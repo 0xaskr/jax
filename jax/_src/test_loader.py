@@ -12,15 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Contains a custom unittest loader and test suite.
+# 文件职责：为 JAX 的测试提供自定义的 unittest 加载器与并行测试套件。
+# 通过 config 标志暴露 JAX_TEST_TARGETS / JAX_EXCLUDE_TEST_TARGETS，
+# 在收集测试用例名时用正则做包含与排除过滤。
+# 当 JAX_TEST_NUM_THREADS >= 1 时，JaxTestSuite 用线程池并行执行线程安全
+# 的测试，并借助 ThreadSafeTestResult 在测试结束时加锁批量回放结果；
+# 线程不安全的用例则退回主线程串行执行。
 
-Implements:
-- A test filter based on the JAX_TEST_TARGETS and JAX_EXCLUDE_TEST_TARGETS
-  environment variables.
-- A test suite that runs tests in parallel using threads if JAX_TEST_NUM_THREADS
-  is >= 1.
-- Test decorators that mark a test case or test class as thread-unsafe.
+"""
+包含自定义的 unittest 加载器与测试套件。
+
+实现：
+- 基于 JAX_TEST_TARGETS 与 JAX_EXCLUDE_TEST_TARGETS 环境变量的
+  测试过滤。
+- 当 JAX_TEST_NUM_THREADS >= 1 时，使用线程并行运行测试的
+  测试套件。
+- 将测试用例或测试类标记为线程不安全的测试装饰器。
 """
 
 from __future__ import annotations
@@ -63,11 +70,11 @@ TEST_NUM_THREADS = config.int_flag(
 
 
 def thread_unsafe_test(condition: bool = True):
-  """Decorator for tests that are not thread-safe.
+  """用于标记非线程安全测试的装饰器。
 
   Args:
-    condition: If True, mark the test as thread-unsafe. If False, the test
-      may run in parallel with other tests. Defaults to True.
+    condition: 若为 True，则把该测试标记为线程不安全；若为 False，该测试
+      可以与其他测试并行运行。默认为 True。
   """
   def decorator(func):
     setattr(func, "thread_unsafe", condition)
@@ -76,11 +83,11 @@ def thread_unsafe_test(condition: bool = True):
 
 
 def thread_unsafe_test_class(condition: bool = True):
-  """Decorator that marks a TestCase class as thread-unsafe.
+  """将某个 TestCase 类标记为线程不安全的装饰器。
 
   Args:
-    condition: If True, mark the test class as thread-unsafe. If False, the
-      test class runs normally. Defaults to True.
+    condition: 若为 True，则把该测试类标记为线程不安全；若为 False，该
+      测试类照常运行。默认为 True。
   """
   def f(klass):
     assert issubclass(klass, unittest.TestCase), type(klass)
@@ -91,14 +98,14 @@ def thread_unsafe_test_class(condition: bool = True):
 
 class ThreadSafeTestResult:
   """
-  Wraps a TestResult to make it thread safe.
+  包装一个 TestResult 使其线程安全。
 
-  We do this by accumulating API calls and applying them in a batch under a
-  lock at the conclusion of each test case.
+  做法是累积 API 调用，并在每个测试用例结束时于锁的保护下批量
+  应用它们。
 
-  We duck type instead of inheriting from TestResult because we aren't actually
-  a perfect implementation of TestResult, and would rather get a loud error
-  for things we haven't implemented.
+  我们采用鸭子类型而不是继承 TestResult，因为我们实际上并不是
+  TestResult 的完整实现，对于尚未实现的部分，我们更希望得到
+  明显的报错。
   """
   def __init__(self, lock: threading.Lock, result: unittest.TestResult):
     self.lock = lock
@@ -113,9 +120,8 @@ class ThreadSafeTestResult:
     logger.info("Test stop: %s", test.id())
     stop_time = time.time()
     with self.lock:
-      # If test_result is an ABSL _TextAndXMLTestResult we override how it gets
-      # the time. This affects the timing that shows up in the XML output
-      # consumed by CI.
+      # 如果 test_result 是 ABSL 的 _TextAndXMLTestResult，我们就覆盖它
+      # 获取时间的方式。这会影响 CI 消费的 XML 输出中显示的计时。
       time_getter = getattr(self.test_result, "time_getter", None)
       try:
         self.test_result.time_getter = lambda: self.start_time  # pyrefly: ignore[missing-attribute]
@@ -159,10 +165,10 @@ def _is_thread_unsafe(test: unittest.TestCase) -> bool:
 
 
 class JaxTestSuite(unittest.TestSuite):
-  """Runs tests in parallel using threads if TEST_NUM_THREADS is > 1.
+  """当 TEST_NUM_THREADS > 1 时使用线程并行运行测试。
 
-  Caution: this test suite does not run setUpClass or setUpModule methods if
-  thread parallelism is enabled.
+  注意：启用线程并行时，该测试套件不会运行 setUpClass 或 setUpModule
+  方法。
   """
 
   def __init__(self, suite: unittest.TestSuite):

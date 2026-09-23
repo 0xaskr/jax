@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Interface and utility functions to XLA.
+# 文件职责：把 JAX 与 XLA/PJRT 运行时连接起来，并对外提供“后端/设备”查询入口。
+# 它负责注册 CPU、GPU、TPU 等后端工厂，发现并加载 `jax_plugins` 命名空间包或
+# `PJRT_NAMES_AND_LIBRARY_PATHS` 环境变量中的 PJRT 插件，再把插件的 C API
+# （`PJRT_Api*`）统一包装成 `xla_client.Client`，并管理设备拓扑的构建。
+# 上层模块通过 `get_backend`、`devices`、`local_devices`、`process_index` 等
+# 函数获取后端与设备信息；本文件同时定义相关的 config 标志（可见设备、
+# 跨主机传输、CPU 异步分派等）以及设备/进程数量的便捷查询工具。
 
-This module wraps the XLA client(s) and builders to standardize their interfaces
-and provide some automatic type mapping logic for converting between Numpy and
-XLA. There are also a handful of related casting utilities.
+"""与 XLA 交互的接口与工具函数。
+
+本模块包装 XLA 客户端与构建器，以统一它们的接口，并提供一些在 Numpy 与 XLA
+之间转换的自动类型映射逻辑。此外还有少量相关的类型转换工具。
 """
 from __future__ import annotations
 
@@ -58,12 +65,12 @@ except ImportError as e:
 
 traceback_util.register_exclusion(__file__)
 
-# The runtimes in this set will force forward compatibility for lowering.
+# 此集合中的运行时会强制对降级启用向前兼容。
 FORCE_FORWARD_COMPAT_LOWERING_RUNTIMES: set[str] = set()
 
 MIN_COMPUTE_CAPABILITY = 52
 
-# TODO(phawkins): Remove jax_xla_backend.
+# TODO(phawkins): 移除 jax_xla_backend。
 _XLA_BACKEND = config.string_flag(
     'jax_xla_backend', '',
     help='Deprecated, please use --jax_platforms instead.')
@@ -71,7 +78,7 @@ BACKEND_TARGET = config.string_flag(
     'jax_backend_target',
     os.getenv('JAX_BACKEND_TARGET', '').lower(),
     help='Either "local" or "rpc:address" to connect to a remote service target.')
-# TODO(skye): warn when this is used once we test out --jax_platforms a bit
+# TODO(skye): 等我们对 --jax_platforms 测试一段时间后，在此项被使用时给出警告
 _PLATFORM_NAME = config.string_flag(
     'jax_platform_name',
     os.getenv('JAX_PLATFORM_NAME', '').lower(),
@@ -159,7 +166,7 @@ CROSS_HOST_TRANSFER_TRANSFER_SIZE = config.int_flag(
     help="Chunk size for chunked transfer requests."
 )
 
-# Warn the user if they call fork(), because it's not going to go well for them.
+# 如果用户调用了 fork() 就给出警告，因为这对他们来说不会有好结果。
 def _at_fork():
   warnings.warn(
     "os.fork() was called. os.fork() is incompatible with multithreaded code, "
@@ -168,13 +175,13 @@ def _at_fork():
 
 _at_fork_handler_installed = False
 
-# Backends
+# 后端
 
 _NameValueMapping = Mapping[str, str | int | list[int] | float | bool]
 
 def _make_transfer_server_factory(
 ) -> _jax.TransferServerInterfaceFactory | None:
-  """Creates a transfer server interface factory."""
+  """创建传输服务器接口工厂。"""
   if (not CROSS_HOST_TRANSFER_SOCKET_ADDRESS.value or not
       hasattr(_jax, "make_transfer_server_interface_factory")):
     return None
@@ -198,7 +205,7 @@ def _make_transfer_server_factory(
 def make_tpu_client(
     library_path: str | None = None, options: _NameValueMapping | None = None
 ):
-  """Returns a TPU client. Defaults to allowing 32 in-flight computations."""
+  """返回一个 TPU 客户端。默许最多 32 个在途计算。"""
   if not _jax.pjrt_plugin_loaded('tpu'):
     c_api = xla_client.load_pjrt_plugin_dynamically(
         "tpu", library_path or "libtpu.so"
@@ -227,7 +234,7 @@ def tpu_client_timer_callback(timer_secs: float) -> xla_client.Client | None:
       'See https://docs.jax.dev/en/latest/multi_process.html '
       'for more information.')
 
-  # Will log a warning after `timer_secs`.
+  # 在 `timer_secs` 之后记录一条警告。
   t = threading.Timer(timer_secs, _log_warning)
   t.start()
 
@@ -241,11 +248,10 @@ def tpu_client_timer_callback(timer_secs: float) -> xla_client.Client | None:
   return client
 
 
-# Backends
+# 后端
 #
-# We have no particular opinion about how "backends" relate to "devices". For
-# example, there could be multiple backends that provide the same kind of
-# device.
+# 我们对“后端”与“设备”之间的关系没有特别的预设。例如，可能存在多个后端
+# 提供同一种设备。
 
 BackendFactory = Callable[[], xla_client.Client | None]
 TopologyFactory = Callable[..., xla_client.DeviceTopology | None]
@@ -254,22 +260,20 @@ TopologyFactory = Callable[..., xla_client.DeviceTopology | None]
 class BackendRegistration:
   factory: BackendFactory
 
-  # Priority of this backend when choosing a default backend. Higher = more
-  # preferred.
+  # 选择默认后端时该后端的优先级。数值越大表示越优先。
   priority: int
 
-  # If this backend fails to initialize, should we log a user-visible warning?
-  # For plugins (e.g., TPU) we usually want a visible failure, because why
-  # install a plugin if you don't intend it to be used?
+  # 如果此后端初始化失败，我们是否应记录一条用户可见的警告？
+  # 对于插件（例如 TPU），我们通常希望失败是可见的，因为如果你不打算使用它，
+  # 又何必安装这个插件呢？
   fail_quietly: bool = False
 
-  # Is this plugin experimental? If a plugin is deemed experimental, we issue
-  # a warning when it is initialized. This is mostly to set user expectations
-  # correctly: we don't want users to think that JAX is buggy because of a
-  # a buggy plugin.
+  # 这个插件是实验性的吗？如果某个插件被认为是实验性的，我们会在它被初始化时
+  # 发出警告。这主要是为了正确设定用户预期：我们不希望用户因为一个有缺陷的插件
+  # 而认为 JAX 有问题。
   experimental: bool = False
 
-  # The C API (`PJRT_Api*`) if this backend is a plugin.
+  # 若此后端是插件，则为其 C API（`PJRT_Api*`）。
   c_api: Any | None = None
 
 _backend_factories: dict[str, BackendRegistration] = {}
@@ -283,17 +287,16 @@ _topology_factories: dict[str, TopologyFactory] = {}
 _plugin_callbacks: list[Any] = []
 _plugin_callback_lock = threading.Lock()
 
-# The set of known non-experimental plugins.
+# 已知的非实验性插件集合。
 #
-# If a plugin passes the JAX test suite, it can be added to the allowlist below.
-# Send a PR if you would like to be added.
+# 如果某个插件通过了 JAX 测试套件，就可以把它加入下面的允许列表。
+# 如果你希望被加入，请提交一个 PR。
 #
-# It is fine for a plugin not to implement every feature that JAX uses, provided
-# that a reasonable feature set is implemented and the plugin fails gracefully
-# for unimplemented features. Wrong outputs are not acceptable.
+# 一个插件不必实现 JAX 用到的每一个特性，只要它实现了合理的特性集合、并且对
+# 未实现的特性优雅地失败即可。错误的输出是不可接受的。
 _nonexperimental_plugins: set[str] = {'cuda', 'rocm'}
 
-# The set of known experimental plugins that have registrations in JAX codebase.
+# 在 JAX 代码库中有注册信息的已知实验性插件集合。
 _experimental_plugins: set[str] = {"oneapi"}
 
 def register_backend_factory(name: str, factory: BackendFactory, *,
@@ -314,24 +317,22 @@ def register_backend_factory(name: str, factory: BackendFactory, *,
 def make_cpu_client(
     collectives: _jax.CpuCollectives | None = None,
 ) -> xla_client.Client:
-  """Creates a CPU client with the requested collectives implementation.
+  """创建使用所请求的集合通信实现的 CPU 客户端。
 
-  The implementation of CPU collectives used by the client is determined by the
-  flag `--jax_cpu_collectives_implementation` - unless `collectives` is
-  provided, in which case the flag is overridden and `collectives` is used.
+  客户端所使用的 CPU 集合通信实现由标志 `--jax_cpu_collectives_implementation`
+  决定——除非提供了 `collectives`，此时该标志会被覆盖，改用 `collectives`。
 
   Args:
-    collectives: An optional CPU collectives implementation, used by the client
-      if provided.
+    collectives: 可选的 CPU 集合通信实现，若提供则由客户端使用。
 
   Raises:
-    RuntimeError: If `--jax_cpu_collectives_implementation` is unknown.
+    RuntimeError: 如果 `--jax_cpu_collectives_implementation` 未知。
 
   Returns:
-    The created CPU client.
+    所创建的 CPU 客户端。
   """
-  # TODO(skyewm): use distributed.is_initialized() after
-  # https://github.com/jax-ml/jax/pull/26172 goes in.
+  # TODO(skyewm): 等 https://github.com/jax-ml/jax/pull/26172 合入后，
+  # 改用 distributed.is_initialized()。
   if collectives is None and distributed.global_state.client is not None:
     collectives_impl = config.cpu_collectives_implementation.value
     if collectives_impl == 'gloo':
@@ -343,7 +344,7 @@ def make_cpu_client(
       collectives.Init()
       atexit.register(collectives.Finalize)
     else:
-      # Already validated by config module
+      # 已由 config 模块校验过
       assert collectives_impl is None
 
   num_devices = num_cpu_devices.value if num_cpu_devices.value >= 0 else None
@@ -373,8 +374,8 @@ def get_num_nodes_from_gpu_topology(topology: str) -> int:
                        '"<number-of-slices> x <number-of-hosts-per-slice> x '
                        '<number-of-devices-per-host>".')
 
-# TODO(phawkins,skyewm): switch TPU plugin to use the PJRT plugin mechanism,
-# and then fail loudly on initialization failure.
+# TODO(phawkins,skyewm): 把 TPU 插件改为使用 PJRT 插件机制，
+# 然后在初始化失败时大声报错。
 register_backend_factory(
   'tpu', partial(tpu_client_timer_callback, timer_secs=60.0), priority=300,
   fail_quietly=True)
@@ -383,14 +384,14 @@ register_backend_factory(
 def _get_pjrt_plugin_names_and_library_paths(
     plugins_from_env: str,
 ) -> dict[str, str]:
-  """Gets the names and library paths of PJRT plugins to load from env var.
+  """从环境变量获取待加载 PJRT 插件的名称与库路径。
 
   Args:
-    plugins_from_env: plugin name and paths from env var. It is in the format
-      of 'name1:path1,name2:path2' ('name1;path1,name2;path2' for windows).
+    plugins_from_env: 来自环境变量的插件名称与路径，格式为
+      'name1:path1,name2:path2'（Windows 上为 'name1;path1,name2;path2'）。
 
   Returns:
-    A dict of {plugin_name: library path} for the PJRT plugins to load.
+    待加载 PJRT 插件的 {插件名: 库路径} 字典。
   """
   if not plugins_from_env:
     return {}
@@ -414,13 +415,12 @@ def _get_pjrt_plugin_config(
 ) -> tuple[
     str, Mapping[str, str | int | list[int] | float | bool] | None
 ]:
-  """Gets PJRT plugin configuration from a json file.
+  """从 json 文件获取 PJRT 插件配置。
 
-  The json file needs to have a "library_path" field for the plugin library
-  path. It can have an optional "create_option" field for the options used when
-  creating a PJRT plugin client. The value of "create_option" is key-value
-  pairs. Please see xla_client._NameValueMapping for the supported types of
-  values.
+  该 json 文件需要有一个 "library_path" 字段以给出插件库路径。它还可以有一个
+  可选的 "create_option" 字段，用于给出创建 PJRT 插件客户端时所用的选项。
+  "create_option" 的值是键值对。关于支持的值类型，请参见
+  xla_client._NameValueMapping。
   """
   with open(json_path) as f:
     config = json.load(f)
@@ -431,35 +431,29 @@ def _get_pjrt_plugin_config(
   return (config['library_path'], config.get('create_options'))
 
 def discover_pjrt_plugins() -> None:
-  """Discovers plugins in the namespace package `jax_plugins` and import them.
+  """发现命名空间包 `jax_plugins` 中的插件并导入它们。
 
-  There are two methods used to discover plugin modules. They are intended
-  to be used together by implementers in order to cover all packaging and
-  development cases:
+  有两种用于发现插件模块的方法。实现者应当同时使用这两种方法，以覆盖所有打包
+  与开发场景：
 
-  1. Define a globally unique module under the `jax_plugins` namespace
-     package (i.e. just create a `jax_plugins` directory and define your
-     module below it).
-  2. If building a package via pyproject.toml or setup.py, advertise your
-     plugin module name by including an entry-point under the `jax_plugins`
-     group which points to your full module name.
+  1. 在 `jax_plugins` 命名空间包下定义一个全局唯一的模块（也就是说，只需创建
+     一个 `jax_plugins` 目录并在其下定义你的模块）。
+  2. 若通过 pyproject.toml 或 setup.py 构建包，则在 `jax_plugins` 组下添加一个
+     指向你完整模块名的 entry-point，以声明你的插件模块名。
 
-  During Jax startup, Jax will load each module discovered in such a way and
-  call its `initialize()` function. It is expected that this function should
-  register its concrete plugin name/implementations via call(s) to
+  在 JAX 启动期间，JAX 会加载以这种方式发现的每个模块并调用其 `initialize()`
+  函数。该函数应当通过调用
   `jax._src.xla_bridge.register_plugin(name, priority=, library_paty=,
-  options=)`. Since `initialize()` functions are called for all installed
-  plugins, they should avoid doing expensive, non-registration related work.
+  options=)` 来注册其具体的插件名称/实现。由于所有已安装插件的 `initialize()`
+  函数都会被调用，它们应避免执行与注册无关的昂贵工作。
 
-  TODO: We should provide a variant of `register_plugin` which allows the
-  library_path and options to be resolved via a callback. This would enable
-  light-weight plugin registration in cases where options need to be derived
-  from heavy-weight system initialization.
+  TODO: 我们应当提供 `register_plugin` 的一个变体，允许通过回调来解析
+  library_path 与 options。这样在需要从重量级系统初始化中推导选项的场景下，
+  就能实现轻量级的插件注册。
   """
   plugin_modules = set()
-  # Scan installed modules under |jax_plugins|. Note that not all packaging
-  # scenarios are amenable to such scanning, so we also use the entry-point
-  # method to seed the list.
+  # 扫描 |jax_plugins| 下已安装的模块。注意并非所有打包场景都适合这种扫描，
+  # 因此我们还使用 entry-point 方法来为列表补充种子。
   if jax_plugins:
     for _, name, _ in pkgutil.iter_modules(
         jax_plugins.__path__, jax_plugins.__name__ + '.'
@@ -469,7 +463,7 @@ def discover_pjrt_plugins() -> None:
   else:
     logger.debug("No jax_plugins namespace packages available")
 
-  # Augment with advertised entrypoints.
+  # 用声明的 entrypoint 加以补充。
   from importlib.metadata import entry_points
 
   for entry_point in entry_points(group="jax_plugins"):
@@ -477,7 +471,7 @@ def discover_pjrt_plugins() -> None:
                  entry_point.value)
     plugin_modules.add(entry_point.value)
 
-  # Now load and initialize them all.
+  # 现在加载并初始化它们全部。
   for plugin_module_name in plugin_modules:
     logger.debug("Loading plugin module %s", plugin_module_name)
     plugin_module = None
@@ -545,13 +539,12 @@ def make_pjrt_c_api_client(
     plugin_name: str,
     options: OptionsDict | Callable[[], OptionsDict] | None = None,
 ) -> xla_client.Client:
-  """Creates a PjRt client for the given plugin.
+  """为给定的插件创建 PjRt 客户端。
 
   Args:
-    plugin_name: the name of the plugin.
-    options: Optional. It is used when creating a PJRT plugin client. Can be a
-      callable, in which case it will be invoked upon plugin initialization
-      time, and will be expected to return an option dictionary.
+    plugin_name: 插件的名称。
+    options: 可选。在创建 PJRT 插件客户端时使用。它可以是一个可调用对象，
+      此时它会在插件初始化时被调用，并且应当返回一个选项字典。
   """
   if not xla_client.pjrt_plugin_initialized(plugin_name):
     xla_client.initialize_pjrt_plugin(plugin_name)
@@ -590,20 +583,17 @@ def register_plugin(
     factory: BackendFactory | None = None,
     make_topology: TopologyFactory | None = None,
 ) -> Any:
-  """Registers a backend factory for the PJRT plugin.
+  """为 PJRT 插件注册一个后端工厂。
 
   Args:
-    plugin_name: the name of the plugin.
-    priority: the priority this plugin should be registered in jax backends.
-      Default to be 400.
-    library_path: Optional. The full path to the .so file of the plugin. The
-      plugin needs to provide either the library_path or the c_api.
-    options: Optional. It is used when creating a PJRT plugin client. Can be a
-      callable, in which case it will be invoked upon plugin initialization
-      time, and will be expected to return an option dictionary.
-    c_api: Optional. The plugin can provide a PJRT C API to be registered.
-    factory: Optional. A factory function that creates a PJRT client. If not
-      provided, a default factory will be used.
+    plugin_name: 插件的名称。
+    priority: 该插件在 jax 后端中注册时应具有的优先级。默认为 400。
+    library_path: 可选。插件 .so 文件的完整路径。插件需要提供 library_path
+      或 c_api 中的一个。
+    options: 可选。在创建 PJRT 插件客户端时使用。它可以是一个可调用对象，
+      此时它会在插件初始化时被调用，并且应当返回一个选项字典。
+    c_api: 可选。插件可以提供要注册的 PJRT C API。
+    factory: 可选。创建 PJRT 客户端的工厂函数。若未提供，则使用默认工厂。
   """
 
   if library_path and c_api:
@@ -649,18 +639,17 @@ def register_plugin(
 
 
 def register_pjrt_plugin_factories_from_env() -> None:
-  """Registers backend factories for PJRT plugins.
+  """为 PJRT 插件注册后端工厂。
 
-  A backend factory will be registered for every PJRT plugin in the input
-  string, in the format of 'name1:path1,name2:path2' ('name1;path1,name2;path2'
-  for windows). The path can be a path to the plugin library or a path to the
-  plugin configuration json file. The json file needs to have a "library_path"
-  field for the plugin library path. It can have an optional "create_option"
-  field for the options used when creating a PJRT plugin client. The value of
-  "create_option" is key-value pairs. Please see xla_client._NameValueMapping
-  for the supported types of values.
+  对于输入字符串中的每个 PJRT 插件，都会注册一个后端工厂，格式为
+  'name1:path1,name2:path2'（Windows 上为 'name1;path1,name2;path2'）。该路径
+  既可以是插件库的路径，也可以是插件配置 json 文件的路径。该 json 文件需要
+  有一个 "library_path" 字段以给出插件库路径。它还可以有一个可选的
+  "create_option" 字段，用于给出创建 PJRT 插件客户端时所用的选项。
+  "create_option" 的值是键值对。关于支持的值类型，请参见
+  xla_client._NameValueMapping。
 
-  TPU PJRT plugin will be loaded and registered separately in make_tpu_client.
+  TPU PJRT 插件将在 make_tpu_client 中单独加载并注册。
   """
   pjrt_plugins = _get_pjrt_plugin_names_and_library_paths(
       os.getenv('PJRT_NAMES_AND_LIBRARY_PATHS', '')
@@ -680,16 +669,15 @@ def register_pjrt_plugin_factories_from_env() -> None:
 def _discover_and_register_pjrt_plugins():
   global _plugins_registered
 
-  # Needs a separate lock because register_backend_factory (called from
-  # register_plugin) requires to hold _backend_lock.
+  # 需要一个单独的锁，因为 register_backend_factory（由 register_plugin 调用）
+  # 需要持有 _backend_lock。
   with _plugin_lock:
     if not _plugins_registered:
-      # Plugins in the namespace package `jax_plugins` or have an entry-point
-      # under the `jax_plugins` group will be imported.
+      # 位于命名空间包 `jax_plugins` 中、或在 `jax_plugins` 组下拥有 entry-point
+      # 的插件将被导入。
       discover_pjrt_plugins()
-      # Registers plugins names and paths set in env var
-      # PJRT_NAMES_AND_LIBRARY_PATHS, in the format of 'name1:path1,name2:path2'
-      # ('name1;path1,name2;path2' for windows).
+      # 注册环境变量 PJRT_NAMES_AND_LIBRARY_PATHS 中设置的插件名称与路径，
+      # 格式为 'name1:path1,name2:path2'（Windows 上为 'name1;path1,name2;path2'）。
       register_pjrt_plugin_factories_from_env()
       with _plugin_callback_lock:
         for factory in _backend_factories.values():
@@ -697,8 +685,6 @@ def _discover_and_register_pjrt_plugins():
             for callback in _plugin_callbacks:
               callback(c_api=factory.c_api)
       _plugins_registered = True
-
-
 _platform_aliases = {
   "cuda": "gpu",
   "rocm": "gpu",
@@ -720,19 +706,17 @@ def known_platforms() -> set[str]:
 
 
 def is_known_platform(platform: str) -> bool:
-  # A platform is valid if there is a registered factory for it. It does not
-  # matter if we were unable to initialize that platform; we only care that
-  # we've heard of it and it isn't, e.g., a typo.
+  # 如果某个平台有已注册的工厂，它就是有效的。我们是否能够初始化该平台并不重要；
+  # 我们只关心我们听说过它，并且它不是（例如）拼写错误。
   return platform in known_platforms()
 
 
 def canonicalize_platform(platform: str) -> str:
-  """Replaces platform aliases with their concrete equivalent.
+  """把平台别名替换为它们的具体等价形式。
 
-  In particular, replaces "gpu" with either "cuda", "oneapi" or "rocm", depending on which
-  hardware is actually present. We want to distinguish "cuda", "oneapi" and "rocm" for
-  purposes such as MLIR lowering rules, but in many cases we don't want to
-  force users to care.
+  具体来说，会根据实际存在的硬件，把 "gpu" 替换为 "cuda"、"oneapi" 或 "rocm"
+  之一。出于 MLIR 降级规则等目的，我们希望区分 "cuda"、"oneapi" 和 "rocm"，
+  但在许多情况下我们并不想强迫用户去关心这些区别。
   """
   platforms = _alias_to_platforms.get(platform, None)
   if platforms is None:
@@ -748,31 +732,29 @@ def canonicalize_platform(platform: str) -> str:
 
 
 def expand_platform_alias(platform: str) -> list[str]:
-  """Expands, e.g., "gpu" to ["cuda", "rocm", "oneapi"].
+  """把诸如 "gpu" 的别名展开为 ["cuda", "rocm", "oneapi"]。
 
-  This is used for convenience reasons: we expect cuda and rocm to act similarly
-  in many respects since they share most of the same code.
+  这是出于便利考虑：由于 cuda 与 rocm 共享大部分相同代码，我们预期它们在
+  许多方面表现相似。
   """
   return _alias_to_platforms.get(platform, [platform])
 
 
 def backends_are_initialized() -> bool:
-  "Returns true if backends have already been initialized."
+  "如果后端已经初始化，则返回 true。"
   with _backend_lock:
     return len(_backends) != 0
 
 
 def register_plugin_callbacks(callback):
-  """Registers a callback to be called with c_api after plugins discovery.
+  """注册一个在插件发现之后带着 c_api 被调用的回调。
 
-  The callback will be called on all discovered PJRT C API plugins. If
-  `register_plugin_callbacks` is called before the plugins are discovered, the
-  callback will be called right after the plugins are discovered. Otherwise, the
-  callback will be called immediately when `register_plugin_callbacks` is
-  called.
+  该回调会在所有已发现的 PJRT C API 插件上被调用。如果在插件被发现之前调用
+  `register_plugin_callbacks`，回调会在插件刚被发现之后被调用。否则，回调会在
+  调用 `register_plugin_callbacks` 时立即被调用。
 
   Args:
-    callback: the callback to be called with c_api.
+    callback: 要带着 c_api 被调用的回调。
   """
   with _plugin_callback_lock:
     if _plugins_registered:
@@ -795,19 +777,18 @@ def backends() -> dict[str, xla_client.Client]:
     if _backends:
       return _backends
 
-    # os.register_at_fork only exists on Unix.
+    # os.register_at_fork 只存在于 Unix 上。
     if not _at_fork_handler_installed and hasattr(os, "register_at_fork"):
       os.register_at_fork(before=_at_fork)
       _at_fork_handler_installed = True
 
     if jax_platforms := config.jax_platforms.value:
       platforms = []
-      # Allow platform aliases in the list of platforms.
+      # 允许在平台列表中使用平台别名。
       for platform in jax_platforms.split(","):
         platforms.extend(expand_platform_alias(platform))
       priorities = range(len(platforms), 0, -1)
-      # If the user specified a list of platforms explicitly, always fail
-      # loudly.
+      # 如果用户显式指定了平台列表，则总是大声地失败。
       fail_quietly_list = [False] * len(platforms)
       platform_registrations = list(
         zip(platforms, priorities, fail_quietly_list))
@@ -846,16 +827,14 @@ def backends() -> dict[str, xla_client.Client]:
       _suggest_missing_backends()
     return _backends
 
-# Code to suggest plugins that should be installed.
+# 用于建议应安装哪些插件的代码。
 #
-# Plugin vendors are welcome to add code to this list, assuming there's a
-# lightweight way to determine if hardware is present without requiring
-# the relevant plugin be installed.
+# 欢迎插件厂商向这个列表添加代码，前提是存在一种轻量级的方式来判断硬件是否存在，
+# 而不需要安装相关插件。
 
 def _suggest_missing_backends():
   if py_platform.system() != "Linux":
-    # If you're not using Linux (or WSL2), we don't have any suggestions at the
-    # moment.
+    # 如果你不使用 Linux（或 WSL2），我们目前没有任何建议。
     return
 
   assert _default_backend is not None
@@ -908,12 +887,11 @@ def _init_backend(platform: str) -> xla_client.Client:
                    "functionality may be correctly supported!")
   logger.debug("Initializing backend '%s'", platform)
   backend = registration.factory()
-  # TODO(skye): consider raising more descriptive errors directly from backend
-  # factories instead of returning None.
+  # TODO(skye): 考虑直接由后端工厂抛出更具描述性的错误，而不是返回 None。
   if backend is None:
     raise RuntimeError(f"Could not initialize backend '{platform}'")
-  # TODO(b/356678989): Only check `backend.device_count()` when it counts
-  # CPU-only devices.
+  # TODO(b/356678989): 只有当 `backend.device_count()` 统计的是纯 CPU 设备时，
+  # 才检查它。
   if backend.device_count() == 0 and len(backend._get_all_devices()) == 0:
     raise RuntimeError(f"Backend '{platform}' provides no devices.")
   util.distributed_debug_log(("Initialized backend", backend.platform),
@@ -927,8 +905,8 @@ def _init_backend(platform: str) -> xla_client.Client:
 def _get_backend_uncached(
     platform: None | str | xla_client.Client = None
 ) -> xla_client.Client:
-  # TODO(mattjj,skyewm): remove this input polymorphism after we clean up how
-  # 'backend' values are handled
+  # TODO(mattjj,skyewm): 等我们理清 'backend' 值的处理方式后，移除这里的
+  # 输入多态。
   if platform is not None and not isinstance(platform, str):
     return platform
 
@@ -951,7 +929,7 @@ def _get_backend_uncached(
     return _default_backend
 
 
-@util.cache(max_size=None, trace_context_in_key=False)  # don't use util.memoize because there is no X64 dependence.
+@util.cache(max_size=None, trace_context_in_key=False)  # 不要用 util.memoize，因为这里不依赖 X64。
 def get_backend(
     platform: None | str | xla_client.Client = None
 ) -> xla_client.Client:
@@ -961,7 +939,7 @@ def get_backend(
 def get_device_backend(
     device: xla_client.Device | None = None,
 ) -> xla_client.Client:
-  """Returns the Backend associated with `device`, or the default Backend."""
+  """返回与 `device` 关联的后端，或默认后端。"""
   if device is not None:
     return device.client
   return get_backend()
@@ -970,20 +948,17 @@ def get_device_backend(
 def device_count(
     backend: str | xla_client.Client | None = None
 ) -> int:
-  """Returns the total number of devices.
+  """返回设备总数。
 
-  On most platforms, this is the same as :py:func:`jax.local_device_count`.
-  However, on multi-process platforms where different devices are associated
-  with different processes, this will return the total number of devices across
-  all processes.
+  在大多数平台上，这与 :py:func:`jax.local_device_count` 相同。不过，在不同设备
+  关联到不同进程的多进程平台上，它会返回所有进程的设备总数。
 
   Args:
-    backend: This is an experimental feature and the API is likely to change.
-      Optional, a string representing the xla backend: ``'cpu'``, ``'gpu'``, or
-      ``'tpu'``.
+    backend: 这是一个实验性特性，API 很可能会变化。可选，一个表示 xla 后端的
+      字符串：``'cpu'``、``'gpu'`` 或 ``'tpu'``。
 
   Returns:
-    Number of devices.
+    设备数量。
 
   """
   return int(get_backend(backend).device_count())
@@ -992,47 +967,44 @@ def device_count(
 def local_device_count(
     backend: str | xla_client.Client | None = None
 ) -> int:
-  """Returns the number of devices addressable by this process."""
+  """返回本进程可寻址的设备数量。"""
   return int(get_backend(backend).local_device_count())
 
 
 def devices(
     backend: str | xla_client.Client | None = None
 ) -> list[xla_client.Device]:
-  """Returns a list of all devices for a given backend.
+  """返回给定后端的所有设备列表。
 
   .. currentmodule:: jaxlib._jax
 
-  Each device is represented by a subclass of :class:`Device` (e.g.
-  :class:`CpuDevice`, :class:`GpuDevice`). The length of the returned list is
-  equal to ``device_count(backend)``. Local devices can be identified by
-  comparing :attr:`Device.process_index` to the value returned by
-  :py:func:`jax.process_index`.
+  每个设备由 :class:`Device` 的一个子类表示（例如 :class:`CpuDevice`、
+  :class:`GpuDevice`）。返回列表的长度等于 ``device_count(backend)``。把
+  :attr:`Device.process_index` 与 :py:func:`jax.process_index` 返回的值相比较，
+  即可识别本地设备。
 
-  If ``backend`` is ``None``, returns all the devices from the default backend.
-  The default backend is generally ``'gpu'`` or ``'tpu'`` if available,
-  otherwise ``'cpu'``.
+  如果 ``backend`` 为 ``None``，则返回默认后端的所有设备。默认后端通常是
+  ``'gpu'`` 或 ``'tpu'``（若可用），否则为 ``'cpu'``。
 
   Args:
-    backend: This is an experimental feature and the API is likely to change.
-      Optional, a string representing the xla backend: ``'cpu'``, ``'gpu'``, or
-      ``'tpu'``.
+    backend: 这是一个实验性特性，API 很可能会变化。可选，一个表示 xla 后端的
+      字符串：``'cpu'``、``'gpu'`` 或 ``'tpu'``。
 
   Returns:
-    List of Device subclasses.
+    Device 子类的列表。
   """
   return get_backend(backend).devices()
 
 
 def default_backend() -> str:
-  """Returns the platform name of the default XLA backend."""
+  """返回默认 XLA 后端的平台名。"""
   return get_backend(None).platform
 
 
 def backend_pjrt_c_api_version(platform=None) -> tuple[int, int] | None:
-  """Returns the PJRT C API version of the backend.
+  """返回后端的 PJRT C API 版本。
 
-  Returns None if the backend does not use PJRT C API.
+  如果后端不使用 PJRT C API，则返回 None。
   """
   backend = get_backend(platform)
   if hasattr(backend, "pjrt_c_api_major_version") and hasattr(
@@ -1043,23 +1015,21 @@ def backend_pjrt_c_api_version(platform=None) -> tuple[int, int] | None:
 
 
 def backend_xla_version(platform=None) -> int | None:
-  """Returns the XLA version of the backend.
+  """返回后端的 XLA 版本。
 
-  Returns None if the backend does not use PJRT C API or does not have
-  xla_version in the plugin attributes. This method can be used to skip features
-  that are not available before certain xla_version if the backend is a
-  plugin and uses xla_version.
+  如果后端不使用 PJRT C API，或插件属性中没有 xla_version，则返回 None。若后端
+  是一个使用 xla_version 的插件，可以用这个方法来跳过在某个 xla_version 之前
+  不可用的特性。
   """
   backend = get_backend(platform)
   return getattr(backend, "xla_version", None)
 
 def backend_stablehlo_version(platform=None) -> Sequence[int] | None:
-  """Returns the StableHLO version of the backend.
+  """返回后端的 StableHLO 版本。
 
-  Returns None if the backend does not use PJRT C API or does not have
-  stablehlo_current_version in the plugin attributes. This method can be used to
-  skip features that are not available before certain stablehlo_current_version
-  if the backend is a plugin and uses stablehlo_current_version.
+  如果后端不使用 PJRT C API，或插件属性中没有 stablehlo_current_version，则返回
+  None。若后端是一个使用 stablehlo_current_version 的插件，可以用这个方法来跳过
+  在某个 stablehlo_current_version 之前不可用的特性。
   """
   backend = get_backend(platform)
   return getattr(backend, "stablehlo_current_version", None)
@@ -1068,19 +1038,18 @@ def backend_stablehlo_version(platform=None) -> Sequence[int] | None:
 def local_devices(process_index: int | None = None,
                   backend: str | xla_client.Client | None = None,
                   host_id: int | None = None) -> list[xla_client.Device]:
-  """Like :py:func:`jax.devices`, but only returns devices local to a given process.
+  """类似于 :py:func:`jax.devices`，但只返回某个给定进程的本地设备。
 
-  If ``process_index`` is ``None``, returns devices local to this process.
+  如果 ``process_index`` 为 ``None``，则返回本进程的本地设备。
 
   Args:
-    process_index: the integer index of the process. Process indices can be
-      retrieved via ``len(jax.process_count())``.
-    backend: This is an experimental feature and the API is likely to change.
-      Optional, a string representing the xla backend: ``'cpu'``, ``'gpu'``, or
-      ``'tpu'``.
+    process_index: 进程的整数索引。进程索引可以通过
+      ``len(jax.process_count())`` 获取。
+    backend: 这是一个实验性特性，API 很可能会变化。可选，一个表示 xla 后端的
+      字符串：``'cpu'``、``'gpu'`` 或 ``'tpu'``。
 
   Returns:
-    List of Device subclasses.
+    Device 子类的列表。
   """
   if host_id is not None:
     warnings.warn(
@@ -1098,23 +1067,21 @@ def local_devices(process_index: int | None = None,
 def process_index(
     backend: str | xla_client.Client | None = None
 ) -> int:
-  """Returns the integer process index of this process.
+  """返回本进程的整数进程索引。
 
-  On most platforms, this will always be 0. This will vary on multi-process
-  platforms though.
+  在大多数平台上，它始终为 0。不过在多进程平台上它会有所不同。
 
   Args:
-    backend: This is an experimental feature and the API is likely to change.
-      Optional, a string representing the xla backend: ``'cpu'``, ``'gpu'``, or
-      ``'tpu'``.
+    backend: 这是一个实验性特性，API 很可能会变化。可选，一个表示 xla 后端的
+      字符串：``'cpu'``、``'gpu'`` 或 ``'tpu'``。
 
   Returns:
-    Integer process index.
+    整数进程索引。
   """
   return get_backend(backend).process_index()
 
 
-# TODO: remove this sometime after jax 0.2.13 is released
+# TODO: 在 jax 0.2.13 发布之后的某个时候移除这个
 def host_id(backend: str | xla_client.Client | None = None) -> int:
   warnings.warn(
       "jax.process_index has been renamed to jax.process_index. This alias "
@@ -1126,12 +1093,12 @@ def host_id(backend: str | xla_client.Client | None = None) -> int:
 def process_count(
     backend: str | xla_client.Client | None = None
 ) -> int:
-  """Returns the number of JAX processes associated with the backend."""
+  """返回与该后端关联的 JAX 进程数量。"""
   gen = (d.process_index for d in devices(backend))
   return max(gen, default=0) + 1
 
 
-# TODO: remove this sometime after jax 0.2.13 is released
+# TODO: 在 jax 0.2.13 发布之后的某个时候移除这个
 def host_count(backend: str | xla_client.Client | None = None) -> int:
   warnings.warn(
       "jax.process_count has been renamed to jax.process_count. This alias "
@@ -1142,20 +1109,19 @@ def host_count(backend: str | xla_client.Client | None = None) -> int:
 def process_indices(
     backend: str | xla_client.Client | None = None
 ) -> list[int]:
-  """Returns the list of all JAX process indices associated with the backend.
+  """返回与该后端关联的所有 JAX 进程索引的列表。
 
   Args:
-    backend: This is an experimental feature and the API is likely to change.
-      Optional, a string representing the xla backend: ``'cpu'``, ``'gpu'``, or
-      ``'tpu'``.
+    backend: 这是一个实验性特性，API 很可能会变化。可选，一个表示 xla 后端的
+      字符串：``'cpu'``、``'gpu'`` 或 ``'tpu'``。
 
   Returns:
-    List of integer process indices.
+    整数进程索引的列表。
   """
   return list(range(process_count(backend)))
 
 
-# TODO: remove this sometime after jax 0.2.13 is released
+# TODO: 在 jax 0.2.13 发布之后的某个时候移除这个
 def host_ids(
     backend: str | xla_client.Client | None = None
 ) -> list[int]:
@@ -1177,7 +1143,7 @@ def make_pjrt_topology(platform: str, topology_name='', **kwargs):
   raise NotImplementedError("topology not implemented for %s" % platform)
 
 
-# TODO(parkers): Get rid of this in favor of a generic way to get topologies.
+# TODO(parkers): 去掉这个，改用获取拓扑的通用方式。
 def make_pjrt_tpu_topology(topology_name='', **kwargs):
   if not xla_client.pjrt_plugin_loaded("tpu"):
     library_path = get_tpu_library_path()

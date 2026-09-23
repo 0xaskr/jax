@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：实现 checkify 变换，把 `check` 断言与各类运行时错误检查（NaN、越界索引、
+# 除零等）从 Python 异常效果改写为显式的函数式 `Error` 值，使带检查的函数仍可被
+# jit/scan/while 等变换暂存。
+# 核心是 `Error` pytree（用 `ErrorEffect` 记录每类错误是否触发、错误码与载荷）以及
+# 一组按原语注册的 `error_checks` 规则，它们负责在解释 jaxpr 时累积错误状态。
+# 本块还定义了 `check_p` 原语及其实现、批处理、JVP 与 MLIR 降级规则，以及
+# `checkify` 变换的骨架。
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -55,9 +62,9 @@ from jax._src.typing import Array
 from jax._src.util import (split_list, safe_map, safe_zip, unzip3,
                            weakref_lru_cache, HashableWrapper, foreach)
 
-# Backward compatibility: some downstream users implicitly rely on this import,
-# and reference jax.experimental.shard_map without an explicit import.
-# TODO(yashkatariya): remove this once users are migrated to jax.shard_map.
+# 向后兼容：一些下游用户隐式依赖这次导入，
+# 会在没有显式导入的情况下引用 jax.experimental.shard_map。
+# TODO(yashkatariya): 待用户迁移到 jax.shard_map 后移除这段。
 try:
   import jax.experimental.shard_map as _  # pyrefly: ignore[missing-import]  # noqa: F401
 except ImportError:
@@ -76,14 +83,14 @@ Payload = list[np.ndarray | Array]
 PyTreeDef = jtu.PyTreeDef
 Out = TypeVar('Out')
 
-# Concrete errors
+# 具体错误
 
 class JaxException(Exception):
-  """Python exception which can contain an error message with JAX run-time info."""
+  """可以携带 JAX 运行时信息的错误消息的 Python 异常。"""
 
   def __init__(self, traceback_info):
     self.traceback_info = traceback_info
-    # TODO(lenamartens): re-enable tracebacks when they don't leak tracers.
+    # TODO(lenamartens): 当回溯不再泄漏追踪器时重新启用。
     # self.with_traceback(self.traceback_info)
 
   def __init_subclass__(cls):
@@ -94,7 +101,7 @@ class JaxException(Exception):
 
   @classmethod
   def tree_unflatten(cls, metadata, payload, /):
-    del payload  # Unused.
+    del payload  # 未使用。
     return cls(metadata)
 
   def get_effect_type(self) -> ErrorEffect:
@@ -108,7 +115,7 @@ class ErrorEffect(effects.Effect):
   shape_dtypes: tuple[api.ShapeDtypeStruct, ...]
 
   def __lt__(self, other: ErrorEffect):
-    shape_dtypes = lambda x: tuple((sd.shape, str(sd.dtype))  # dtype is not comparable
+    shape_dtypes = lambda x: tuple((sd.shape, str(sd.dtype))  # dtype 不可比较
                                    for sd in x.shape_dtypes)
     unpack = lambda x: (str(x.error_type), shape_dtypes(x))
     return (unpack(self) < unpack(other))
@@ -179,8 +186,8 @@ class FailedCheckError(JaxException):
     self.kwargs = k
 
   def tree_flatten(self):
-    return ((self.args, self.kwargs),  # leaves
-            (self.traceback_info, self.fmt_string))  # treedef
+    return ((self.args, self.kwargs),  # 叶子
+            (self.traceback_info, self.fmt_string))  # 树结构定义
 
   @classmethod
   def tree_unflatten(cls, metadata, payload):
@@ -211,25 +218,25 @@ class BatchedError(JaxException):
                      for idx, e in self.error_mapping.items())
 
 
-# Error Value
+# 错误值
 
 @jtu.register_pytree_node_class
 @dataclasses.dataclass(frozen=True, slots=True)
 class Error:
   _pred: dict[ErrorEffect, Bool]
   _code: dict[ErrorEffect, Int]
-  _metadata: dict[Int, PyTreeDef]  # mapping of code to JaxException treedef.
+  _metadata: dict[Int, PyTreeDef]  # 从错误码到 JaxException 树结构定义的映射。
   _payload: dict[ErrorEffect, Payload]
 
   def get(self) -> str | None:
-    """Returns error message if error happened, None if no error happened."""
+    """若发生错误则返回错误消息，未发生错误则返回 None。"""
     exp = self.get_exception()
     if exp is not None:
       return str(exp)
     return None
 
   def get_exception(self) -> JaxException | None:
-    """Returns Python exception if error happened, None if no error happened."""
+    """若发生错误则返回 Python 异常，未发生错误则返回 None。"""
     if any(np.shape(v) for v in self._pred.values()):
       return self._get_batched_exception()
     else:
@@ -253,7 +260,7 @@ class Error:
   def __str__(self):
     return f'Error({self.get()})'
 
-  # Internal helpers
+  # 内部辅助函数
 
   def _get_batched_exception(self) -> BatchedError | None:
     shape = np.shape(list(self._pred.values())[0])
@@ -285,7 +292,7 @@ class Error:
     return Error(new_errs, new_codes, new_metadata, new_payload)
 
   def _add_placeholder_effects(self, effects: set[ErrorEffect]):
-    """Fill out Error with `effects` and np.ones arrays of their payloads."""
+    """用 `effects` 及其载荷的 np.ones 数组把 Error 填充完整。"""
     new_err = self._pred.copy()
     new_code = self._code.copy()
     new_payload = self._payload.copy()
@@ -294,15 +301,15 @@ class Error:
         new_err[effect] = False
         new_payload[effect] = list(
             tree_map(lambda a: jnp.ones(a.shape, a.dtype), effect.shape_dtypes))
-        # The error value associated with this effect will never become True, so
-        # we don't need to set a meaningful code.
+        # 与该效果关联的错误值永远不会变为 True，
+        # 因此无需设置有意义的错误码。
         new_code[effect] = -1
     return Error(new_err, new_code, self._metadata, new_payload)
 
   def _replace(self, *args, **kwargs):
     return dataclasses.replace(self, *args, **kwargs)
 
-  # PyTree methods
+  # PyTree 方法
 
   def tree_flatten(self):
     return ((self._pred, self._code, self._payload), (self._metadata))
@@ -312,8 +319,8 @@ class Error:
     pred, code, payload = data
     return cls(pred, code, metadata, payload)
 
-init_error = Error({}, {}, {}, {})  # value used as initial (empty) error.
-next_code = it.count(1).__next__  # globally unique ids, could be uuid4
+init_error = Error({}, {}, {}, {})  # 用作初始（空）错误的值。
+next_code = it.count(1).__next__  # 全局唯一 id，也可以用 uuid4
 
 def assert_func(error: Error, pred: Bool, new_error: JaxException) -> Error:
   code = next_code()
@@ -333,7 +340,7 @@ def update_error(error, pred, code, metadata, payload, effect_type):
   return error._update(effect_type, out_err, out_code, metadata, out_payload)
 
 
-## Checkify transformation for plumbing functional error values.
+## 用于传递函数式错误值的 Checkify 变换。
 
 @lu.transformation_with_aux2
 def _flatten_and_get_error_metadata_thunk(f, store, *invals):
@@ -345,22 +352,22 @@ def _flatten_and_get_error_metadata_thunk(f, store, *invals):
 def default_checkify_rule(primitive: core.Primitive, error: Error,
                           enabled_errors, *invals: core.Value,
                           **params: Any) -> tuple[Error, Sequence[core.Value]]:
-  """Default rule for primitives in `checkify` interpreter."""
+  """`checkify` 解释器中原语的默认规则。"""
   if 'call_jaxpr' not in params:
-    # Default non-HOP case: just call primitive and don't update error.
+    # 默认的非高阶原语情形：只调用原语，不更新错误。
     return error, primitive.bind(*invals, **params)
 
-  # Code below handles call- and map-primitives, by recursively calling
-  # checkify_jaxpr.
+  # 下面的代码通过递归调用
+  # checkify_jaxpr 来处理 call 与 map 类原语。
   err_vals, err_tree = jtu.tree_flatten(error)
   num_error_vals = len(err_vals)
   if 'donated_invars' in params:
     params = dict(params, donated_invars=(*[False]*num_error_vals,
                                           *params['donated_invars']))
 
-  # call_jaxpr handling
+  # call_jaxpr 处理
   call_jaxpr = params.pop('call_jaxpr')
-  if isinstance(call_jaxpr, core.Jaxpr):  # jaxpr with attached consts
+  if isinstance(call_jaxpr, core.Jaxpr):  # 带附加常量的 jaxpr
     jaxpr, consts = call_jaxpr, call_jaxpr.consts
   else:
     jaxpr, consts = call_jaxpr, ()
@@ -404,7 +411,7 @@ def checkify_jaxpr_flat(jaxpr: core.Jaxpr, consts: Sequence[core.Value],
   foreach(write_env, jaxpr.constvars, consts)
   foreach(write_env, jaxpr.invars, in_args)
 
-  # interpreter loop
+  # 解释器主循环
   for eqn in jaxpr.eqns:
     invals = map(read_env, eqn.invars)
     checkify_rule = error_checks.get(
@@ -450,11 +457,11 @@ def _reduce_any_error(error: Error):
   out_error = out_error._replace(_metadata=error._metadata)
   return out_error
 
-## check_p primitive
+## check_p 原语
 
 check_p = core.Primitive('check')
 check_p.is_effectful = lambda _: True
-check_p.multiple_results = True  # zero results
+check_p.multiple_results = True  # 零个结果
 
 
 def _pp_check(eqn, context, settings) -> core.pp.Doc:
@@ -471,14 +478,14 @@ def _pp_check(eqn, context, settings) -> core.pp.Doc:
 
 core.pp_eqn_rules[check_p] = _pp_check
 
-# TODO(lenamartens): inherit from Exception instead of ValueError.
+# TODO(lenamartens): 改为继承 Exception 而不是 ValueError。
 class JaxRuntimeError(ValueError):
   pass
 
 @check_p.def_impl
 def check_impl(*args, err_tree, debug):
   if debug:
-    # NOOP (check will only trigger when discharged)
+    # 空操作（check 只有在被释放时才会触发）
     return []
   error = tree_unflatten(err_tree, args)
   exc = error.get_exception()
@@ -494,7 +501,7 @@ def check_abstract_eval(*args, err_tree, debug):
   del debug
   return [], set(tree_unflatten(err_tree, args)._pred.keys())
 
-# TODO(lenamartens) add in-depth error explanation to link to in module docs.
+# TODO(lenamartens) 补充深入的错误解释，并在模块文档中链接。
 functionalization_error = ValueError(
     'Cannot abstractly evaluate a checkify.check which was not'
     ' functionalized. This probably means you tried to stage'
@@ -504,7 +511,7 @@ functionalization_error = ValueError(
 
 def check_lowering_rule(ctx, *args, err_tree, debug):
   if debug:
-    # NOOP (check will only trigger when discharged)
+    # 空操作（check 只有在被释放时才会触发）
     return []
   if not config.xla_runtime_errors.value:
     raise functionalization_error
@@ -547,12 +554,12 @@ def check_batching_rule(batched_args, batch_dims, *, err_tree, debug):
 batching.primitive_batchers[check_p] = check_batching_rule
 
 def check_jvp_rule(primals, _, *, err_tree, debug):
-  # Check primals, discard tangents.
+  # 检查原始值，丢弃切向量。
   check_p.bind(*primals, err_tree=err_tree, debug=debug)
   return [], []
 ad.primitive_jvps[check_p] = check_jvp_rule
 
-## checkify rules
+## checkify 规则
 
 ErrorCheckRule = Callable  # (Error, FrozenSet[ErrorCategory], *in_vals, **params) -> (Any, Error)
 error_checks: dict[core.Primitive, ErrorCheckRule] = {}
@@ -580,7 +587,7 @@ def check_nans(prim, error, enabled_errors, out):
   return assert_func(error, any_nans, NaNError(get_traceback(), prim.name))
 
 
-# All primitives which can generate a NaN.
+# 所有可能产生 NaN 的原语。
 nan_primitives = [lax.acos_p, lax.acosh_p, lax.add_p, lax.asin_p, lax.asinh_p,
                   lax.atan2_p, lax.atan_p, lax.atanh_p, lax.bessel_i0e_p,
                   lax.bessel_i1e_p, lax.cbrt_p, lax.conv_general_dilated_p,
@@ -644,7 +651,7 @@ def gather_error_check(error, enabled_errors, operand, start_indices, *,
   if OOBError not in enabled_errors:
     return error, out
 
-  # compare to OOB masking logic in lax._gather_translation_rule
+  # 对比 lax._gather_translation_rule 中的越界掩码逻辑
   dnums = dimension_numbers
   operand_dims = np.array(operand.shape)
   num_batch_dims = len(start_indices.shape) - 1
@@ -660,7 +667,7 @@ def gather_error_check(error, enabled_errors, operand, start_indices, *,
 error_checks[lax.gather_p] = gather_error_check
 
 def div_error_check(error, enabled_errors, x, y):
-  """Checks for division by zero and NaN."""
+  """检查除零与 NaN。"""
   if DivisionByZeroError in enabled_errors:
     any_zero = jnp.any(jnp.equal(y, 0))
     error = assert_func(error, any_zero, DivisionByZeroError(get_traceback()))
@@ -672,7 +679,7 @@ def eval_jaxpr_error_check(error, enabled_errors, *invals, call_jaxpr, **_):
 error_checks[pe.eval_jaxpr_p] = eval_jaxpr_error_check
 
 def oob_payload(oob_mask, indices, dims_map, operand_shape):
-  # Get first OOB index, axis and axis size so it can be added to the error msg.
+  # 取出第一个越界索引、轴与轴长度，以便加入错误消息。
   flat_idx = jnp.argmin(jnp.logical_not(oob_mask))
   multi_idx = jnp.unravel_index(flat_idx, indices.shape)
   oob_axis = jnp.array(dims_map)[multi_idx[-1]]
@@ -682,7 +689,7 @@ def oob_payload(oob_mask, indices, dims_map, operand_shape):
   return payload
 
 def scatter_oob(operand, indices, updates, dnums):
-  # Ref: see clamping code used in scatter_translation_rule
+  # 参考：见 scatter_translation_rule 中使用的截断逻辑
   slice_sizes = []
   pos = 0
   for i in range(len(operand.shape)):
@@ -705,11 +712,10 @@ def scatter_oob(operand, indices, updates, dnums):
   payload = oob_payload(oob_mask, indices,
                         dnums.scatter_dims_to_operand_dims, operand.shape)
   return jnp.any(oob_mask), payload
-
 def scatter_error_check(prim, error, enabled_errors, operand, indices, updates,
                         *, update_jaxpr, update_consts, dimension_numbers,
                         indices_are_sorted, unique_indices, mode):
-  """Checks if indices are within bounds and update does not generate NaN."""
+  """检查索引是否越界，以及更新是否产生 NaN。"""
   out = prim.bind(
       operand, indices, updates, update_jaxpr=update_jaxpr,
       update_consts=update_consts, dimension_numbers=dimension_numbers,
@@ -734,7 +740,7 @@ error_checks[lax.scatter_min_p] = functools.partial(scatter_error_check,
 error_checks[lax.scatter_max_p] = functools.partial(scatter_error_check,
                                                     lax.scatter_max_p)
 
-# HOP error check rules
+# 高阶原语的错误检查规则
 
 @jtu.register_static
 class ErrorEffects:
@@ -761,8 +767,8 @@ def jaxpr_to_checkify_jaxpr(
 
 def cond_error_check(error: Error, enabled_errors, index, *ops,
                      branches, **params):
-  # Get the error-effects out of all branches so the cond can be called with
-  # a merged error with all these effects.
+  # 从所有分支中取出错误效果，这样调用 cond 时就能传入
+  # 一个合并了这些效果的错误。
   err_vals, err_tree = jtu.tree_flatten(error)
   in_avals = map(core.typeof, [*err_vals, *ops])
   def get_error_effects_from_jaxpr(jxpr):
@@ -773,7 +779,7 @@ def cond_error_check(error: Error, enabled_errors, index, *ops,
   merged_error = error._add_placeholder_effects(set().union(*effects))
   err_vals, err_tree = jtu.tree_flatten(merged_error)
 
-  # Update branch jaxprs to be checkified jaxprs.
+  # 把各分支的 jaxpr 更新为已 checkify 的 jaxpr。
   in_avals = map(core.typeof, [*err_vals, *ops])
   new_branches, out_trees, _ = unzip3(
       jaxpr_to_checkify_jaxpr(
@@ -783,7 +789,7 @@ def cond_error_check(error: Error, enabled_errors, index, *ops,
       index, *err_vals, *ops,
       branches=tuple(new_branches), **params)
 
-  # we need to merge metadata across out_trees (a tuple)
+  # 我们需要跨 out_trees（一个元组）合并元数据
   err0, out = tree_unflatten(out_trees[0], err_and_outs)
   merged_metadata = err0._metadata
   for tr in out_trees[1:]:
@@ -797,8 +803,8 @@ def scan_error_check(error, enabled_errors, *in_flat, reverse, length, jaxpr,
 
   consts, carry, xs = map(list, ft_in.update(in_flat).unpack())
   xs_mapped = [core.mapped_aval(length, 0, core.typeof(val)) for val in xs]
-  # Query body effects to create a merged error containing all effects (such
-  # that in and out carried error are of the same type).
+  # 查询循环体的效果，构造一个包含所有效果的合并错误
+  # （使得传入与传出的被携带错误具有相同类型）。
   err_vals, err_tree = jtu.tree_flatten(error)
   new_in_aval = map(core.typeof, [*err_vals, *consts, *carry]) + xs_mapped
   _, _, effects = jaxpr_to_checkify_jaxpr(jaxpr, enabled_errors,
@@ -807,7 +813,7 @@ def scan_error_check(error, enabled_errors, *in_flat, reverse, length, jaxpr,
   merged_error = error._add_placeholder_effects(effects)
   err_vals, err_tree = jtu.tree_flatten(merged_error)
 
-  # Create checked-jaxpr, with the needed pre-processing on the inputs.
+  # 创建已检查的 jaxpr，并对输入做所需的预处理。
   new_in_aval = map(core.typeof, [*err_vals, *consts, *carry]) + xs_mapped
   checked_jaxpr_, out_tree, _ = jaxpr_to_checkify_jaxpr(jaxpr, enabled_errors,
                                                         err_tree, *new_in_aval)
@@ -836,7 +842,7 @@ def checkify_while_body_jaxpr(
   def new_body_f(*c_consts_and_vals):
     c_consts, vals = split_list(c_consts_and_vals, [c_consts_num])
     out = body_f(*vals)
-    # This checks if the next cond application will error
+    # 这里检查下一次 cond 求值是否会出错
     lax.dce_sink(cond_f(*c_consts, *out))
     return out
   c_consts_avals = cond_jaxpr.in_avals[:c_consts_num]
@@ -855,26 +861,26 @@ def checkify_while_body_jaxpr(
 
 @weakref_lru_cache
 def ignore_error_output_jaxpr(jaxpr, num_error_vals: int):
-  """Constructs a checked jaxpr which does not output its error value."""
+  """构造一个不输出其错误值的已检查 jaxpr。"""
   return jaxpr.replace(outvars=jaxpr.outvars[num_error_vals:])
 
 def while_loop_error_check(error, enabled_errors, *in_flat, cond_nconsts,
                            cond_jaxpr, body_nconsts, body_jaxpr):
   if cond_jaxpr.out_avals[0].shape:
-    # TODO(lenamartens, sharadmv): support batched while.
+    # TODO(lenamartens, sharadmv): 支持批量化的 while。
     raise ValueError('Checkify does not support batched while-loops '
                      '(checkify-of-vmap-of-while). \nHint: if possible, move '
                      'the vmap to the outer level to get '
                      'vmap-of-checkify-of-while.')
 
   c_consts, b_consts, carry = split_list(in_flat, [cond_nconsts, body_nconsts])
-  # Check if the first cond application will error.
+  # 检查第一次 cond 求值是否会出错。
   error, _ = checkify_jaxpr(cond_jaxpr, enabled_errors, error, *c_consts, *carry)
 
   _, _, error_effects = checkify_while_body_jaxpr(cond_jaxpr, body_jaxpr,
                                                   enabled_errors, error,
                                                   cond_nconsts)
-  # merged error!
+  # 合并后的错误！
   error = error._add_placeholder_effects(error_effects)
   err_vals, err_tree = jtu.tree_flatten(error)
   checked_body_jaxpr_, body_out_tree, _ = checkify_while_body_jaxpr(
@@ -896,7 +902,7 @@ def while_loop_error_check(error, enabled_errors, *in_flat, cond_nconsts,
   all_out_vals = lax.while_p.bind(
       *new_in_flat, cond_nconsts=cond_nconsts, cond_jaxpr=compat_cond_jaxpr,
       body_nconsts=cond_nconsts+body_nconsts, body_jaxpr=checked_body_jaxpr)
-  # body_out_tree will have all the metadata of cond because it executes a cond!
+  # body_out_tree 会带有 cond 的全部元数据，因为它执行了一次 cond！
   error, out = tree_unflatten(body_out_tree, all_out_vals)
   return error, out
 error_checks[lax.while_p] = while_loop_error_check
@@ -906,14 +912,14 @@ def pjit_error_check(error, enabled_errors, *vals_in, jaxpr,
                      in_layouts, out_layouts,
                      donated_invars, ctx_mesh, name, inline, keep_unused,
                      compiler_options_kvs):
-  # jaxpr to checked_jaxpr
+  # 把 jaxpr 转换为已检查的 jaxpr
   err_vals, err_tree = jtu.tree_flatten(error)
   new_vals_in = [*err_vals, *vals_in]
   in_avals = tuple(map(core.typeof, new_vals_in))
   checked_jaxpr, out_tree, _ = jaxpr_to_checkify_jaxpr(jaxpr, enabled_errors,
                                                        err_tree, *in_avals)
 
-  # Update pjit params to account for extra error values.
+  # 更新 pjit 参数以考虑额外的错误值。
   num_error_vals = len(err_vals)
   num_out_error_vals = out_tree.num_leaves - len(out_shardings)
   sharding = sharding_impls.UNSPECIFIED
@@ -980,7 +986,7 @@ def shard_map_error_check(
 
   err_vals, err_tree = jtu.tree_flatten(error)
   num_error_vals = len(err_vals)
-  # Replicated sharding for in errors.
+  # 输入错误的副本式分片。
   new_in_specs = (*([P()] * num_error_vals), *in_specs)
   new_vals_in = [*err_vals, *vals_in]
   in_avals = list(map(core.typeof, new_vals_in))
@@ -994,7 +1000,7 @@ def shard_map_error_check(
   with (jshmap._extend_axis_env(mesh, manual_axes),
         mesh_lib.use_abstract_mesh(jshmap._as_manual_mesh(mesh, manual_axes)),
         config._check_vma(check_vma)):
-    # jaxpr to checked_jaxpr
+    # 把 jaxpr 转换为已检查的 jaxpr
     checked_jaxpr, out_tree, _ = jaxpr_to_checkify_jaxpr(
         jaxpr, enabled_errors, err_tree, *in_avals
     )
@@ -1012,8 +1018,8 @@ def shard_map_error_check(
         ft.flatten((tuple(checked_jaxpr.in_avals), {})),
         debug_info=checked_jaxpr.debug_info)
 
-  # Update shard_map params to account for extra error values.
-  # Use fully sharded partitioning for out errors.
+  # 更新 shard_map 参数以考虑额外的错误值。
+  # 输出错误使用完全分片的分片方式。
   new_out_specs = (*([P(mesh.axis_names)] * num_out_error_vals), *out_specs)
   new_params = dict(
       jaxpr=checked_jaxpr,
@@ -1032,15 +1038,15 @@ def custom_jvp_call_rule(in_err: Error,
                          enabled_errors: set, *in_vals, num_consts,
                          jvp_jaxpr_fun: lu.WrappedFun,
                          call_jaxpr: core.Jaxpr, **params):
-  # The types to have in mind are:
+  # 需要记住的类型是：
   #   jvp : (a -> b) -> (a, T a) -> (b, T b)
   #   checkify : (a -> b) -> a -> Err b
   #   jvp-of-checkify : (a -> b) -> (a, T a) -> (Err b, T (Err b))
-  # where because Err is a pytree, we necessarily have T (Err b) = Err' (T b)
-  # where the other Err' components are trivial (of float0 dtype).
-  # Semantically, we don't add checks to the JVP rule. To check the result of a
-  # JVP rule, one must instead use checkify-of-jvp. Thus this implementation
-  # just forwards the input error and code (and trivial tangents) to the output.
+  # 因为 Err 是 pytree，必然有 T (Err b) = Err' (T b)，
+  # 其中 Err' 的其余分量都是平凡的（float0 数据类型）。
+  # 从语义上说，我们不给 JVP 规则添加检查。要检查
+  # JVP 规则的结果，必须改用 checkify-of-jvp。因此本实现
+  # 只是把输入的错误与错误码（以及平凡的切向量）转发到输出。
   err_vals, err_tree = jtu.tree_flatten(in_err)
   dbg = call_jaxpr.debug_info
   if dbg.arg_names is not None:
@@ -1061,16 +1067,16 @@ def custom_jvp_call_rule(in_err: Error,
     out_err, out_vals = tree_unflatten(err_and_out_tree, all_outs)
   else:
     err_vals, out_vals = split_list(all_outs, [len(err_vals)])
-    # forward input error to output
+    # 把输入的错误转发到输出
     out_err = jtu.tree_unflatten(err_tree, err_vals)
   return out_err, out_vals
 error_checks[custom_derivatives.custom_jvp_call_p] = custom_jvp_call_rule
 
-# Compared to custom_derivatives.lift_jvp, we're handling the extra inputs and
-# outputs that checkify adds (just forwarding the error data's primal and
-# tangent components). The jaxpr in jvp_jaxpr_fun doesn't expect those.
-# TODO(mattjj): can we simplify this, or dedup with custom_derivatives.lift_jvp?
-# Adding another layer of lu.transformation was tricky, though maybe doable.
+# 与 custom_derivatives.lift_jvp 相比，我们额外处理了 checkify
+# 加入的输入与输出（只是转发错误数据的原始值与
+# 切向量分量）。jvp_jaxpr_fun 中的 jaxpr 并不期望这些。
+# TODO(mattjj): 能否简化这一实现，或与 custom_derivatives.lift_jvp 去重？
+# 再增加一层 lu.transformation 当时很难处理，虽然也许可行。
 def lift_jvp(num_errs: int, num_consts: int,
              jvp_jaxpr_fun: lu.WrappedFun) -> lu.WrappedFun:
   def jvp(*xs):
@@ -1107,18 +1113,18 @@ def custom_vjp_call_rule(in_err, enabled_errors, *in_vals,
       checkified_fun)
 
   def checkified_fwd(*args):
-    # TODO(lenamartens, sharadmv): why not checkify here?
+    # TODO(lenamartens, sharadmv): 这里为什么不 checkify 呢？
     xs, zeros = args[::2], args[1::2]
     xs, zeros = xs[num_errs:], zeros[num_errs:]
     fwd_jaxpr, fwd_consts = fwd_jaxpr_thunk.call_wrapped(*zeros)
     xs_without_consts = xs[num_consts:]
     return core.eval_jaxpr(fwd_jaxpr, fwd_consts, *xs_without_consts)
 
-  # TODO(necula): the fwd result_paths are not quite the same as fun_jaxpr
+  # TODO(necula): 前向的 result_paths 与 fun_jaxpr 并不完全相同
   checkified_fwd_wrapped = lu.wrap_init(checkified_fwd,
                                         debug_info=fwd_jaxpr_thunk.debug_info)
   def bwd_with_errs(*args):
-    cts, logs = bwd.call_wrapped(*args)  # flat bwd returns a (cts, logs) pair
+    cts, logs = bwd.call_wrapped(*args)  # 扁平化的 bwd 返回 (cts, logs) 对
     return (*(None,) * num_errs, *cts), logs
   bwd_ = lu.wrap_init(bwd_with_errs, debug_info=bwd.debug_info)
   checkified_fwd_wrapped, fwd_out_tree = flatten_fun_output(checkified_fwd_wrapped)
@@ -1138,9 +1144,9 @@ error_checks[custom_derivatives.custom_vjp_call_p] = custom_vjp_call_rule
 def check_discharge_rule(error, enabled_errors, *args, err_tree, debug):
   del debug
   new_error = tree_unflatten(err_tree, args)
-  # Split up new_error into error to be functionalized if it's included in
-  # enabled_errors (=discharged_error) and an error to be defunctionalized if
-  # it's not included (=recharged_error)
+  # 把 new_error 拆分为两部分：若它包含在 enabled_errors 中
+  # （=被释放的错误），则要函数化的错误；若不包含
+  # （=被重新充入的错误），则要去函数化的错误。
   discharged_error = error
   recharged_error = init_error
   for error_effect in new_error._pred.keys():
@@ -1157,14 +1163,14 @@ def check_discharge_rule(error, enabled_errors, *args, err_tree, debug):
   discharged_error = discharged_error._replace(
       _metadata={**new_error._metadata, **discharged_error._metadata})
   recharged_error = recharged_error._replace(_metadata=new_error._metadata)
-  # TODO(lenamartens): we actually need to recharge, but this would be a
-  # breaking API change so leaving for a follow-up.
+  # TODO(lenamartens): 我们其实需要重新充入，但这会是一个
+  # 破坏性的 API 变更，所以留待后续处理。
   # check_error(recharged_error)
   return discharged_error, []
 error_checks[check_p] = check_discharge_rule
 
 
-## checkify public api
+## checkify 公开 API
 
 user_checks = frozenset({FailedCheckError})
 nan_checks = frozenset({NaNError})
@@ -1178,47 +1184,42 @@ all_checks = automatic_checks | user_checks
 def checkify(f: Callable[..., Out],
              errors: frozenset[ErrorCategory] = user_checks
              ) -> Callable[..., tuple[Error, Out]]:
-  """Functionalize `check` calls in `fun`, and optionally add run-time error checks.
+  """把 `fun` 中的 `check` 调用函数化，并可选地添加运行时错误检查。
 
-  Run-time errors are either user-added :func:`~check` assertions, or
-  automatically added checks like NaN checks, depending on the ``errors``
-  argument.
+  运行时错误要么是用户添加的 :func:`~check` 断言，要么是
+  自动添加的检查（如 NaN 检查），取决于 ``errors`` 参数。
 
-  The returned function will return an Error object `err` along with the output
-  of the original function. ``err.get()`` will either return ``None`` (if no
-  error occurred) or a string containing an error message. This error message
-  will correspond to the first error which occurred. ``err.throw()`` will raise
-  a ValueError with the error message if an error occurred.
+  返回的函数会在原函数的输出之外再返回一个 Error 对象 `err`。
+  ``err.get()`` 要么返回 ``None``（未发生错误），要么返回包含错误
+  消息的字符串。该错误消息对应第一个发生的错误。若发生错误，
+  ``err.throw()`` 会带着错误消息抛出 ValueError。
 
-  By default only user-added :func:`~check` assertions are enabled. You can
-  enable automatic checks through the ``errors`` argument.
+  默认只启用用户添加的 :func:`~check` 断言。你可以通过
+  ``errors`` 参数启用自动检查。
 
-  The automatic check sets which can be enabled, and when an error is generated:
-    - ``user_checks``: a :func:`~check` evaluated to False.
-    - ``nan_checks``: a floating-point operation generated a NaN value
-      as output.
-    - ``div_checks``: a division by zero.
-    - ``index_checks``: an index was out-of-bounds.
+  可启用的自动检查集合，以及它们何时会产生错误：
+    - ``user_checks``: 一个 :func:`~check` 求值为 False。
+    - ``nan_checks``: 一个浮点运算产生了 NaN 值作为输出。
+    - ``div_checks``: 一次除零。
+    - ``index_checks``: 一个索引越界。
 
-  Multiple categories can be enabled together by passing in an error `Set` (eg.
-  ``errors=nan_checks``). Multiple sets can be re-combined (eg.
-  ``errors=float_checks|user_checks``)
+  传入一个错误 `Set` 可以同时启用多个类别（例如
+  ``errors=nan_checks``）。多个集合也可以重新组合（例如
+  ``errors=float_checks|user_checks``）
 
   Args:
-    fun: Callable which can contain user checks (see :func:`~check`).
-    errors: A set of ErrorCategory values which defines the set of enabled
-      checks. By default only explicit ``checks`` are enabled
-      (``user_checks``). You can also for example enable NAN and
-      DIV errors by passing the ``float_checks`` set, or for
-      example combine multiple sets through set operations
-      (``float_checks | user_checks``)
+    fun: 可以包含用户检查的可调用对象（见 :func:`~check`）。
+    errors: 一组 ErrorCategory 值，定义要启用的检查集合。
+      默认只启用显式的 ``checks``（``user_checks``）。你也可以
+      例如传入 ``float_checks`` 集合来启用 NAN 与 DIV 错误，或者
+      通过集合运算组合多个集合
+      （``float_checks | user_checks``）
   Returns:
-    A function which accepts the same arguments as ``fun`` and returns as output
-    a pair where the first element is an ``Error`` value, representing the first
-    failed :func:`~check`, and the second element is the original output of
-    ``fun``.
+    一个函数，它接受与 ``fun`` 相同的参数，并返回一个二元组：
+    第一个元素是 ``Error`` 值，表示第一个失败的 :func:`~check`；
+    第二个元素是 ``fun`` 的原始输出。
 
-  For example:
+  例如：
 
     >>> import jax
     >>> import jax.numpy as jnp
@@ -1236,14 +1237,14 @@ def checkify(f: Callable[..., Out],
   """
   @traceback_util.api_boundary
   def checked_fun(*args, **kwargs):
-    # close over all arguments so they're not turned into abstract values.
+    # 闭包捕获所有参数，使它们不会被转换为抽象值。
     in_avals = ft.flatten(((), {}))
     closed_f = lambda: f(*args, **kwargs)
-    # stage:
+    # 暂存：
     debug_info = api_util.debug_info("checkify", f, args, kwargs).with_unknown_names()
     jaxpr_, out_avals = pe.trace_to_jaxpr(closed_f, in_avals, debug_info)
     jaxpr, consts = pe.separate_consts(jaxpr_)
-    # checkify:
+    # checkify：
     error, out_flat = checkify_jaxpr(jaxpr, errors, init_error, *consts)
     return error, out_avals.update(out_flat).unflatten()
   return checked_fun
@@ -1253,26 +1254,24 @@ def check(pred: Bool, msg: str,
           debug: bool = False,
           **fmt_kwargs,
           ) -> None:
-  """Check a predicate, add an error with msg if predicate is False.
+  """检查一个谓词，若谓词为 False 则添加带 msg 的错误。
 
-  This is an effectful operation, and can't be staged (jitted/scanned/...).
-  Before staging a function with checks, :func:`~checkify` it!
+  这是一个有副作用的操作，不能被暂存（jitted/scanned/...）。
+  在对带检查的函数做暂存之前，先 :func:`~checkify` 它！
 
   Args:
-    pred: if False, a FailedCheckError error is added.
-    msg: error message if error is added. Can be a format string.
-    debug: Whether to turn on debugging mode. If True, check will be removed
-      during execution. If False, the check must be functionalized using
-      checkify.checkify.
-    fmt_args, fmt_kwargs: Positional and keyword formatting arguments for
-      `msg`, eg.:
+    pred: 若为 False，则添加一个 FailedCheckError 错误。
+    msg: 添加错误时的错误消息。可以是格式字符串。
+    debug: 是否开启调试模式。若为 True，check 会在执行时被移除。
+      若为 False，则必须用 checkify.checkify 把该检查函数化。
+    fmt_args, fmt_kwargs: `msg` 的位置与关键字格式化参数，例如：
       ``check(.., "check failed on values {} and {named_arg}", x, named_arg=y)``
-      Note that these arguments can be traced values allowing you to add
-      run-time values to the error message.
-      Note that tracking these run-time arrays will increase your memory usage,
-      even if no error happens.
+      注意这些参数可以是追踪值，从而允许你向错误消息中加入
+      运行时的值。
+      注意追踪这些运行时数组会增加内存占用，
+      即使没有发生错误也是如此。
 
-  For example:
+  例如：
 
     >>> import jax
     >>> import jax.numpy as jnp
@@ -1318,23 +1317,22 @@ def is_scalar_pred(pred) -> bool:
 
 
 def debug_check(pred: Bool, msg: str, *fmt_args, **fmt_kwargs) -> None:
-  """Check a predicate when running under checkify, otherwise is a no-op.
+  """在 checkify 下运行时检查一个谓词，否则是空操作。
 
-  A `debug_check` will only be run if it is transformed by :func:`~checkify`,
-  otherwise the check will be dropped.
+  `debug_check` 只有在被 :func:`~checkify` 变换时才会运行，
+  否则该检查会被丢弃。
 
   Args:
-    pred: if False, a FailedCheckError error is added.
-    msg: error message if error is added.
-    fmt_args, fmt_kwargs: Positional and keyword formatting arguments for
-      `msg`, eg.:
+    pred: 若为 False，则添加一个 FailedCheckError 错误。
+    msg: 添加错误时的错误消息。
+    fmt_args, fmt_kwargs: `msg` 的位置与关键字格式化参数，例如：
       ``debug_check(.., "check failed on values {} and {named}", x, named=y)``
-      Note that these arguments can be traced values allowing you to add
-      run-time values to the error message.
-      Note that tracking these run-time arrays will increase your memory usage,
-      even if no error happens.
+      注意这些参数可以是追踪值，从而允许你向错误消息中加入
+      运行时的值。
+      注意追踪这些运行时数组会增加内存占用，
+      即使没有发生错误也是如此。
 
-  For example:
+  例如：
 
     >>> import jax
     >>> import jax.numpy as jnp
@@ -1355,46 +1353,41 @@ def debug_check(pred: Bool, msg: str, *fmt_args, **fmt_kwargs) -> None:
 
 
 def check_error(error: Error) -> None:
-  """Raise an Exception if ``error`` represents a failure. Functionalized by :func:`~checkify`.
+  """若 ``error`` 表示一次失败，则抛出异常。由 :func:`~checkify` 函数化。
 
-  The semantics of this function are equivalent to:
+  该函数的语义等价于：
 
   >>> def check_error(err: Error) -> None:
   ...   err.throw()  # can raise ValueError
 
-  But unlike that implementation, ``check_error`` can be functionalized using
-  the :func:`~checkify` transformation.
+  但与那个实现不同，``check_error`` 可以用
+  :func:`~checkify` 变换来函数化。
 
-  This function is similar to :func:`~check` but with a different signature: whereas
-  :func:`~check` takes as arguments a boolean predicate and a new error message
-  string, this function takes an ``Error`` value as argument. Both :func:`~check`
-  and this function raise a Python Exception on failure (a side-effect), and
-  thus cannot be staged out by :func:`~jax.jit`, :func:`~jax.pmap`,
-  :func:`~jax.lax.scan`, etc. Both also can
-  be functionalized by using :func:`~checkify`.
+  该函数与 :func:`~check` 类似，但签名不同：:func:`~check` 以
+  布尔谓词和新的错误消息字符串为参数，而该函数以 ``Error``
+  值为参数。:func:`~check` 与该函数在失败时都会抛出 Python
+  异常（一种副作用），因此无法被 :func:`~jax.jit`、:func:`~jax.pmap`、
+  :func:`~jax.lax.scan` 等暂存出去。二者也都可以
+  用 :func:`~checkify` 函数化。
 
-  But unlike :func:`~check`, this function is like a direct inverse of
-  :func:`~checkify`:
-  whereas :func:`~checkify` takes as input a function which
-  can raise a Python
-  Exception and produces a new function without that effect but which produces
-  an ``Error`` value as output, this ``check_error`` function can accept an
-  ``Error`` value as input and can produce the side-effect of raising an
-  Exception. That is, while :func:`~checkify` goes from
-  functionalizable Exception
-  effect to error value, this ``check_error`` goes from error value to
-  functionalizable Exception effect.
+  但与 :func:`~check` 不同，该函数像是 :func:`~checkify` 的直接逆：
+  :func:`~checkify` 接受一个可能抛出 Python
+  异常的函数，产生一个没有该效果、但以 ``Error`` 值为输出的
+  新函数；而这个 ``check_error`` 函数可以接受 ``Error`` 值作为
+  输入，并产生抛出异常的副作用。也就是说，:func:`~checkify` 是
+  从可函数化的异常效果走向错误值，而这个 ``check_error`` 则是从错误
+  值走向可函数化的异常效果。
 
-  ``check_error`` is useful when you want to turn checks represented by an
-  ``Error`` value (produced by functionalizing ``checks`` via
-  :func:`~checkify`) back into Python Exceptions.
+  当你想把由 ``Error`` 值（通过 :func:`~checkify` 函数化
+  ``checks`` 得到）表示的检查重新变回 Python 异常时，
+  ``check_error`` 很有用。
 
   Args:
-    error: Error to check.
+    error: 要检查的 Error。
 
-  For example, you might want to functionalize part of your program through
-  checkify, stage out your functionalized code through :func:`~jax.jit`, then
-  re-inject your error value outside of the :func:`~jax.jit`:
+  例如，你可能想用 checkify 函数化程序的一部分，把函数化后的
+  代码通过 :func:`~jax.jit` 暂存出去，然后在 :func:`~jax.jit`
+  之外重新注入你的错误值：
 
   >>> import jax
   >>> from jax.experimental import checkify

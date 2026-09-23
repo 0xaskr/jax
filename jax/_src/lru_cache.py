@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 JAX 编译缓存的 LRU（最近最少使用）磁盘后端。
+# `LRUCache` 实现 `CacheInterface`，把编译产物按键写为缓存目录下的文件，
+# 并用同名 `-atime` 附属文件记录访问时间；写入前用 `filelock` 加锁，
+# 再用优先队列按访问时间淘汰最久未用的条目，使目录总大小不超过 `max_size`。
+# 当 `max_size` 为 -1 时不淘汰，此时它退化为无容量限制的普通缓存；
+# 路径为远程文件系统时依赖 `etils[epath]`，并使用软文件锁。
+
 from __future__ import annotations
 
 import heapq
@@ -41,24 +48,24 @@ def _is_local_filesystem(path: str) -> bool:
 
 
 class LRUCache(CacheInterface):
-  """Bounded cache with least-recently-used (LRU) eviction policy.
+  """具有最近最少使用（LRU）淘汰策略的有界缓存。
 
-  This implementation includes cache reading, writing and eviction
-  based on the LRU policy.
+  该实现包含缓存的读取、写入与淘汰，
+  三者都基于 LRU 策略。
 
-  Notably, when ``max_size`` is set to -1, the cache eviction
-  is disabled, and the LRU cache functions as a normal cache
-  without any size limitations.
+  特别地，当 ``max_size`` 被设为 -1 时缓存淘汰会被禁用，
+  此时该 LRU 缓存的行为与普通缓存一致，
+  不再有任何容量限制。
   """
 
   def __init__(self, path: str, *, max_size: int, lock_timeout_secs: float | None = 10):
     """Args:
 
-      path: The path to the cache directory.
-      max_size: The maximum size of the cache in bytes. Caching will be
-        disabled if this value is set to ``0``. A special value of ``-1``
-        indicates no limit, allowing the cache size to grow indefinitely.
-      lock_timeout_secs: (optional) The timeout for acquiring a file lock.
+      path: 缓存目录的路径。
+      max_size: 缓存的最大字节数。若该值被设为 ``0``，
+        则禁用缓存。特殊值 ``-1`` 表示不设限制，
+        缓存大小可以无限增长。
+      lock_timeout_secs:（可选）获取文件锁的超时时间。
     """
     if not _is_local_filesystem(path) and not pathlib.epath_installed:
       raise RuntimeError("Please install the `etils[epath]` package to specify a cache directory on a non-local filesystem")
@@ -66,7 +73,7 @@ class LRUCache(CacheInterface):
     self.path = self._path = pathlib.Path(path)
     self.path.mkdir(parents=True, exist_ok=True)
 
-    self.eviction_enabled = max_size != -1  # no eviction if `max_size` is set to -1
+    self.eviction_enabled = max_size != -1  # 若 `max_size` 为 -1 则不淘汰
 
     if self.eviction_enabled:
       if filelock is None:
@@ -82,13 +89,13 @@ class LRUCache(CacheInterface):
         self.lock = filelock.SoftFileLock(self.lock_path)
 
   def get(self, key: str) -> bytes | None:
-    """Retrieves the cached value for the given key.
+    """获取给定键对应的缓存值。
 
     Args:
-      key: The key for which the cache value is retrieved.
+      key: 要获取缓存值所用的键。
 
     Returns:
-      The cached data as bytes if available; ``None`` otherwise.
+      若存在则返回以字节表示的缓存数据，否则返回 ``None``。
     """
     if not key:
       raise ValueError("key cannot be empty")
@@ -119,19 +126,19 @@ class LRUCache(CacheInterface):
         self.lock.release()
 
   def put(self, key: str, value: bytes) -> None:
-    """Adds a new entry to the cache.
+    """向缓存中添加一个新条目。
 
-    If a cache item with the same key already exists, no action
-    will be taken, even if the value is different.
+    如果已存在相同键的缓存项，则不做任何操作，
+    即使其值不同。
 
     Args:
-      key: The key under which the data will be stored.
-      val: The data to be stored.
+      key: 存储数据所使用的键。
+      val: 要存储的数据。
     """
     if not key:
       raise ValueError("key cannot be empty")
 
-    # prevent adding entries that exceed the maximum size limit of the cache
+    # 防止加入大小超过缓存最大容量限制的条目
     if self.eviction_enabled and len(value) > self.max_size:
       msg = (f"Cache value for key {key!r} of size {len(value)} bytes exceeds "
              f"the maximum cache size of {self.max_size} bytes")
@@ -161,26 +168,26 @@ class LRUCache(CacheInterface):
         self.lock.release()
 
   def _evict_if_needed(self, *, additional_size: int = 0) -> None:
-    """Evicts the least recently used items from the cache if necessary
-    to ensure the cache does not exceed its maximum size.
+    """如有必要则从缓存中淘汰最近最少使用的条目，
+    以确保缓存不超过其最大容量。
 
     Args:
-      additional_size: The size of the new entry being added to the cache.
-        This is included to account for the new entry when checking if
-        eviction is needed.
+      additional_size: 即将加入缓存的新条目的大小。
+        在判断是否需要淘汰时把它计入，
+        以便将新条目也考虑在内。
     """
     if not self.eviction_enabled:
       return
 
-    # a priority queue, each element is a tuple `(file_atime, key, file_size)`
+    # 一个优先队列，每个元素是一个元组 `(file_atime, key, file_size)`
     h: list[tuple[int, str, int]] = []
     dir_size = 0
     for cache_path in self.path.glob(f"*{_CACHE_SUFFIX}"):
       file_stat = cache_path.stat()
 
-      # `pathlib` and `etils[epath]` have different API for obtaining the size
-      # of a file, and we need to support them both.
-      # See also https://github.com/google/etils/issues/630
+      # `pathlib` 与 `etils[epath]` 获取文件大小的 API 不同，
+      # 而这两种情况我们都需要支持。
+      # 另见 https://github.com/google/etils/issues/630
       file_size = file_stat.st_size if not pathlib.epath_installed else file_stat.length  # pyrefly: ignore[missing-attribute]
 
       key = cache_path.name.removesuffix(_CACHE_SUFFIX)
@@ -191,8 +198,8 @@ class LRUCache(CacheInterface):
       heapq.heappush(h, (file_atime, key, file_size))
 
     target_size = self.max_size - additional_size
-    # evict files until the directory size is less than or equal
-    # to `target_size`
+    # 不断淘汰文件，直到目录大小小于或等于
+    # `target_size`
     while dir_size > target_size:
       file_atime, key, file_size = heapq.heappop(h)
 

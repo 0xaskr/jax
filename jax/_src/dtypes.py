@@ -11,13 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：定义 JAX 的数据类型系统，包括扩展 dtype、类型提升格与 dtype 规范化。
+# 本模块为 `jax.numpy`、`jax.lax` 等前端提供公共 dtype API：`canonicalize_dtype`
+# 按 x64 配置把 dtype 归一化，`result_type` / `promote_types` 按 JAX 自己的规则
+# 求类型提升的最小上界，`issubdtype` / `isdtype` 负责类型层级判断。
+# 它还注册并校验自定义浮点（bfloat16、float8/float6/float4）、子字节整型
+# （int1/2/4）以及 `prng_key`、`float0` 等扩展 dtype，其规则与 NumPy 并不相同。
 
-# Array type functions.
+# 数组类型相关函数。
 #
-# JAX dtypes differ from NumPy in both:
-# a) their type promotion rules, and
-# b) the set of supported types (e.g., bfloat16),
-# so we need our own implementation that deviates from NumPy in places.
+# JAX 的 dtype 与 NumPy 在两方面存在差异：
+# a) 类型提升规则不同，
+# b) 支持的类型集合不同（例如 bfloat16），
+# 因此我们需要自己的实现，并在若干地方有意偏离 NumPy。
 
 from __future__ import annotations
 
@@ -53,10 +59,10 @@ export = set_module('jax.dtypes')
 
 @export
 class extended(np.generic):
-  """Scalar class for extended dtypes.
+  """扩展 dtype 的标量类。
 
-  This is an abstract class that should never be instantiated, but rather
-  exists for the sake of `jnp.issubdtype`.
+  这是一个抽象类，绝不应该被实例化，它的存在只是为了支持
+  `jnp.issubdtype`。
 
   Examples:
     >>> from jax import random
@@ -69,10 +75,10 @@ class extended(np.generic):
 
 @export
 class prng_key(extended):
-  """Scalar class for PRNG Key dtypes.
+  """PRNG 密钥 dtype 的标量类。
 
-  This is an abstract class that should never be instantiated, but rather
-  exists for the sake of `jnp.issubdtype`.
+  这是一个抽象类，绝不应该被实例化，它的存在只是为了支持
+  `jnp.issubdtype`。
 
   Examples:
     >>> from jax import random
@@ -84,14 +90,14 @@ class prng_key(extended):
 
 
 class ExtendedDType(StrictABC):
-  """Abstract Base Class for extended dtypes"""
+  """扩展 dtype 的抽象基类"""
   @property
   @abc.abstractmethod
   def type(self) -> type: ...
 
   _rules: Any = None
 
-# fp8 support
+# fp8 支持
 float8_e3m4: type[np.generic] = ml_dtypes.float8_e3m4
 float8_e4m3: type[np.generic] = ml_dtypes.float8_e4m3
 float8_e8m0fnu: type[np.generic] = ml_dtypes.float8_e8m0fnu
@@ -110,26 +116,26 @@ _float8_e4m3fnuz_dtype: np.dtype = np.dtype(float8_e4m3fnuz)
 _float8_e5m2_dtype: np.dtype = np.dtype(float8_e5m2)
 _float8_e5m2fnuz_dtype: np.dtype = np.dtype(float8_e5m2fnuz)
 
-# fp6 support
+# fp6 支持
 float6_e2m3fn: type[np.generic] = ml_dtypes.float6_e2m3fn
 float6_e3m2fn: type[np.generic] = ml_dtypes.float6_e3m2fn
 
 _float6_e2m3fn_dtype: np.dtype = np.dtype(float6_e2m3fn)
 _float6_e3m2fn_dtype: np.dtype = np.dtype(float6_e3m2fn)
 
-# fp4 support
+# fp4 支持
 float4_e2m1fn: type[np.generic] = ml_dtypes.float4_e2m1fn
 
 _float4_e2m1fn_dtype: np.dtype = np.dtype(float4_e2m1fn)
 
 def supports_inf(dtype: DTypeLike) -> bool:
-  """Return true if the dtype supports infinity, else return False."""
+  """如果该 dtype 支持无穷大则返回 True，否则返回 False。"""
   typ = np.dtype(dtype).type
   if typ in {float8_e4m3b11fnuz, float8_e4m3fn, float8_e4m3fnuz, float8_e5m2fnuz}:
     return False
   return issubdtype(dtype, np.inexact)
 
-# bfloat16 support
+# bfloat16 支持
 bfloat16: type[np.generic] = ml_dtypes.bfloat16
 _bfloat16_dtype: np.dtype = np.dtype(bfloat16)
 
@@ -192,7 +198,7 @@ uint2: type[np.generic] = ml_dtypes.uint2
 _int2_dtype: np.dtype = np.dtype(int2)
 _uint2_dtype: np.dtype = np.dtype(uint2)
 
-# 4-bit integer support
+# 4 位整数支持
 int4: type[np.generic] = ml_dtypes.int4
 uint4: type[np.generic] = ml_dtypes.uint4
 _int4_dtype = np.dtype(int4)
@@ -215,7 +221,7 @@ if hasattr(ml_dtypes, 'uint1'):
   _uint1_dtype = np.dtype(uint1)
   _intn_dtypes.append(_uint1_dtype)
 
-# Default types.
+# 默认类型。
 bool_ = np.bool_
 int_: type[Any] = np.int64
 uint: type[Any] = np.uint64
@@ -223,9 +229,9 @@ float_: type[Any] = np.float64
 complex_: type[Any] = np.complex128
 
 
-# Default dtypes. These are intended to have the same semantics as, say,
-# canonicalize_dtype(np.float64), but are preparing for the reduction in the
-# number of places we perform dtype canonicalization.
+# 默认 dtype。它们意在具有与（例如）canonicalize_dtype(np.float64)
+# 相同的语义，但这样划分是为了将来减少我们执行
+# dtype 规范化的调用点数量。
 
 
 def default_int_dtype() -> DType:
@@ -260,9 +266,9 @@ default_types: dict[str, Callable[[], DType]] = {
 
 def jax_dtype(obj: DTypeLike | None, *, align: bool = False,
               copy: bool = False) -> DType:
-  """Cast an object to a dtype, respecting JAX dtype defaults.
+  """把对象转换为 dtype，并遵循 JAX 的默认 dtype 规则。
 
-  Arguments mirror those of :func:`numpy.dtype`.
+  参数与 :func:`numpy.dtype` 一致。
   """
   if obj is None:
     obj = default_float_dtype()
@@ -280,13 +286,13 @@ _DEFAULT_TYPEMAP: dict[type, Callable[[], np.dtype]] = {
 }
 
 def itemsize_bits(dtype: DTypeLike) -> int:
-  """Number of bits per element for the dtype."""
-  # Note: we cannot use dtype.itemsize here because this is
-  # incorrect for sub-byte integer types.
+  """该 dtype 每个元素占用的位数。"""
+  # 注意：这里不能使用 dtype.itemsize，
+  # 因为对子字节整型来说它是不正确的。
   if dtype is None:
     raise ValueError("dtype cannot be None.")
   if dtype == np.dtype(bool):
-    return 8  # physical bit layout for boolean dtype
+    return 8  # 布尔 dtype 的物理位布局
   elif issubdtype(dtype, np.integer):
     return iinfo(dtype).bits
   elif issubdtype(dtype, np.floating):
@@ -296,7 +302,7 @@ def itemsize_bits(dtype: DTypeLike) -> int:
   else:
     raise ValueError(f"unexpected input: {dtype=}")
 
-# Trivial vectorspace datatype needed for tangent values of int/bool primals
+# int/bool 原始值的切向量所需的平凡向量空间数据类型
 float0: np.dtype = np.dtype([('float0', np.void, 0)])
 
 _dtype_to_32bit_dtype: dict[DType, DType] = {
@@ -306,9 +312,9 @@ _dtype_to_32bit_dtype: dict[DType, DType] = {
     np.dtype('complex128'): np.dtype('complex64'),
 }
 
-# Note: we promote narrow types to float32 here for backward compatibility
-# with earlier approaches. We might consider revisiting this, or perhaps
-# tying the logic more closely to the type promotion lattice.
+# 注意：为与早期做法保持向后兼容，这里把窄类型
+# 提升为 float32。我们可能会重新考虑这一点，
+# 或者把该逻辑与类型提升格结合得更紧密。
 _dtype_to_inexact: dict[DType, DType] = {
     np.dtype(k): np.dtype(v) for k, v in [
         ('bool', 'float32'),
@@ -321,19 +327,19 @@ _dtype_to_inexact: dict[DType, DType] = {
 }
 
 def to_numeric_dtype(dtype: DTypeLike) -> DType:
-  """Promotes a dtype into an numeric dtype, if it is not already one."""
+  """若该 dtype 还不是数值 dtype，则将其提升为数值 dtype。"""
   dtype_ = np.dtype(dtype)
   return np.dtype('int32') if dtype_ == np.dtype('bool') else dtype_
 
 
 def to_inexact_dtype(dtype: DTypeLike) -> DType:
-  """Promotes a dtype into an inexact dtype, if it is not already one."""
+  """若该 dtype 还不是非精确 dtype，则将其提升为非精确 dtype。"""
   dtype_ = np.dtype(dtype)
   return _dtype_to_inexact.get(dtype_, dtype_)
 
 
 def to_floating_dtype(dtype: DTypeLike) -> DType:
-  """Promotes a dtype to a non-complex floating dtype."""
+  """将该 dtype 提升为非复数浮点 dtype。"""
   dtype_ = np.dtype(dtype)
   return finfo(_dtype_to_inexact.get(dtype_, dtype_)).dtype
 
@@ -382,7 +388,7 @@ def canonicalize_dtype(
 
 @export
 def canonicalize_dtype(dtype: Any, allow_extended_dtype: bool = False) -> DType | ExtendedDType:
-  """Convert from a dtype to a canonical dtype based on config.x64_enabled."""
+  """根据 config.x64_enabled 把 dtype 转换为其规范形式。"""
   return _canonicalize_dtype(config.enable_x64.value, allow_extended_dtype, dtype)
 
 class InvalidInputException(TypeError):
@@ -393,7 +399,7 @@ _jax.set_invalid_input_exception(InvalidInputException)
 register_canonicalize_value_handler = _jax.register_canonicalize_value_handler
 canonicalize_value = _jax.canonicalize_value
 
-# Backward compatibility shim.
+# 向后兼容垫片。
 class _CanonicalizeValueHandlersDict:
 
   def __getitem__(self, key):
@@ -405,10 +411,10 @@ class _CanonicalizeValueHandlersDict:
 canonicalize_value_handlers = _CanonicalizeValueHandlersDict()
 
 
-# The list of all known Python scalar types.
+# 所有已知 Python 标量类型的列表。
 python_scalar_types: set[type] = {bool, int, float, complex}
 
-# Default dtypes corresponding to Python scalars.
+# Python 标量对应的默认 dtype。
 python_scalar_types_to_dtypes: dict[type, DType] = {
   bool: np.dtype('bool'),
   int: np.dtype('int64'),
@@ -418,7 +424,7 @@ python_scalar_types_to_dtypes: dict[type, DType] = {
 
 @export
 def scalar_type_of(x: Any) -> type:
-  """Return the scalar type associated with a JAX value."""
+  """返回与 JAX 值关联的标量类型。"""
   typ = dtype(x)
   if typ in _custom_float_dtypes:
     return float
@@ -437,11 +443,11 @@ def scalar_type_of(x: Any) -> type:
 
 
 def scalar_type_to_dtype(typ: type, value: Any = None) -> DType:
-  """Return the numpy dtype for the given scalar type.
+  """返回给定标量类型对应的 numpy dtype。
 
   Raises
   ------
-  OverflowError: if `typ` is `int` and the value is too large for int64.
+  OverflowError：当 `typ` 为 `int` 且该值对 int64 而言过大时抛出。
 
   Examples
   --------
@@ -468,10 +474,10 @@ def scalar_type_to_dtype(typ: type, value: Any = None) -> DType:
 
 
 def coerce_to_array(x: Any, dtype: DTypeLike | None = None) -> np.ndarray:
-  """Coerces a scalar or NumPy array to an np.array.
+  """把标量或 NumPy 数组强制转换为 np.array。
 
-  Handles Python scalar type promotion according to JAX's rules, not NumPy's
-  rules.
+  按照 JAX 的规则（而不是 NumPy 的规则）处理
+  Python 标量类型提升。
   """
   if dtype is None and type(x) in python_scalar_types:
     dtype = scalar_type_to_dtype(type(x), x)
@@ -481,10 +487,10 @@ iinfo = ml_dtypes.iinfo
 finfo = ml_dtypes.finfo
 
 def _issubclass(a: Any, b: Any) -> bool:
-  """Determines if ``a`` is a subclass of ``b``.
+  """判断 ``a`` 是否为 ``b`` 的子类。
 
-  Similar to issubclass, but returns False instead of an exception if `a` is not
-  a class.
+  与 issubclass 类似，但当 `a` 不是类时返回 False，
+  而不是抛出异常。
   """
   try:
     return issubclass(a, b)
@@ -494,37 +500,37 @@ def _issubclass(a: Any, b: Any) -> bool:
 
 _types_for_issubdtype = (type, np.dtype, ExtendedDType)
 
-# TODO(jakevdp): consider whether to disallow None here. We allow it
-# because np.issubdtype allows it (and treats it as equivalent to float64).
+# TODO(jakevdp): 考虑是否在此禁止 None。我们允许它，
+# 因为 np.issubdtype 允许（并将其视为等价于 float64）。
 @set_module('jax.numpy')
 def issubdtype(a: DTypeLike | ExtendedDType | None,
                b: DTypeLike | ExtendedDType | None) -> bool:
-  """Returns True if first argument is a typecode lower/equal in type hierarchy.
+  """如果第一个参数的类型码在类型层级中更低或相等，则返回 True。
 
-  This is like :func:`numpy.issubdtype`, but can handle dtype extensions such as
-  :obj:`jax.dtypes.bfloat16` and `jax.dtypes.prng_key`.
+  它类似 :func:`numpy.issubdtype`，但能处理诸如
+  :obj:`jax.dtypes.bfloat16` 和 `jax.dtypes.prng_key` 这类 dtype 扩展。
   """
-  # Main departures from np.issubdtype are:
-  # - "extended" dtypes (like prng key types) are not normal numpy dtypes, so we
-  #   need to handle them specifically. However, their scalar types do conform to
-  #   the numpy scalar type hierarchy.
-  # - custom dtypes (like bfloat16, int4, etc.) are normal numpy dtypes, but they
-  #   don't conform to the standard numpy type hierarchy (e.g. the bfloat16 scalar
-  #   type is not a subclass of np.floating) so we must also handle these specially.
+  # 与 np.issubdtype 的主要差异在于：
+  # - “扩展”dtype（如 prng key 类型）不是普通的 numpy dtype，因此
+  #   我们需要专门处理它们。不过它们的标量类型确实符合
+  #   numpy 标量类型层级。
+  # - 自定义 dtype（如 bfloat16、int4 等）是普通的 numpy dtype，但它们
+  #   不符合标准的 numpy 类型层级（例如 bfloat16 标量类型并不是 np.floating
+  #   的子类），所以也必须专门处理。
 
-  # We cannot use the cached version directly for all inputs, because some may be
-  # unhashable (e.g. custom objects with a dtype attribute). The following check is
-  # fast and covers the majority of calls to this function within JAX library code.
+  # 我们不能对所有输入都直接使用带缓存的版本，因为有些输入可能不可哈希
+  # （例如带 dtype 属性的自定义对象）。下面这个检查很快，且覆盖了
+  # JAX 库代码中调用本函数的大多数情况。
   return _issubdtype_cached(
       a if isinstance(a, _types_for_issubdtype) else np.dtype(a),
       b if isinstance(b, _types_for_issubdtype) else np.dtype(b),
   )
 
 
-@cache(max_size=512, trace_context_in_key=False)  # don't use util.memoize because there is no X64 dependence.
+@cache(max_size=512, trace_context_in_key=False)  # 不要用 util.memoize，因为这里不依赖 X64。
 def _issubdtype_cached(a: type | np.dtype | ExtendedDType,
                        b: type | np.dtype | ExtendedDType) -> bool:
-  # First handle extended dtypes, which require their own logic.
+  # 先处理扩展 dtype，它们需要自己的逻辑。
   a_is_type = isinstance(a, type)
   b_is_type = isinstance(b, type)
   if b_is_type and _issubclass(b, extended):
@@ -539,12 +545,12 @@ def _issubdtype_cached(a: type | np.dtype | ExtendedDType,
     a = a.type
     a_is_type = isinstance(a, type)
 
-  # For all others, normalize inputs to scalar types.
+  # 对于其他情况，把输入归一化为标量类型。
   a_sctype = a if a_is_type and _issubclass(a, np.generic) else np.dtype(a).type
   b_sctype = b if b_is_type and _issubclass(b, np.generic) else np.dtype(b).type
 
-  # Now do special handling of custom float and int types, as they don't conform
-  # to the normal scalar type hierarchy.
+  # 现在对自定义浮点与整数类型做特殊处理，因为它们不符合
+  # 常规的标量类型层级。
   if a_sctype in _custom_float_scalar_types:
     return b_sctype in {a_sctype, np.floating, np.inexact, np.number, np.generic}
   if a_sctype in [int2, int4] or (int1 is not None and a_sctype == int1):
@@ -552,14 +558,14 @@ def _issubdtype_cached(a: type | np.dtype | ExtendedDType,
   if a_sctype in [uint2, uint4] or (uint1 is not None and a_sctype == uint1):
     return b_sctype in {a_sctype, np.unsignedinteger, np.integer, np.number, np.generic}
 
-  # Otherwise, fall back to numpy.issubdtype
+  # 其他情况回退到 numpy.issubdtype
   return bool(np.issubdtype(a_sctype, b_sctype))
 
 can_cast = np.can_cast
 
 JAXType = type | DType
 
-# Enumeration of all valid JAX types in order.
+# 按顺序枚举所有合法的 JAX 类型。
 _weak_types: list[JAXType] = [int, float, complex]
 _bool_types: list[JAXType] = [np.dtype(bool)]
 _signed_types: list[JAXType]
@@ -601,12 +607,12 @@ _complex_types: list[JAXType] = [
 ]
 
 
-# We add the StringDType only to `_jax_dtype_set` but not to `_jax_types` and
-# `_dtype_kinds`. This is because, in spite of a very similar sounding name,
-# `_jax_types` is only meant for the promotion related logic, and StringDType
-# does not participate in promotions at the moment. Similarly, `_dtype_kinds` is
-# only meant for the `jnp.isdtype` and we want to be conservative and not allow
-# StringDType to be used in there.
+# 我们只把 StringDType 加入 `_jax_dtype_set`，而不加入 `_jax_types` 和
+# `_dtype_kinds`。这是因为，尽管这个名字听起来非常相似，
+# `_jax_types` 只用于类型提升相关的逻辑，而 StringDType
+# 目前并不参与类型提升。同理，`_dtype_kinds`
+# 也只用于 `jnp.isdtype`，我们希望保守一些，不允许
+# 在其中使用 StringDType。
 string_dtype = np.dtypes.StringDType()
 
 _jax_dtype_set = {
@@ -635,26 +641,26 @@ _dtype_kinds: dict[str, set] = {
 
 @set_module('jax.numpy')
 def isdtype(dtype: DTypeLike, kind: str | DTypeLike | tuple[str | DTypeLike, ...]) -> bool:
-  """Returns a boolean indicating whether a provided dtype is of a specified kind.
+  """返回一个布尔值，表示给定 dtype 是否属于指定的类别。
 
   Args:
-    dtype : the input dtype
-    kind : the data type kind.
-      If ``kind`` is dtype-like, return ``dtype = kind``.
-      If ``kind`` is a string, then return True if the dtype is in the specified category:
+    dtype : 输入的 dtype
+    kind : 数据类型类别。
+      如果 ``kind`` 是 dtype 形式的，则返回 ``dtype = kind``。
+      如果 ``kind`` 是字符串，则当 dtype 属于指定类别时返回 True：
 
       - ``'bool'``: ``{bool}``
       - ``'signed integer'``: ``{int4, int8, int16, int32, int64}``
       - ``'unsigned integer'``: ``{uint4, uint8, uint16, uint32, uint64}``
-      - ``'integral'``: shorthand for ``('signed integer', 'unsigned integer')``
+      - ``'integral'``: ``('signed integer', 'unsigned integer')`` 的简写
       - ``'real floating'``: ``{float8_*, float16, bfloat16, float32, float64}``
       - ``'complex floating'``: ``{complex64, complex128}``
-      - ``'numeric'``: shorthand for ``('integral', 'real floating', 'complex floating')``
+      - ``'numeric'``: ``('integral', 'real floating', 'complex floating')`` 的简写
 
-      If ``kind`` is a tuple, then return True if dtype matches any entry of the tuple.
+      如果 ``kind`` 是元组，则当 dtype 匹配元组中任意一项时返回 True。
 
   Returns:
-    True or False
+    True 或 False
   """
   the_dtype = np.dtype(dtype)
   kind_tuple: tuple[str | DTypeLike, ...] = (
@@ -680,7 +686,7 @@ def isdtype(dtype: DTypeLike, kind: str | DTypeLike | tuple[str | DTypeLike, ...
 
 
 def _jax_type(dtype: DType, weak_type: bool) -> JAXType:
-  """Return the jax type for a dtype and weak type."""
+  """返回给定 dtype 与弱类型标志对应的 jax 类型。"""
   if weak_type:
     if dtype == bool:
       return dtype
@@ -690,17 +696,17 @@ def _jax_type(dtype: DType, weak_type: bool) -> JAXType:
   return dtype
 
 def _dtype_and_weaktype(value: Any) -> tuple[DType, bool]:
-  """Return a (dtype, weak_type) tuple for the given input."""
+  """返回给定输入的 (dtype, weak_type) 元组。"""
   return dtype(value), any(value is typ for typ in _weak_types) or is_weakly_typed(value)
 
 def _type_promotion_lattice(strict: bool, x64: bool) -> dict[JAXType, list[JAXType]]:
   """
-  Return the type promotion lattice in the form of a DAG.
-  This DAG maps each type to its immediately higher types on the lattice.
+  以 DAG 的形式返回类型提升格。
+  该 DAG 把每个类型映射到它在格上紧邻的更高类型。
 
   Args:
-    strict: use strict promotion lattice?
-    x64: allow promotions that form x64 types from non-x64 inputs?
+    strict: 是否使用严格类型提升格？
+    x64: 是否允许由非 x64 输入提升出 x64 类型？
   """
   b1, = _bool_types
   u1, i1 = None, None
@@ -744,10 +750,10 @@ def _type_promotion_lattice(strict: bool, x64: bool) -> dict[JAXType, list[JAXTy
     if u1 is not None:
       out[i_].append(u1)
       out[u1] = []
-    # If x64 mode is not enabled, then we want to avoid any promotions that form
-    # 64-bit types from non-64-bit inputs. There's only one of these in the
-    # entire promotion lattice, namely u4xi4->i8, which we can avoid by
-    # replacing it with u4xi4->i4.
+    # 如果未启用 x64 模式，我们希望避免任何由非 64 位输入
+    # 产生 64 位类型的提升。整个提升格中只有一处这样的情况，
+    # 即 u4xi4->i8，我们可以通过把它替换为 u4xi4->i4
+    # 来避免。
     if not x64:
       out[u32] = [i32, u64]
     return out
@@ -779,39 +785,39 @@ _strict_lattice_ubs = _make_lattice_upper_bounds(strict=True, x64=True)
 
 @export
 class TypePromotionError(ValueError):
-  """Raised when JAX type promotion fails."""
+  """当 JAX 类型提升失败时抛出。"""
   pass
 
 
-# We don't use util.memoize because there is no implicit X64 dependence.
+# 我们没有使用 util.memoize，因为这里不存在隐式的 X64 依赖。
 @functools.lru_cache(512)
 def _least_upper_bound(jax_numpy_dtype_promotion: config.NumpyDtypePromotion,
                        x64: bool, *nodes: JAXType) -> JAXType:
-  """Compute the least upper bound of a set of nodes.
+  """计算一组节点的最小上界。
 
   Args:
-    nodes: sequence of entries from _jax_types + _weak_types
+    nodes: 来自 _jax_types + _weak_types 的条目序列
   Returns:
-    the _jax_type representing the least upper bound of the input nodes
-      on the promotion lattice.
+    在提升格上表示输入节点最小上界的
+      _jax_type。
   """
-  # This function computes the least upper bound of a set of nodes N within a partially
-  # ordered set defined by the lattice generated above.
-  # Given a partially ordered set S, let the set of upper bounds of n ∈ S be
+  # 该函数计算节点集合 N 的最小上界，其中 N 位于上面生成的
+  # 格所定义的偏序集之内。
+  # 给定偏序集 S，令 n ∈ S 的上界集合为
   #   UB(n) ≡ {m ∈ S | n ≤ m}
-  # Further, for a set of nodes N ⊆ S, let the set of common upper bounds be given by
+  # 进而，对于节点集合 N ⊆ S，其公共上界集合定义为
   #   CUB(N) ≡ {a ∈ S | ∀ b ∈ N: a ∈ UB(b)}
-  # Then the least upper bound of N is defined as
+  # 那么 N 的最小上界定义为
   #   LUB(N) ≡ {c ∈ CUB(N) | ∀ d ∈ CUB(N), c ≤ d}
-  # The definition of an upper bound implies that c ≤ d if and only if d ∈ UB(c),
-  # so the LUB can be expressed:
+  # 上界的定义意味着 c ≤ d 当且仅当 d ∈ UB(c)，
+  # 于是 LUB 可以表示为：
   #   LUB(N) = {c ∈ CUB(N) | ∀ d ∈ CUB(N): d ∈ UB(c)}
-  # or, equivalently:
+  # 或者等价地：
   #   LUB(N) = {c ∈ CUB(N) | CUB(N) ⊆ UB(c)}
-  # By definition, LUB(N) has a cardinality of 1 for a partially ordered set.
-  # Note a potential algorithmic shortcut: from the definition of CUB(N), we have
+  # 按定义，对于偏序集而言 LUB(N) 的基数为 1。
+  # 注意一个可能的算法捷径：由 CUB(N) 的定义可得
   #   ∀ c ∈ N: CUB(N) ⊆ UB(c)
-  # So if N ∩ CUB(N) is nonempty, if follows that LUB(N) = N ∩ CUB(N).
+  # 因此若 N ∩ CUB(N) 非空，则可推出 LUB(N) = N ∩ CUB(N)。
   N = set(nodes)
   if jax_numpy_dtype_promotion == config.NumpyDtypePromotion.STRICT:
     UB = _strict_lattice_ubs
@@ -870,7 +876,7 @@ def _least_upper_bound(jax_numpy_dtype_promotion: config.NumpyDtypePromotion,
         "promotion path. Try explicitly casting inputs to the desired output type.")
     raise TypePromotionError(msg)
   else:
-    # If we get here, it means the lattice is ill-formed.
+    # 执行到这里说明该格的结构有问题。
     raise TypePromotionError(
       f"Internal Type Promotion error: {nodes} do not have a unique least upper bound "
       f"on the specified lattice; options are {LUB}. This is an unexpected error in "
@@ -879,21 +885,21 @@ def _least_upper_bound(jax_numpy_dtype_promotion: config.NumpyDtypePromotion,
 
 @set_module('jax.numpy')
 def promote_types(a: DTypeLike, b: DTypeLike) -> DType:
-  """Returns the type to which a binary operation should cast its arguments.
+  """返回二元运算把其参数转换成的类型。
 
-  JAX implementation of :func:`numpy.promote_types`. For details of JAX's
-  type promotion semantics, see :ref:`type-promotion`.
+  这是 :func:`numpy.promote_types` 的 JAX 实现。关于 JAX 类型提升语义的
+  细节，参见 :ref:`type-promotion`。
 
   Args:
-    a: a :class:`numpy.dtype` or a dtype specifier.
-    b: a :class:`numpy.dtype` or a dtype specifier.
+    a: 一个 :class:`numpy.dtype` 或 dtype 说明符。
+    b: 一个 :class:`numpy.dtype` 或 dtype 说明符。
 
   Returns:
-    A :class:`numpy.dtype` object.
+    一个 :class:`numpy.dtype` 对象。
 
   Examples:
-    Type specifiers may be strings, dtypes, or scalar types, and the return
-    value is always a dtype:
+    类型说明符可以是字符串、dtype 或标量类型，
+    返回值始终是一个 dtype：
 
     >>> jnp.promote_types('int32', 'float32')  # strings
     dtype('float32')
@@ -902,17 +908,17 @@ def promote_types(a: DTypeLike, b: DTypeLike) -> DType:
     >>> jnp.promote_types(jnp.int32, jnp.float32)  # scalar types
     dtype('float32')
 
-    Built-in scalar types (:type:`int`, :type:`float`, or :type:`complex`) are
-    treated as weakly-typed and will not change the bit width of a strongly-typed
-    counterpart (see discussion in :ref:`type-promotion`):
+    内置标量类型（:type:`int`、:type:`float` 或 :type:`complex`）被视为弱类型，
+    它们不会改变与之对应的强类型值的位宽
+    （讨论见 :ref:`type-promotion`）：
 
     >>> jnp.promote_types('uint8', int)
     dtype('uint8')
     >>> jnp.promote_types('float16', float)
     dtype('float16')
 
-    This differs from the NumPy version of this function, which treats built-in scalar
-    types as equivalent to 64-bit types:
+    这与该函数的 NumPy 版本不同：后者把内置标量类型
+    视为等价于 64 位类型：
 
     >>> import numpy
     >>> numpy.promote_types('uint8', int)
@@ -920,8 +926,8 @@ def promote_types(a: DTypeLike, b: DTypeLike) -> DType:
     >>> numpy.promote_types('float16', float)
     dtype('float64')
   """
-  # Note: we deliberately avoid `if a in _weak_types` here because we want to check
-  # object identity, not object equality, due to the behavior of np.dtype.__eq__
+  # 注意：这里刻意避免使用 `if a in _weak_types`，因为我们要检查的是
+  # 对象同一性而非对象相等性，这是由 np.dtype.__eq__ 的行为决定的
   a_tp = cast(JAXType, a if any(a is t for t in _weak_types) else np.dtype(a))
   b_tp = cast(JAXType, b if any(b is t for t in _weak_types) else np.dtype(b))
   return np.dtype(_least_upper_bound(
@@ -929,7 +935,7 @@ def promote_types(a: DTypeLike, b: DTypeLike) -> DType:
 
 
 def register_weak_scalar_type(typ: type):
-  """Register a scalar type as a weak type."""
+  """把一个标量类型注册为弱类型。"""
   _registered_weak_types.add(typ)
 
 _registered_weak_types: set[JAXType] = set()
@@ -955,7 +961,7 @@ def check_valid_dtype(dtype: DType) -> None:
                     "type. Only arrays of numeric types are supported by JAX.")
 
 def _maybe_canonicalize_explicit_dtype(dtype: DType, fun_name: str) -> DType:
-  "Canonicalizes explicitly requested dtypes, per explicit_x64_dtypes."
+  "根据 explicit_x64_dtypes 对显式请求的 dtype 做规范化。"
   allow = config.explicit_x64_dtypes.value
   if allow == config.ExplicitX64Mode.ALLOW or config.enable_x64.value:
     return dtype
@@ -970,7 +976,7 @@ def _maybe_canonicalize_explicit_dtype(dtype: DType, fun_name: str) -> DType:
           "See https://github.com/jax-ml/jax#current-gotchas for more.")
     msg = msg.format(dtype, fun_name, canonical_dtype.name)
     raise ValueError(msg)
-  else:  # WARN
+  else:  # 警告
     msg = ("Explicitly requested dtype {}{} is not available, "
           "and will be truncated to dtype {}. To enable more dtypes, set the "
           "jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell "
@@ -990,35 +996,35 @@ def register_type_whose_dtype_should_not_be_canonicalized(typ: type):
   _types_whose_dtype_should_not_be_canonicalized += (typ,)
 
 def dtype(x: Any) -> DType:
-  """Return the dtype object for a value or type.
+  """返回值或类型对应的 dtype 对象。
 
-  Python scalars, Python scalar types, NumPy scalar type, NumPy dtypes, and
-  non-JAX arrays will have their dtypes canonicalized.
+  Python 标量、Python 标量类型、NumPy 标量类型、NumPy dtype 以及非 JAX
+  数组，它们的 dtype 都会被规范化。
 
-  Note: this is not the same function as jax.numpy.dtype, which simply aliases
-  numpy.dtype."""
-  # TODO(phawkins): in the future, we would like to:
-  # - return the default dtype for Python scalar types and values
-  # - canonicalize NumPy array and scalar types
-  # - return NumPy dtypes as-is, uncanonicalized.
+  Note: 这个函数与 jax.numpy.dtype 不是同一个函数，后者只是
+  numpy.dtype 的别名。"""
+  # TODO(phawkins): 将来我们希望：
+  # - 对 Python 标量类型和值返回默认 dtype
+  # - 规范化 NumPy 数组和标量类型
+  # - 原样返回 NumPy dtype，不做规范化。
   if x is None:
     raise ValueError(f"Invalid argument to dtype: {x}.")
   if isinstance(x, type):
-    # Python scalar types, e.g., int, float
+    # Python 标量类型，例如 int、float
     if (dt := python_scalar_types_to_dtypes.get(x)) is not None:
       return canonicalize_dtype(dt)
 
-    # Numpy scalar types, e.g., np.int32, np.float32
+    # NumPy 标量类型，例如 np.int32、np.float32
     if _issubclass(x, np.generic):
       dt = np.dtype(x)
       return _maybe_canonicalize_explicit_dtype(dt, "dtype")
 
-  # Python scalar values, e.g., int(3), float(3.14)
+  # Python 标量值，例如 int(3)、float(3.14)
   elif (dt := python_scalar_types_to_dtypes.get(type(x))) is not None:
     return canonicalize_dtype(dt)
-  # Jax Arrays, literal arrays, and scalars.
-  # We intentionally do not canonicalize these types: once we've formed an x64
-  # value, that is something we respect irrespective of the x64 mode.
+  # JAX 数组、字面量数组和标量。
+  # 我们有意不对这些类型做规范化：一旦构造出 x64 值，
+  # 无论 x64 模式如何，我们都会尊重它。
   elif isinstance(x, _types_whose_dtype_should_not_be_canonicalized):
     return x.dtype
 
@@ -1029,9 +1035,9 @@ def dtype(x: Any) -> DType:
                       "type. Only arrays of numeric types are supported by JAX.")
     return _maybe_canonicalize_explicit_dtype(dt, "dtype")
 
-  # If x has a dtype attribute, and it's a valid dtype, use it. This avoids
-  # calling np.result_type on objects that might have a .dtype but are not
-  # standard NumPy array-like, which can lead to warnings in NumPy 2.4+.
+  # 如果 x 带有 dtype 属性，且它是合法 dtype，就直接使用它。这样可以避免
+  # 对可能带有 .dtype 但并非标准 NumPy 数组类对象的对象调用 np.result_type，
+  # 否则在 NumPy 2.4+ 中可能产生警告。
   dt_attr = getattr(x, 'dtype', None)
   if issubdtype(dt_attr, extended) or isinstance(dt_attr, np.dtype):
     dt = dt_attr
@@ -1043,7 +1049,7 @@ def dtype(x: Any) -> DType:
   if dt not in _jax_dtype_set and not issubdtype(dt, extended):
     raise TypeError(f"Value '{x}' with dtype {dt} is not a valid JAX array "
                     "type. Only arrays of numeric types are supported by JAX.")
-  # TODO(jakevdp): fix return type annotation and remove this ignore.
+  # TODO(jakevdp): 修正返回类型标注并移除这个 ignore。
   return canonicalize_dtype(dt, allow_extended_dtype=True)  # pyrefly: ignore[bad-return]
 
 def lattice_result_type(*args: Any) -> tuple[DType, bool]:
@@ -1052,14 +1058,14 @@ def lattice_result_type(*args: Any) -> tuple[DType, bool]:
     out_dtype = dtypes[0]
     out_weak_type = weak_types[0]
   elif len(set(dtypes)) == 1 and not all(weak_types):
-    # Trivial promotion case. This allows extended dtypes through.
+    # 平凡的提升情形。这样可以允许扩展 dtype 通过。
     out_dtype = dtypes[0]
     out_weak_type = False
   elif all(weak_types) and config.numpy_dtype_promotion.value != config.NumpyDtypePromotion.STRICT:
-    # If all inputs are weakly typed, we compute the bound of the strongly-typed
-    # counterparts and apply the weak type at the end. This avoids returning the
-    # incorrect result with non-canonical weak types (e.g. weak int16).
-    # TODO(jakevdp): explore removing this special case.
+    # 如果所有输入都是弱类型，我们先计算其强类型对应物的上界，
+    # 最后再施加弱类型。这样可以避免因非规范弱类型
+    # （例如弱 int16）而返回错误结果。
+    # TODO(jakevdp): 探索移除这个特殊情形。
     result_type = _least_upper_bound(
         config.numpy_dtype_promotion.value, config.enable_x64.value,
         *{_jax_type(dtype, False) for dtype in dtypes})
@@ -1084,14 +1090,14 @@ def result_type(*args: Any, return_weak_type_flag: bool = False) -> DType | tupl
 
 @export
 def result_type(*args: Any, return_weak_type_flag: bool = False) -> DType | tuple[DType, bool]:
-  """Convenience function to apply JAX argument dtype promotion.
+  """应用 JAX 参数 dtype 提升的便捷函数。
 
   Args:
-    return_weak_type_flag : if True, then return a ``(dtype, weak_type)`` tuple.
-      If False, just return `dtype`
+    return_weak_type_flag : 若为 True，则返回 ``(dtype, weak_type)`` 元组。
+      若为 False，则只返回 `dtype`
 
   Returns:
-    dtype or (dtype, weak_type) depending on the value of the ``return_weak_type`` argument.
+    取决于 ``return_weak_type`` 参数的值，返回 dtype 或 (dtype, weak_type)。
   """
   if len(args) == 0:
     raise ValueError("at least one array or dtype is required")
@@ -1104,9 +1110,9 @@ def result_type(*args: Any, return_weak_type_flag: bool = False) -> DType | tupl
 def check_and_canonicalize_user_dtype(
     dtype, fun_name=None, *, allow_non_jax_dtypes: bool = False
 ) -> DType:
-  """Checks validity of a user-provided dtype, and returns its canonical form.
+  """检查用户提供的 dtype 是否合法，并返回其规范形式。
 
-  For Python scalar types this function returns the corresponding default dtype.
+  对于 Python 标量类型，该函数返回相应的默认 dtype。
   """
   if dtype is None:
     raise ValueError("dtype must be specified.")
@@ -1115,7 +1121,7 @@ def check_and_canonicalize_user_dtype(
                      "supported; instead of dtype=arr use dtype=arr.dtype.")
   if issubdtype(dtype, extended):
     return dtype
-  # Avoid using `dtype in [...]` because of numpy dtype equality overloading.
+  # 避免使用 `dtype in [...]`，因为 numpy dtype 重载了相等比较。
   if isinstance(dtype, type) and (f := _DEFAULT_TYPEMAP.get(dtype)) is not None:
     return f()
   np_dtype = np.dtype(dtype)
@@ -1131,21 +1137,21 @@ def check_and_canonicalize_user_dtype(
 
 def safe_to_cast(input_dtype_or_value: Any,
                  output_dtype_or_value: Any) -> bool:
-  """Check if a dtype/value is safe to cast to another dtype/value
+  """检查某个 dtype/值是否可以安全地转换到另一个 dtype/值
 
   Args:
-    input_dtype_or_value: a dtype or value (to be passed to result_type)
-      representing the source dtype.
-    output_dtype_or_value: a dtype or value (to be passed to result_type)
-      representing the target dtype.
+    input_dtype_or_value: 表示源 dtype 的 dtype 或值
+      （会被传给 result_type）。
+    output_dtype_or_value: 表示目标 dtype 的 dtype 或值
+      （会被传给 result_type）。
 
   Returns:
-    boolean representing whether the values are safe to cast according to
-    default type promotion semantics.
+    布尔值，表示按默认类型提升语义
+    这些值是否可以安全转换。
 
   Raises:
-    TypePromotionError: if the inputs have differing types and no type promotion
-    path under the current jax_numpy_dtype_promotion setting.
+    TypePromotionError: 当输入类型不同、且在当前的 jax_numpy_dtype_promotion
+    设置下不存在类型提升路径时抛出。
 
   Examples:
 
@@ -1162,8 +1168,8 @@ def safe_to_cast(input_dtype_or_value: Any,
   output_dtype = dtype(output_dtype_or_value)
   if input_dtype == output_dtype:
     return True
-  # We deliberately use output_dtype rather than output_dtype_or_value here:
-  # this effectively treats the output dtype as always strongly-typed.
+  # 这里我们刻意使用 output_dtype 而不是 output_dtype_or_value：
+  # 这相当于把输出 dtype 始终视为强类型。
   return result_type(input_dtype_or_value, output_dtype) == output_dtype
 
 class primal_tangent_dtype_scalar(extended): ...

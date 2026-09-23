@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：为 `jax.jit` 等 API 提供参数规格解析与追踪调试信息的基础工具。
+# 它负责校验并补全 `static_argnums`/`static_argnames`/`donate_argnums`/`donate_argnames`，
+# 计算捐赠(donation)向量，判断静态实参是否可哈希，并在给定示例参数与函数签名时
+# 构造 `core.DebugInfo`；同时提供把 pytree 参数展平为扁平实参的 `linear_util` 变换，
+# 以及 pmap 风格轴规格(`out_axes`/`axis_resources`)与前缀匹配错误报告工具。
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -41,7 +47,7 @@ map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
 
 def _ensure_index(x: Any) -> int | tuple[int, ...]:
-  """Ensure x is either an index or a tuple of indices."""
+  """确保 x 是索引或索引元组。"""
   x = core.concrete_or_error(None, x, "expected a static index or sequence of indices.")
   try:
     return operator.index(x)
@@ -49,7 +55,7 @@ def _ensure_index(x: Any) -> int | tuple[int, ...]:
     return tuple(map(operator.index, x))
 
 def _ensure_index_tuple(x: Any) -> tuple[int, ...]:
-  """Convert x to a tuple of indices."""
+  """把 x 转换为索引元组。"""
   x = core.concrete_or_error(None, x, "expected a static index or sequence of indices.")
   try:
     return (operator.index(x),)
@@ -62,7 +68,7 @@ def _ensure_str(x: str) -> str:
   return x
 
 def _ensure_str_tuple(x: str | Iterable[str]) -> tuple[str, ...]:
-  """Convert x to a tuple of strings."""
+  """把 x 转换为字符串元组。"""
   if isinstance(x, str):
     return (x,)
   else:
@@ -87,9 +93,9 @@ def flatten_fun_nokwargs(f: Callable, store: lu.Store,
   return ans
 
 class _HashableWithStrictTypeEquality:
-  """Box object used when comparing static arguments as a jit key.
+  """在把静态参数作为 jit 键进行比较时所用的装箱对象。
 
-  Requires exact type equality using `is` and value equality."""
+  要求使用 `is` 做精确类型相等判断，并使用值相等判断。"""
   __slots__ = ["val"]
 
   def __init__(self, val):
@@ -108,10 +114,9 @@ _POSITIONAL_ARGUMENTS = (
 
 def _validate_argnums(sig: inspect.Signature, argnums: tuple[int, ...], argnums_name: str) -> None:
   """
-  Validate that the argnums are sensible for a given function.
+  校验 argnums 对给定函数而言是否合理。
 
-  For functions that accept a variable number of positions arguments
-  (`f(..., *args)`) all positive argnums are considered valid.
+  对于接受可变数量位置参数（`f(..., *args)`）的函数，所有正数 argnums 都被视为有效。
   """
   n_pos_args = 0
   for param in sig.parameters.values():
@@ -119,7 +124,7 @@ def _validate_argnums(sig: inspect.Signature, argnums: tuple[int, ...], argnums_
       n_pos_args += 1
 
     elif param.kind is inspect.Parameter.VAR_POSITIONAL:
-      # We can have any number of positional arguments
+      # 位置参数的数量可以是任意的
       return
 
   if argnums and (-min(argnums) > n_pos_args or max(argnums) >= n_pos_args):
@@ -140,11 +145,10 @@ def _validate_argnames(
     sig: inspect.Signature, argnames: tuple[str, ...], argnames_name: str
 ) -> None:
   """
-  Validate that the argnames are sensible for a given function.
+  校验 argnames 对给定函数而言是否合理。
 
-  For functions that accept a variable keyword arguments
-  (`f(..., **kwargs)`) all argnames are considered valid except those
-  marked as position-only (`f(pos_only, /, ...)`).
+  对于接受可变数量关键字参数（`f(..., **kwargs)`）的函数，除被标记为仅位置（`f(pos_only, /, ...)`）
+  的参数名之外，所有 argnames 都被视为有效。
   """
   var_kwargs = False
   valid_kwargs: set[str] = set()
@@ -159,16 +163,16 @@ def _validate_argnames(
     elif param.kind in _INVALID_KEYWORD_ARGUMENTS:
       invalid_kwargs.add(param_name)
 
-  # Check whether any kwargs are invalid due to position only
+  # 检查是否有 kwargs 因仅位置而无效
   if invalid_argnames := (invalid_kwargs & set(argnames)):
     raise ValueError(f"Jitted function has invalid argnames {invalid_argnames} "
                      f"in {argnames_name}. These are positional-only")
 
-  # Takes any kwargs
+  # 接受任意 kwargs
   if var_kwargs:
     return
 
-  # Check that all argnames exist on function
+  # 检查所有 argnames 都存在于该函数上
   if invalid_argnames := (set(argnames) - valid_kwargs):
     raise ValueError(f"Jitted function has invalid argnames {invalid_argnames} "
                      f"in {argnames_name}. Function does not take these args.")
@@ -197,7 +201,7 @@ def argnums_partial(f: lu.WrappedFun, dyn_argnums: int | Sequence[int],
 
 def argnums_partial2(f: Callable, dyn_argnums: int | Sequence[int],
                      args: Sequence, kwargs: dict):
-  # like argnums_partial but works with callables instead of WrappedFun
+  # 类似 argnums_partial，但作用于可调用对象而不是 WrappedFun
   dyn_argnums = _ensure_index_tuple(dyn_argnums)
   dyn_argnums = _ensure_inbounds(False, len(args), dyn_argnums)
   static_args = list(args)
@@ -228,7 +232,7 @@ def _prepend_static_args(f, static_args, *args, **kwargs):
 
 def _ensure_inbounds(allow_invalid: bool, num_args: int, argnums: Sequence[int]
                      ) -> tuple[int, ...]:
-  """Ensure argnum is within bounds. Also resolves negative argnums."""
+  """确保 argnum 在边界内。同时解析负的 argnums。"""
   result = []
   for i in argnums:
     if i >= num_args and allow_invalid: continue
@@ -237,7 +241,7 @@ def _ensure_inbounds(allow_invalid: bool, num_args: int, argnums: Sequence[int]
           "Positional argument indices, e.g. for `static_argnums`, must have "
           "value greater than or equal to -len(args) and less than len(args), "
           f"but got value {i} for len(args) == {num_args}.")
-    result.append(i % num_args)  # Resolve negative
+    result.append(i % num_args)  # 解析负索引
   return tuple(result)
 
 
@@ -258,17 +262,15 @@ def _argnums_partial(_fun: Callable,
 @lru_cache(maxsize=4096)
 def donation_vector(donate_argnums, donate_argnames, in_tree,
                     kws: bool = True) -> tuple[bool, ...]:
-  """Returns a tuple with a boolean value for each leaf in args and kwargs.
+  """返回一个元组，为 args 与 kwargs 中的每个叶子给出一个布尔值。
 
-  What if a user specifies donate_argnums but calls the function with kwargs
-  or vice-versa? In that case, in `resolve_argnums` using the signature of the
-  function, the counterpart (donate_argnames or donate_argnums respectively) is
-  calculated so when this function is called both donate_argnums and
-  donate_argnames are available. This allows JAX to donate kwargs when only
-  donate_argnums is specified and vice-versa.
+  如果用户只指定了 donate_argnums 却以 kwargs 调用该函数，或者反过来，会怎样？此时在
+  `resolve_argnums` 中会利用函数签名计算出与之对应的另一项（分别是 donate_argnames 或
+  donate_argnums），因此调用本函数时 donate_argnums 与 donate_argnames 都可用。这使得
+  JAX 在只指定 donate_argnums 时也能捐赠 kwargs，反之亦然。
 
-  When both donate_argnums and donate_argnames are specified, only the args and
-  kwargs specified are donated.
+  当 donate_argnums 与 donate_argnames 都被指定时，只有被指定到的 args 和
+  kwargs 会被捐赠。
   """
   res: list[bool] = []
   if kws:
@@ -285,18 +287,18 @@ def donation_vector(donate_argnums, donate_argnames, in_tree,
   return tuple(res)
 
 def rebase_donate_argnums(donate_argnums, static_argnums) -> tuple[int, ...]:
-  """Shifts donate to account for static.
+  """平移 donate 以计入 static。
 
   >>> rebase_donate_argnums((3, 4), (0, 1))
   (1, 2)
 
   Args:
-    donate_argnums: An iterable of ints.
-    static_argnums: An iterable of ints.
+    donate_argnums: 一个整数可迭代对象。
+    static_argnums: 一个整数可迭代对象。
 
   Returns:
-    A tuple of unique, sorted integer values based on donate_argnums with each
-    element offset to account for static_argnums.
+    一个由去重且排序后的整数值组成的元组，基于 donate_argnums，其中每个
+    元素都做了偏移以计入 static_argnums。
   """
   if not (static_argnums or donate_argnums):
     return tuple(sorted(donate_argnums))
@@ -350,10 +352,10 @@ class WrapHashably:
         return self.val is other.val
     return False
 
-# This caching is useful to avoid retracing even when static_argnums is used.
-# See api_benchmark.py:bench_remat_eager_retracing_overheads_static_argnums.
-# On that benchmark, including this caching makes a ~10x difference (which can
-# be made arbitrary large by involving larger functions to be traced).
+# 这种缓存有助于在使用 static_argnums 时也避免重复追踪。
+# 参见 api_benchmark.py:bench_remat_eager_retracing_overheads_static_argnums。
+# 在该基准测试中，加入这一缓存会带来约 10 倍的差异（若让被追踪的函数更大，
+# 这一差异可以变得任意大）。
 def dyn_args_fun(fun: Callable, static_argnums: frozenset[int],
                  static_args: tuple[WrapHashably, ...], nargs: int):
   if any(isinstance(x.val, core.Tracer) for x in static_args):
@@ -377,18 +379,15 @@ SENTINEL = object()
 
 
 def flatten_axes(name, treedef, axis_tree, *, kws=False, tupled_args=False):
-  # given an axis spec tree axis_tree (a pytree with integers and Nones at the
-  # leaves, i.e. the Nones are to be considered leaves) that is a tree prefix of
-  # the given treedef, build a complete axis spec tree with the same structure
-  # and return the flattened result
+  # 给定轴规格树 axis_tree（一棵叶子为整数与 None 的 pytree，即把 None 也当作叶子），
+  # 它是给定 treedef 的树前缀，构造一棵结构相同、完整的轴规格树并返回展平后的结果
   axis_tree_leaves, axis_treedef = none_leaf_registry.flatten(axis_tree)
   try:
     axes = broadcast_flattened_prefix_with_treedef(
         axis_tree_leaves, axis_treedef, treedef)
   except ValueError:
     if kws:
-      # if keyword arguments are included in the tree, we make adapt the error
-      # message only to be about the positional arguments
+      # 如果树中包含关键字参数，我们只把错误消息调整成针对位置参数的形式
       treedef, _ = treedef_children(treedef)
       axis_tree, _ = axis_tree
     hint = ""
@@ -399,7 +398,7 @@ def flatten_axes(name, treedef, axis_tree, *, kws=False, tupled_args=False):
         try:
           flatten_axes(name, treedef, (axis_tree,))
         except ValueError:
-          pass  # That's not the issue.
+          pass  # 问题不在这里。
         else:
           hint += (f" In particular, you're passing in a single argument which "
                    f"means that {name} might need to be wrapped in "
@@ -413,7 +412,7 @@ def flatten_axes(name, treedef, axis_tree, *, kws=False, tupled_args=False):
       raise ValueError(
           f"{name} specification must be a tree prefix of the "
           f"corresponding value; {hint}{prefix_err_msg}") from None
-    # At this point we've failed to find a tree prefix error.
+    # 到这里说明没能找到树前缀错误。
     assert False, "unreachable code"
   assert len(axes) == treedef.num_leaves
   return axes
@@ -427,24 +426,23 @@ def flatten_axis_resources(what, tree, shardings, tupled_args):
   try:
     return tuple(flatten_axes(what, tree, shardings, tupled_args=tupled_args))
   except ValueError:
-    pass  # Raise a tree prefix error below
+    pass  # 在下面抛出树前缀错误
 
-  # Tree leaves are always valid prefixes, so if there was a prefix error as
-  # assumed here, axis_resources must not be a leaf.
+  # 树的叶子总是合法前缀，因此如果这里假设的前缀错误确实发生，axis_resources
+  # 就一定不是叶子。
   assert not treedef_is_leaf(tree_structure(shardings))
 
-  # Check the type directly rather than using isinstance because of namedtuples.
+  # 直接检查类型而不是用 isinstance，因为要处理 namedtuple。
   if tupled_args and (type(shardings) is not tuple or
                       len(shardings) != len(tree.children())):
-    # We know axis_resources is meant to be a tuple corresponding to the args
-    # tuple, but while it is a non-leaf pytree, either it wasn't a tuple or it
-    # wasn't the right length.
+    # 我们知道 axis_resources 本应是与会话参数元组对应的元组，但它虽然是非叶 pytree，
+    # 要么不是元组，要么长度不对。
     msg = (f"{what} specification must be a tree prefix of the positional "
            f"arguments tuple. In particular, {what} must either be a Sharding, "
            "a PartitionSpec, or a tuple of length equal to the number of "
            "positional arguments.")
-    # If `tree` represents an args tuple, then `axis_resources` must be a tuple.
-    # TODO(mattjj,apaszke): disable implicit list casts, remove 'or list' below
+    # 如果 `tree` 表示参数元组，那么 `axis_resources` 就必须是元组。
+    # TODO(mattjj,apaszke): 禁用隐式列表转换，删除下面的 'or list'
     if type(shardings) is not tuple:
       msg += f" But {what} is not a tuple: got {type(shardings)} instead."
     elif len(shardings) != len(tree.children()):
@@ -452,11 +450,10 @@ def flatten_axis_resources(what, tree, shardings, tupled_args):
               f"{len(shardings)} for an args tuple of length "
               f"{len(tree.children())}.")
 
-    # As an extra hint, let's check if the user just forgot to wrap
-    # shardings in a singleton tuple.
+    # 作为额外提示，检查一下用户是不是只是忘了把 shardings 包进单元素元组。
     if len(tree.children()) == 1:
       try: flatten_axes(what, tree, (shardings,))
-      except ValueError: pass  # That's not the issue.
+      except ValueError: pass  # 问题不在这里。
       else:
         msg += (f" Given the corresponding argument being "
                 f"passed, it looks like {what} might need to be wrapped in "
@@ -466,8 +463,8 @@ def flatten_axis_resources(what, tree, shardings, tupled_args):
 
   axis_tree = shardings
 
-  # Because we only have the `tree` treedef and not the full pytree here,
-  # we construct a dummy tree to compare against. Revise this in callers?
+  # 因为这里只有 `tree` 这个 treedef 而非完整的 pytree，我们构造一棵虚拟树来比较。
+  # 是否要修改调用方？
   dummy_tree = tree_unflatten(tree, [PytreeLeaf()] * tree.num_leaves)
   errors = prefix_errors(axis_tree, dummy_tree)
   if errors:
@@ -476,8 +473,8 @@ def flatten_axis_resources(what, tree, shardings, tupled_args):
         f"Mismatch details ({len(errors)} found):\n{details}"
     )
 
-  # At this point we've failed to find a tree prefix error.
-  assert False, "Please open a bug report!"  # This should be unreachable.
+  # 到这里说明没能找到树前缀错误。
+  assert False, "Please open a bug report!"  # 这里本应不可达。
 
 
 def flat_out_axes(
@@ -495,7 +492,7 @@ def _flat_out_axes(_fun, _store, _leaves, _treedef, *args, **kwargs):
     spec_flat = tuple(broadcast_prefix(spec, ans, is_leaf=lambda x: x is None))
   except ValueError:
     e, *_ = prefix_errors(spec, ans)
-    # TODO(mattjj): currently hardcoded for pmap; generalize to vmap in followup
+    # TODO(mattjj): 目前是硬编码用于 pmap 的；后续工作中要推广到 vmap
     msg, = e('pmap out_axes').args
     msg += ("\n\nThe full pytree is the output of the pmapped function. Ensure "
             "that the `out_axes` argument to `pmap` is a pytree prefix of the "
@@ -505,8 +502,8 @@ def _flat_out_axes(_fun, _store, _leaves, _treedef, *args, **kwargs):
   return ans
 
 def check_callable(fun):
-  # In Python 3.10+, the only thing stopping us from supporting staticmethods
-  # is that we can't take weak references to them, which the C++ JIT requires.
+  # 在 Python 3.10+ 中，唯一阻碍我们支持 staticmethod 的原因是
+  # 无法对它们取弱引用，而 C++ JIT 需要弱引用。
   if isinstance(fun, staticmethod):
     raise TypeError(f"staticmethod arguments are not supported, got {fun}")
   if not callable(fun):
@@ -521,7 +518,7 @@ def infer_argnums_and_argnames(
     argnums: int | Iterable[int] | None,
     argnames: str | Iterable[str] | None,
   ) -> tuple[tuple[int, ...], tuple[str, ...]]:
-  """Infer missing argnums and argnames for a function with inspect."""
+  """用 inspect 为函数推断缺失的 argnums 与 argnames。"""
   if argnums is None and argnames is None:
     return (), ()
 
@@ -556,16 +553,16 @@ def resolve_argnums(
     static_argnums: int | Sequence[int] | None,
     static_argnames: str | Iterable[str] | None,
 ) -> tuple[tuple[int, ...], tuple[str, ...], tuple[int, ...], tuple[str, ...]]:
-  """Validates and completes the argnum/argname specification for a jit.
+  """校验并补全 jit 的 argnum/argname 规格。
 
-  * fills in any missing pieces (e.g., names given numbers, or vice versa),
-  * validates the argument names/numbers against the function signature,
-  * validates that donated and static arguments don't intersect.
+  * 补齐任何缺失的部分（例如由名称给出编号，或反过来），
+  * 依据函数签名校验参数名/编号，
+  * 校验被捐赠的参数与静态参数没有交集。
   """
   if signature is None:
-    # Some built-in functions don't support signature.
-    # See: https://github.com/python/cpython/issues/73485
-    # In this case no validation is done
+    # 有些内置函数不支持签名。
+    # 参见：https://github.com/python/cpython/issues/73485
+    # 这种情况下不做任何校验
     static_argnums = () if static_argnums is None else _ensure_index_tuple(
         static_argnums)
     static_argnames = () if static_argnames is None else _ensure_str_tuple(
@@ -578,21 +575,20 @@ def resolve_argnums(
     assert donate_argnames is None
     donate_argnames = ()
   else:
-    # Infer argnums and argnames according to docstring
-    # If nums is None and names is not None, then nums are inferred from the
-    # names and vice-versa.
+    # 按 docstring 推断 argnums 与 argnames
+    # 如果 nums 为 None 而 names 不为 None，则从 names 推断 nums，反之亦然。
     static_argnums, static_argnames = infer_argnums_and_argnames(
         signature, static_argnums, static_argnames)
     donate_argnums, donate_argnames = infer_argnums_and_argnames(
         signature, donate_argnums, donate_argnames)
 
-    # Validation
+    # 校验
     _validate_argnums(signature, static_argnums, "static_argnums")
     _validate_argnames(signature, static_argnames, "static_argnames")
     _validate_argnums(signature, donate_argnums, "donate_argnums")
     _validate_argnames(signature, donate_argnames, "donate_argnames")
 
-  # Compensate for static argnums absorbing args
+  # 补偿静态 argnums 吸收掉的参数
   _assert_no_intersection(static_argnames, donate_argnames)
   return donate_argnums, donate_argnames, static_argnums, static_argnames
 
@@ -606,13 +602,12 @@ def _assert_no_intersection(static_argnames, donate_argnames):
 
 
 def resolve_kwargs(fun: Callable, args, kwargs) -> tuple[Any, ...]:
-  """Resolve input arguments to positional following a function's signature.
+  """按照函数签名把输入参数解析为位置参数。
 
-  This will raise a TypeError if any keyword-only arguments were passed by the
-  caller.
+  如果调用方传入了任何仅关键字参数，本函数会抛出 TypeError。
   """
   if isinstance(fun, partial):
-    # functools.partial should have an opaque signature.
+    # functools.partial 应具有不透明签名。
     fun = lambda *args, **kwargs: None
   ba = inspect.signature(fun).bind(*args, **kwargs)
   ba.apply_defaults()
@@ -633,8 +628,8 @@ def _dtype(x):
     return dtypes.result_type(getattr(x, 'dtype'))
 
 
-# This decorator exists to make it easier to monkey-patch APIs in JAX.
-# By default it does nothing, but it can be monkey-patched to do other things.
+# 这个装饰器存在的目的是让 JAX 中的 API 更易于被猴子补丁替换。
+# 默认情况下它什么都不做，但可以被猴子补丁改成做其他事情。
 def api_hook(fun, tag: str):
   return fun
 
@@ -648,18 +643,17 @@ def debug_info(
     static_argnums: Sequence[int] = (),
     static_argnames: Sequence[str] = (),
     result_paths_thunk: Callable[[], tuple[str, ...]] | core.InitialResultPaths = core.initial_result_paths,
-    # TODO(necula): check if we really need this, e.g., to speed up tracing?
+    # TODO(necula): 检查我们是否真的需要这个，例如为了加快追踪速度？
     sourceinfo: str | None = None,
     signature: inspect.Signature | None = None,
 ) -> core.DebugInfo:
-  """Construct core.DebugInfo for a function given example args and kwargs.
+  """根据示例参数 args 和 kwargs 为函数构造 core.DebugInfo。
 
-  `args` and `kwargs` are example positional and keyword arguments, used with
-  `inspect.Signature` to get the names of arguments. The arguments that are
-  considered static for tracing purposes should be included, and designated
-  using `static_argnums` and `static_argnames`.
+  `args` 和 `kwargs` 是示例位置参数与关键字参数，与 `inspect.Signature` 一起
+  用来得到参数的名称。出于追踪目的被视为静态的参数也应包含在内，并用
+  `static_argnums` 和 `static_argnames` 指定。
 
-  See docstring for linear_util.DebugInfo.
+  参见 linear_util.DebugInfo 的文档字符串。
   """
   res = getattr(fun, "__fun_debug_info__", None)
   if res is not None:
@@ -685,9 +679,9 @@ def save_wrapped_fun_debug_info(wrapper: Callable,
 
 _fun_name_re = re.compile(r"(?:<built-in function (\S+)>)")
 
-# TODO(mattjj): make this function internal to this module
+# TODO(mattjj): 把这个函数改成该模块内部使用
 def fun_sourceinfo(fun: Callable) -> str:
-  # See DebugInfo.fun_src_info
+  # 参见 DebugInfo.fun_src_info
   while isinstance(fun, partial):
     fun = fun.func
   fun = inspect.unwrap(fun)
@@ -700,27 +694,23 @@ def fun_sourceinfo(fun: Callable) -> str:
       fun_str = str(fun)
     except:
       return "<unknown>"
-    # By contract, the function name has no spaces; also, we want to avoid
-    # fun_sourceinfo of the form "<object Foo at 0x1234>", because it makes
-    # lowering non-deterministic.
+    # 按照约定，函数名中不含空格；另外我们还想避免生成形如
+    # "<object Foo at 0x1234>" 的 fun_sourceinfo，因为它会让降级变得不确定。
     if m := _fun_name_re.match(fun_str):
       return m.group(1)
     return "<unknown>"
-
 
 def _non_static_arg_names(fn_signature: inspect.Signature | None,
                           args: Sequence[Any], kwargs: Mapping[str, Any],
                           static_argnums: Sequence[int],
                           static_argnames: Sequence[str],
                           ) -> tuple[str, ...]:
-  """Returns the names of the non-static arguments.
+  """返回非静态参数的名称。
 
-  If the `fn_signature` is given then we get from it the names of the
-  top-level arguments. In other cases, including when the `args` and `kwargs`
-  do not match the signature, we use names like `args[0]`, `args[1]`, etc.
+  如果给定了 `fn_signature`，我们就从中取得顶层参数的名称。在其他情况下，
+  包括 `args` 与 `kwargs` 和签名不匹配时，我们使用 `args[0]`、`args[1]` 之类的名称。
   """
-  # Use the same argument parsing as jit: positional followed by kwargs
-  # sorted by keys.
+  # 使用与 jit 相同的参数解析方式：先是位置参数，然后是按键排序的 kwargs。
   static = object()
   static_argnums_ = _ensure_inbounds(True, len(args), static_argnums)
   static_argnames_ = set(static_argnames)
@@ -733,14 +723,13 @@ def _non_static_arg_names(fn_signature: inspect.Signature | None,
     except (ValueError, TypeError):
       pass
     else:
-      # Do we have a **kwargs
+      # 是否有 **kwargs
       kwargs_name = next((name for name, p in fn_signature.parameters.items()
                           if p.kind == inspect.Parameter.VAR_KEYWORD), None)
-      # Positional argument are those not passed by keyword and not passed
-      # by **kwargs.
+      # 位置参数是那些既没有按关键字传入、也没有通过 **kwargs 传入的参数。
       positional = [(name, x) for name, x in ba.arguments.items()
                     if name not in kwargs and name != kwargs_name]
-      # Keyword arguments are passed sorted by actual kwarg keyword
+      # 关键字参数按实际 kwarg 的关键字排序后传入
       sorted_kwargs = sorted(((name, x) for name, x in kwargs_.items()),
                               key=lambda name_x: name_x[0])
       sorted_kwargs = [(name if name in ba.arguments else f"{kwargs_name}['{name}']",
@@ -759,7 +748,7 @@ def _non_static_arg_names(fn_signature: inspect.Signature | None,
                for path, l in tracing_registry.flatten_with_path(x)[0]
                if l is not static)
 
-# TODO(mattjj): make this function faster
+# TODO(mattjj): 让这个函数更快
 def check_no_aliased_ref_args(dbg_fn: Callable[[], core.DebugInfo],
                               maybe_avals, args) -> None:
   assert config.mutable_array_checks.value

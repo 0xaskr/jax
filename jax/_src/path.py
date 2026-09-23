@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：为 JAX 提供统一的路径抽象，屏蔽本地文件系统与云端对象存储的差异。
+# 优先使用 `etils.epath`（pip 中的 `etils[epath]`），因为它可以读写 GCS 桶等远程路径；
+# 若未安装则回退到标准库 `pathlib`，此时只能读写本地文件系统。
+# 模块用 `PathProtocol` 声明 `Path` 的构造签名，让两种实现共享同一个类型接口。
+# `make_jax_dump_dir` 供 IR dump 等场景创建输出目录，并支持 `sponge` 这一测试专用取值。
+
 from typing import cast, Protocol
 import logging
 import os
@@ -25,15 +31,15 @@ epath_installed: bool
 
 
 class PathProtocol(Protocol):
-  """A factory that creates a PurePath."""
+  """创建 `PurePath` 的工厂。"""
   def __call__(self, *pathsegments: str | os.PathLike) -> pathlib.Path:
     ...
 
 Path: PathProtocol
 
-# If etils.epath (aka etils[epath] to pip) is present, we prefer it because it
-# can read and write to, e.g., GCS buckets. Otherwise we use the builtin
-# pathlib and can only read/write to the local filesystem.
+# 若存在 etils.epath（在 pip 中即 etils[epath]），我们优先使用它，因为它
+# 可以读写诸如 GCS 桶之类的路径。否则使用内置的 pathlib，
+# 此时只能读写本地文件系统。
 try:
   from etils import epath  # pyrefly: ignore[missing-import]
 except ImportError:
@@ -42,13 +48,13 @@ except ImportError:
   epath_installed = False
 else:
   logger.debug("etils.epath found. Using etils.epath for file I/O.")
-  # Ultimately, epath.Path implements pathlib.Path.  See:
+  # 归根结底，epath.Path 实现了 pathlib.Path。参见：
   # https://github.com/google/etils/blob/2083f3d932a88d8a135ef57112cd1f9aff5d559e/etils/epath/abstract_path.py#L47
   Path = epath.Path
   epath_installed = True
 
 def make_jax_dump_dir(out_dir_path: str) -> pathlib.Path | None:
-  """Make a directory or return the undeclared outputs directory if `sponge`."""
+  """创建目录；若为 `sponge` 则返回未声明的输出目录。"""
   if not out_dir_path:
     return None
   if out_dir_path == "sponge":

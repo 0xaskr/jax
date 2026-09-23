@@ -17,6 +17,12 @@ from typing import Any
 from jax._src import config
 from jax._src.lib import _jax
 
+# 文件职责：承载 XLA 元数据（metadata）的不可变值对象与增删工具，
+# 供 `jax._src.xla_metadata` 提供的 `xla_metadata` 上下文管理器使用。
+# `XlaMetadata` 把元数据字典包装成可哈希的值（缓存命中的键之一），
+# `update_metadata` 在当前元数据之上叠加更新，`current_xla_metadata` 读取
+# 当前配置环境中的元数据；这些元数据最终随计算一起传给 XLA 作为编译提示。
+
 config_ext = _jax.config
 
 

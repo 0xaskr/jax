@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 JAX 在 Python 侧的 FFI（外部函数接口）接入层。
+# 它既提供注册入口（`register_ffi_target`/`register_ffi_type`/`pycapsule`
+# 等），把外部编译库里的函数注册为 XLA custom call 目标；也提供调用入口
+# `ffi_call`，把带目标名、布局、输入输出别名与属性参数的调用封装成
+# `ffi_call` 原语，并为其注册抽象求值、JVP/转置、批处理（vmap）与 MLIR
+# 降级规则，使外部内核能像普通 JAX 运算一样参与追踪、变换与编译。
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
@@ -51,32 +58,32 @@ def register_ffi_target(
     api_version: int = 1,
     **kwargs: Any,
 ) -> None:
-  """Registers a foreign function target.
+  """注册一个外部函数目标。
 
   Args:
-    name: the name of the target.
-    fn: a ``PyCapsule`` object containing the function pointer, or a ``dict``
-      where the keys are FFI stage names (e.g. `"execute"`) and the values are
-      ``PyCapsule`` objects containing a pointer to the handler for that stage.
-    platform: the target platform.
-    api_version: the XLA custom call API version to use. Supported versions are:
-      1 (default) for the typed FFI or 0 for the earlier "custom call" API.
-    kwargs: any extra keyword arguments are passed directly to
-      :func:`~jaxlib.xla_client.register_custom_call_target` for more advanced
-      use cases.
+    name: 目标的名称。
+    fn: 一个包含函数指针的 ``PyCapsule`` 对象，或者一个 ``dict``，
+      其键是 FFI 阶段名（例如 `"execute"`），值是指向该阶段处理函数的
+      ``PyCapsule`` 对象。
+    platform: 目标平台。
+    api_version: 要使用的 XLA custom call API 版本。支持的版本有：
+      1（默认）表示带类型的 FFI，0 表示更早的 "custom call" API。
+    kwargs: 任何额外的关键字参数都会直接传给
+      :func:`~jaxlib.xla_client.register_custom_call_target`，以应对更高级的
+      用法。
   """
   return xla_client.register_custom_call_target(name, fn, platform, api_version,
                                                 **kwargs)
 
 
 class TypeRegistration(TypedDict):
-  """A dictionary type for registering FFI types.
+  """用于注册 FFI 类型的字典类型。
 
   Attributes:
-    type_id: A ``PyCapsule`` object containing a pointer to the
-      ``XLA_FFI_TypeId``.
-    type_info: An optional ``PyCapsule`` object containing a pointer to the type
-      ``XLA_FFI_TypeInfo``.
+    type_id: 一个 ``PyCapsule`` 对象，包含指向
+      ``XLA_FFI_TypeId`` 的指针。
+    type_info: 一个可选的 ``PyCapsule`` 对象，包含指向类型
+      ``XLA_FFI_TypeInfo`` 的指针。
   """
 
   type_id: Any
@@ -88,12 +95,12 @@ def register_ffi_type_id(
     obj: Any,
     platform: str = "cpu",
 ) -> None:
-  """Registers a custom type ID for a FFI target.
+  """为 FFI 目标注册自定义类型 ID。
 
   Args:
-    name: the name of the type ID. This name must be unique within the process.
-    obj: a ``PyCapsule`` object encapsulating a pointer to the type ID.
-    platform: the target platform.
+    name: 类型 ID 的名称。该名称在进程内必须唯一。
+    obj: 一个 ``PyCapsule`` 对象，封装了指向该类型 ID 的指针。
+    platform: 目标平台。
   """
   raise ValueError(
       "register_ffi_type_id is not supported after jaxlib version 381.")
@@ -103,12 +110,12 @@ def register_ffi_type(
     type_registration: TypeRegistration,
     platform: str = "cpu",
 ) -> None:
-  """Registers a custom type for a FFI target.
+  """为 FFI 目标注册自定义类型。
 
   Args:
-    name: the name of the type. This name must be unique within the process.
-    type_registration: a ``TypeRegistration`` defining the external type.
-    platform: the target platform.
+    name: 类型的名称。该名称在进程内必须唯一。
+    type_registration: 定义该外部类型的 ``TypeRegistration``。
+    platform: 目标平台。
   """
   return xla_client.register_custom_type(
       name, type_registration, platform=platform
@@ -116,10 +123,10 @@ def register_ffi_type(
 
 
 def register_ffi_target_as_batch_partitionable(name: str) -> None:
-  """Registers an FFI target as batch partitionable.
+  """把一个 FFI 目标注册为可按批次切分。
 
   Args:
-    name: the name of the target.
+    name: 目标的名称。
   """
   xla_client.register_custom_call_as_batch_partitionable(name)
   xla_bridge.register_plugin_callbacks(
@@ -128,13 +135,12 @@ def register_ffi_target_as_batch_partitionable(name: str) -> None:
 
 
 def pycapsule(funcptr):
-  """Wrap a ctypes function pointer in a PyCapsule.
+  """把 ctypes 函数指针包装成 PyCapsule。
 
-  The primary use of this function, and the reason why it lives with in the
-  ``jax.ffi`` submodule, is to wrap function calls from external compiled
-  libraries to be registered as XLA custom calls.
+  这个函数的主要用途，也是它被放在 ``jax.ffi`` 子模块里的原因，
+  是把外部编译库中的函数调用包装起来，以便注册为 XLA custom call。
 
-  Example usage::
+  示例用法::
 
     import ctypes
     import jax
@@ -149,10 +155,10 @@ def pycapsule(funcptr):
     )
 
   Args:
-    funcptr: A function pointer loaded from a dynamic library using ``ctypes``.
+    funcptr: 用 ``ctypes`` 从动态库中加载的函数指针。
 
   Returns:
-    An opaque ``PyCapsule`` object wrapping ``funcptr``.
+    一个包装了 ``funcptr`` 的不透明 ``PyCapsule`` 对象。
   """
   destructor = ctypes.CFUNCTYPE(None, ctypes.py_object)
   builder = ctypes.pythonapi.PyCapsule_New
@@ -162,13 +168,13 @@ def pycapsule(funcptr):
 
 
 def include_dir() -> str:
-  """Get the path to the directory containing header files bundled with jaxlib"""
-  # Handle both regular packages (__file__ is set) and namespace packages
-  # (__file__ is None but __path__ is available)
+  """获取 jaxlib 自带头文件所在目录的路径"""
+  # 同时处理常规包（设置了 __file__）和命名空间包
+  # （__file__ 为 None，但 __path__ 可用）两种情况
   if jaxlib.__file__ is not None:
     jaxlib_dir = os.path.dirname(os.path.abspath(jaxlib.__file__))
   elif hasattr(jaxlib, '__path__') and jaxlib.__path__:
-    # For namespace packages, use the first path entry
+    # 对于命名空间包，使用第一个路径条目
     jaxlib_dir = jaxlib.__path__[0]
   else:
     raise RuntimeError(
@@ -178,15 +184,15 @@ def include_dir() -> str:
 
 def _aval_shape(aval: core.AbstractValue) -> Shape:
   if isinstance(aval, core.AbstractFuture):
-    # An AbstractFuture is a future of an array. While the array has a shape,
-    # the future itself acts more like a token, which has no shape.
+    # AbstractFuture 是数组的 future。虽然该数组有形状，
+    # 但 future 本身更像一个没有形状的 token。
     return ()
   return () if aval is core.abstract_token else core.physical_aval(aval).shape  # pyrefly: ignore[missing-attribute]
 
 
 def _convert_layout_for_lowering(
     aval: core.AbstractValue, layout: FfiLayoutOptions = None) -> Sequence[int]:
-  """Convert a layout to the minor-to-major order used by the custom call API."""
+  """把布局转换为 custom call API 使用的从次到主（minor-to-major）顺序。"""
   if layout is None:
     return tuple(reversed(range(len(_aval_shape(aval)))))
   elif isinstance(layout, Layout):
@@ -206,31 +212,30 @@ def build_ffi_lowering_function(
     skip_ffi_layout_processing: bool = False,
     **lowering_args: Any,
 ) -> Callable[..., ir.OpView]:
-  """Build a lowering op for an foreign function interface (FFI) target.
+  """为外部函数接口（FFI）目标构建一个降级算子。
 
-  By default, this lowering rule can use the input and output abstract values to
-  compute the input and output types and shapes for the custom call, assuming
-  row-major layouts.
+  默认情况下，该降级规则可以利用输入和输出的抽象值，
+  在假定为行主序布局的前提下，计算出 custom call 的输入与输出类型和形状。
 
-  Note that layouts passed to this function as tuples should be in
-  minor-to-major order (as expected by XLA) rather than major-to-minor as used
-  by :func:`~jax.ffi.ffi_call` and ``Layout``.
+  注意，以元组形式传给本函数的布局应采用从次到主（minor-to-major）顺序
+  （XLA 所期望的顺序），而不是 :func:`~jax.ffi.ffi_call` 与 ``Layout``
+  所使用的从主到次（major-to-minor）顺序。
 
-  If keyword arguments are passed to the lowering rule, these are treated as
-  attributes, and added to `backend_config`.
+  如果向该降级规则传入关键字参数，它们会被当作属性，
+  并被加入到 `backend_config` 中。
 
   Args:
-    call_target_name: The name of the custom call target.
-    operand_layouts: A sequence of layouts (dimension orders) for each operand.
-      By default, the operands are assumed to be row-major.
-    result_layouts: A sequence of layouts (dimension orders) for each result.
-      By default, the results are assumed to be row-major.
-    backend_config: Configuration data for the custom call. Any keyword
-      arguments passed to the lowering rule will added to this dictionary.
-    lowering_args: Any other arguments to :func:`mlir.custom_call` will also be
-      passed through if provided as extra arguments to this function.
-    skip_ffi_layout_processing: If true, skip processing of operand and result
-      layout arguments passed to the lowering rule.
+    call_target_name: custom call 目标的名称。
+    operand_layouts: 每个操作数的布局（维度顺序）序列。
+      默认假定操作数为行主序。
+    result_layouts: 每个结果的布局（维度顺序）序列。
+      默认假定结果为行主序。
+    backend_config: custom call 的配置数据。任何传给该降级规则的
+      关键字参数都会被加入这个字典。
+    lowering_args: 如果作为额外参数传给本函数，任何其他传给
+      :func:`mlir.custom_call` 的参数也会一并传递。
+    skip_ffi_layout_processing: 若为 true，则跳过对传给该降级规则的
+      操作数与结果布局参数的处理。
   """
 
   def _lowering_op(
@@ -293,31 +298,30 @@ def ffi_lowering(
     skip_ffi_layout_processing: bool = False,
     **lowering_args: Any
 ) -> mlir.LoweringRule:
-  """Build a lowering rule for an foreign function interface (FFI) target.
+  """为外部函数接口（FFI）目标构建一个降级规则。
 
-  By default, this lowering rule can use the input and output abstract values to
-  compute the input and output types and shapes for the custom call, assuming
-  row-major layouts.
+  默认情况下，该降级规则可以利用输入和输出的抽象值，
+  在假定为行主序布局的前提下，计算出 custom call 的输入与输出类型和形状。
 
-  Note that layouts passed to this function as tuples should be in
-  minor-to-major order (as expected by XLA) rather than major-to-minor as used
-  by :func:`~jax.ffi.ffi_call` and ``Layout``.
+  注意，以元组形式传给本函数的布局应采用从次到主（minor-to-major）顺序
+  （XLA 所期望的顺序），而不是 :func:`~jax.ffi.ffi_call` 与 ``Layout``
+  所使用的从主到次（major-to-minor）顺序。
 
-  If keyword arguments are passed to the lowering rule, these are treated as
-  attributes, and added to `backend_config`.
+  如果向该降级规则传入关键字参数，它们会被当作属性，
+  并被加入到 `backend_config` 中。
 
   Args:
-    call_target_name: The name of the custom call target.
-    operand_layouts: A sequence of layouts (dimension orders) for each operand.
-      By default, the operands are assumed to be row-major.
-    result_layouts: A sequence of layouts (dimension orders) for each result.
-      By default, the results are assumed to be row-major.
-    backend_config: Configuration data for the custom call. Any keyword
-      arguments passed to the lowering rule will added to this dictionary.
-    lowering_args: Any other arguments to :func:`mlir.custom_call` will also be
-      passed through if provided as extra arguments to this function.
-    skip_ffi_layout_processing: If true, skip processing of operand and result
-      layout arguments passed to the lowering rule.
+    call_target_name: custom call 目标的名称。
+    operand_layouts: 每个操作数的布局（维度顺序）序列。
+      默认假定操作数为行主序。
+    result_layouts: 每个结果的布局（维度顺序）序列。
+      默认假定结果为行主序。
+    backend_config: custom call 的配置数据。任何传给该降级规则的
+      关键字参数都会被加入这个字典。
+    lowering_args: 如果作为额外参数传给本函数，任何其他传给
+      :func:`mlir.custom_call` 的参数也会一并传递。
+    skip_ffi_layout_processing: 若为 true，则跳过对传给该降级规则的
+      操作数与结果布局参数的处理。
   """
 
   def _lowering(
@@ -350,8 +354,8 @@ def _result_avals(results: Sequence[ResultMetadata]) -> tuple[core.AbstractValue
         raise ValueError(
             "All elements of result_shape_dtypes must have 'shape' and 'dtype' "
             f"attributes. Got {result} at position {idx}.")
-      # We use explicit_x64_dtypes("allow") so shaped_abstractify does not
-      # canonicalize explicit 64-bit dtypes on result_shape_dtypes.
+      # 我们使用 explicit_x64_dtypes("allow")，这样 shaped_abstractify
+      # 就不会对 result_shape_dtypes 上显式的 64 位数据类型做规范化。
       with config.explicit_x64_dtypes("allow"):
         avals.append(core.shaped_abstractify(result))
   return tuple(avals)
@@ -378,7 +382,7 @@ def _convert_layouts_for_ffi_call(
       for aval, layout in zip(avals, layouts))
 
 
-# ffi_call() returns as many results as result_shape_dtypes.
+# ffi_call() 返回的结果数量与 result_shape_dtypes 一样多。
 @overload
 def ffi_call(
     target_name: str,
@@ -423,64 +427,56 @@ def ffi_call(
     custom_call_api_version: int = 4,
     legacy_backend_config: str | None = None,
 ) -> Callable[..., Array | Sequence[Array]]:
-  """Call a foreign function interface (FFI) target.
+  """调用一个外部函数接口（FFI）目标。
 
-  See the :ref:`ffi-tutorial` tutorial for more information.
+  更多信息请参见 :ref:`ffi-tutorial` 教程。
 
-  Like :func:`~jax.pure_callback`, the behavior of ``ffi_call`` under
-  :func:`~jax.vmap` depends on the value of ``vmap_method``. See the
-  :func:`~jax.pure_callback` documentation for more details about the allowed
-  values and examples of their behavior.
+  与 :func:`~jax.pure_callback` 类似，``ffi_call`` 在 :func:`~jax.vmap`
+  下的行为取决于 ``vmap_method`` 的取值。关于允许的取值及其行为示例，
+  详见 :func:`~jax.pure_callback` 的文档。
 
-  The current default behavior is to use ``vmap_method="sequential"`` when
-  not specified, but this behavior is deprecated, and in the future, the
-  default will be to raise a ``NotImplementedError`` unless ``vmap_method`` is
-  explicitly specified.
+  当前的默认行为是：未指定时使用 ``vmap_method="sequential"``，
+  但该行为已被弃用；将来除非显式指定 ``vmap_method``，
+  默认行为将改为抛出 ``NotImplementedError``。
 
   Args:
-    target_name: the name of the XLA FFI custom call target that was registered
-      using :func:`~jax.ffi.register_ffi_target`.
-    result_shape_dtypes: an object, or sequence of objects, with ``shape`` and
-      ``dtype`` attributes which are expected to match the shape and dtype of
-      the custom call output or outputs. :class:`~jax.ShapeDtypeStruct` is often
-      used to define the elements of ``result_shape_dtypes``.
-      ``jax.core.abstract_token`` may be used to represent a token-typed output.
-    has_side_effect: boolean specifying whether the custom call has side
-      effects. When ``True``, the FFI call will be executed even when the
-      outputs are not used.
-    vmap_method: string specifying how the FFI call transforms under
-      :func:`~jax.vmap` as described above.
-    input_layouts: a sequence of layouts for each input argument. In each case,
-      the layout can be (a) ``None`` indicating that this input is in default
-      row-major order, (b) a ``Layout`` specifying the axis order,
-      or (c) a sequence of integers specifying the major-to-minor axis
-      ordering. Users who are familiar with XLA layouts should note that this
-      function expects layouts in major-to-minor order instead of the
-      minor-to-major order that XLA uses. For example, a batch of row-major
-      matrices could be specified using the layout ``[0, 1, 2]``, whereas a
-      batch of column-major matrices would have layout ``[0, 2, 1]``. In both
-      of these examples, the leading/batch dimension is the "slowest" axis. The
-      ``input_layouts`` parameter should be used to request the memory layout
-      expected by the FFI call target, and XLA will ensure that the buffers
-      have the correct layouts before the handler is executed.
-    output_layouts: like ``input_layouts``, but specifying the required layouts
-      for the output arrays.
-    input_output_aliases: a dictionary where the keys are input indices and the
-      values are output indices. This mapping indicates which output arrays
-      alias specific input arrays.
-    custom_call_api_version: the version number of the custom call API
-      implemented by the FFI target ``target_name``. The only formally
-      supported version is the typed FFI API with ``custom_call_api_version=4``,
-      but earlier unsupported custom calls can be executed using this argument.
-    legacy_backend_config: for legacy targets implemented using
-      ``custom_call_api_version<4``, attributes are passed using the opaque
-      string representation provided by this argument. This parameter cannot be
-      used with ``custom_call_api_version>=4``.
+    target_name: 通过 :func:`~jax.ffi.register_ffi_target` 注册的
+      XLA FFI custom call 目标的名称。
+    result_shape_dtypes: 一个对象或对象序列，其 ``shape`` 与 ``dtype``
+      属性应当与 custom call 输出的形状和数据类型匹配。
+      通常用 :class:`~jax.ShapeDtypeStruct` 来定义
+      ``result_shape_dtypes`` 的元素。
+      可以用 ``jax.core.abstract_token`` 表示 token 类型的输出。
+    has_side_effect: 布尔值，指定该 custom call 是否有副作用。
+      当为 ``True`` 时，即使输出未被使用，FFI 调用也会被执行。
+    vmap_method: 字符串，按上文所述指定 FFI 调用在 :func:`~jax.vmap`
+      下如何变换。
+    input_layouts: 每个输入参数对应的布局序列。每种情况下，
+      布局可以是 (a) ``None``，表示该输入采用默认的行主序，
+      (b) 一个指定轴顺序的 ``Layout``，
+      或 (c) 一个整数序列，指定从主到次的轴顺序。
+      熟悉 XLA 布局的用户应注意，本函数期望的布局是从主到次顺序，
+      而不是 XLA 使用的从次到主顺序。例如，一批行主序矩阵
+      可以用布局 ``[0, 1, 2]`` 表示，而一批列主序矩阵的布局
+      则为 ``[0, 2, 1]``。在这两个例子中，前导/批次维度都是“最慢”的轴。
+      ``input_layouts`` 参数用于请求 FFI 调用目标所期望的内存布局，
+      XLA 会确保处理函数执行前缓冲区具有正确的布局。
+    output_layouts: 与 ``input_layouts`` 类似，但指定的是输出数组
+      所需的布局。
+    input_output_aliases: 一个字典，其键是输入索引，值是输出索引。
+      该映射指明了哪些输出数组与特定的输入数组互为别名。
+    custom_call_api_version: FFI 目标 ``target_name`` 所实现的
+      custom call API 版本号。唯一正式支持的版本是
+      ``custom_call_api_version=4`` 的带类型 FFI API，
+      但更早的、不受支持的 custom call 也可以用该参数执行。
+    legacy_backend_config: 对于用 ``custom_call_api_version<4``
+      实现的旧式目标，属性通过该参数提供的不透明字符串表示来传递。
+      该参数不能与 ``custom_call_api_version>=4`` 一起使用。
 
   Returns:
-    A function that can be called with the input arrays as positional arguments
-    to execute the FFI handler. Any keyword arguments are passed as named
-    attributes to the FFI handler using XLA's FFI interface.
+    一个函数，可以把输入数组作为位置参数调用它，以执行 FFI 处理函数。
+    任何关键字参数都会通过 XLA 的 FFI 接口，作为具名属性传给
+    FFI 处理函数。
   """
 
   allowed_vmap_methods = ["sequential", "sequential_unrolled", "expand_dims",
@@ -580,11 +576,11 @@ def ffi_call(
   return wrapped
 
 
-# ffi_call must support some small non-hashable input arguments, like np.arrays
-# and dicts, to support calling FFI targets with array inputs or user defined
-# structs. Since these arguments will eventually be embedded in the HLO as
-# dense attributes, we assume that they are small and hash by making an
-# immutable copy and hashing by value.
+# ffi_call 必须支持一些不可哈希的小型输入参数，例如 np.array
+# 和 dict，以便支持用数组输入或用户定义的结构体调用 FFI 目标。
+# 由于这些参数最终会作为稠密属性嵌入 HLO 中，
+# 我们假定它们很小，于是通过创建不可变副本、
+# 并按值进行哈希的方式来哈希。
 def _wrap_kwargs_hashable(kwargs: dict[str, Any]) -> Sequence[tuple[str, Any]]:
   hashable_kwargs: list[tuple[str, Any]] = []
   for k, v in sorted(kwargs.items()):
@@ -698,8 +694,8 @@ def ffi_batching_rule(
   batched_result_avals = tuple(
       core.unmapped_aval(axis_size, 0, aval) for aval in result_avals)
 
-  # For FFI calls we must update the layouts. We handle the output layouts
-  # here, but the input layout updates depend on the vmap_method parameter.
+  # 对于 FFI 调用，我们必须更新布局。这里处理输出布局，
+  # 而输入布局的更新取决于 vmap_method 参数。
   if (
       vmap_method not in ("sequential", "sequential_unrolled") and
       kwargs.get("output_layouts") is not None
@@ -709,8 +705,8 @@ def ffi_batching_rule(
         for layout in kwargs["output_layouts"])
 
   if vmap_method == "legacy_vectorized":
-    # This method is kept to support the behavior that was previously exposed
-    # when using `vectorized=True`.
+    # 保留该方法是为了支持以前使用 `vectorized=True` 时
+    # 所暴露的行为。
     if kwargs.get("input_layouts") is not None:
       kwargs["input_layouts"] = tuple(
           layout if d is None else

@@ -13,6 +13,14 @@
 # limitations under the License.
 
 
+# 文件职责：为 `jax.lax` 原语提供基于 NumPy/SciPy 的参考实现，给出每个原语的确切语义。
+# 这些函数不参与实际的降级与编译执行，而是在主机上充当“语义标准”，
+# 供测试（如 `lax_test`、`random_test`）逐元素比对 JAX 的计算结果，并作为 `lax` 运算的可读规范。
+# 覆盖算术与位运算、类型转换与位转换、卷积与窗口归约、`dot_general`、`ragged_dot`、
+# 切片与填充、排序、`top_k` 等；此处的每个名字都与 `jax.lax` 中的同名原语一一对应。
+# 属于 JAX 内部模块，不建议用户直接调用。
+
+
 import builtins
 import collections
 import itertools
@@ -123,7 +131,7 @@ def mulhi(x, y):
   info = np.iinfo(dtype)
   bits = info.bits
   is_signed = np.issubdtype(dtype, np.signedinteger)
-  # For 64-bit inputs, use Python object dtype for arbitrary precision.
+  # 对于 64 位输入，使用 Python object dtype 以获得任意精度。
   if bits == 64:
     widen_dtype = np.dtype(object)
   else:
@@ -163,24 +171,24 @@ def population_count(x):
     x = x.view(f"uint{np.iinfo(x.dtype).bits}")
   assert x.dtype in (np.uint32, np.uint64)
   m = [
-      np.uint64(0x5555555555555555),  # binary: 0101...
-      np.uint64(0x3333333333333333),  # binary: 00110011..
-      np.uint64(0x0f0f0f0f0f0f0f0f),  # binary:  4 zeros,  4 ones ...
-      np.uint64(0x00ff00ff00ff00ff),  # binary:  8 zeros,  8 ones ...
-      np.uint64(0x0000ffff0000ffff),  # binary: 16 zeros, 16 ones ...
-      np.uint64(0x00000000ffffffff),  # binary: 32 zeros, 32 ones
+      np.uint64(0x5555555555555555),  # 二进制：0101...
+      np.uint64(0x3333333333333333),  # 二进制：00110011...
+      np.uint64(0x0f0f0f0f0f0f0f0f),  # 二进制：4 个 0、4 个 1 ...
+      np.uint64(0x00ff00ff00ff00ff),  # 二进制：8 个 0、8 个 1 ...
+      np.uint64(0x0000ffff0000ffff),  # 二进制：16 个 0、16 个 1 ...
+      np.uint64(0x00000000ffffffff),  # 二进制：32 个 0、32 个 1
   ]
 
   if x.dtype == np.uint32:
     m = list(map(np.uint32, m[:-1]))
 
-  x = (x & m[0]) + ((x >>  1) & m[0])  # put count of each  2 bits into those  2 bits
-  x = (x & m[1]) + ((x >>  2) & m[1])  # put count of each  4 bits into those  4 bits
-  x = (x & m[2]) + ((x >>  4) & m[2])  # put count of each  8 bits into those  8 bits
-  x = (x & m[3]) + ((x >>  8) & m[3])  # put count of each 16 bits into those 16 bits
-  x = (x & m[4]) + ((x >> 16) & m[4])  # put count of each 32 bits into those 32 bits
+  x = (x & m[0]) + ((x >>  1) & m[0])  # 将每 2 位的计数放入对应的 2 位中
+  x = (x & m[1]) + ((x >>  2) & m[1])  # 将每 4 位的计数放入对应的 4 位中
+  x = (x & m[2]) + ((x >>  4) & m[2])  # 将每 8 位的计数放入对应的 8 位中
+  x = (x & m[3]) + ((x >>  8) & m[3])  # 将每 16 位的计数放入对应的 16 位中
+  x = (x & m[4]) + ((x >> 16) & m[4])  # 将每 32 位的计数放入对应的 32 位中
   if x.dtype == np.uint64:
-    x = (x & m[5]) + ((x >> 32) & m[5])  # put count of each 64 bits into those 64 bits
+    x = (x & m[5]) + ((x >> 32) & m[5])  # 将每 64 位的计数放入对应的 64 位中
   return x.astype(dtype)
 
 def clz(x):
@@ -203,13 +211,13 @@ def convert_element_type(operand, dtype):
   return np.asarray(operand, dtype=dtype)
 
 def _bitcast_uint4_to_uint8(operand):
-  # Note: assumes little-endian byte order.
+  # 注意：假定为小端字节序。
   assert operand.dtype == 'uint4'
   operand = operand.astype('uint8')
   return operand[..., ::2] + (operand[..., 1::2] << 4)
 
 def _bitcast_uint8_to_uint4(operand):
-  # Note: assumes little-endian byte order.
+  # 注意：假定为小端字节序。
   assert operand.dtype == 'uint8'
   result = np.zeros((*operand.shape[:-1], operand.shape[-1] * 2), dtype='uint4')
   result[..., ::2] = (operand & 0b00001111).astype('uint4')
@@ -229,7 +237,7 @@ def bitcast_convert_type(operand, dtype):
   else:
     out_shape = (*operand.shape, nbits_in // nbits_out)
 
-  # Special handling for 4-bit integers.
+  # 对 4 位整数的特殊处理。
   if nbits_in == 4:
     operand = _bitcast_uint4_to_uint8(operand.view('uint4'))
   if nbits_out == 4:
@@ -306,7 +314,7 @@ def ragged_dot(
     rhs,
     group_sizes,
 ):
-  """Reference ragged dot implementation."""
+  """ragged dot 的参考实现。"""
   m, lk = lhs.shape
   group_count, rk, n = rhs.shape
   assert lk == rk
@@ -352,7 +360,7 @@ def reshape(operand, new_sizes, dimensions=None):
 def pad(operand, padding_value, padding_config):
   # https://www.openxla.org/xla/operation_semantics#pad
   lo, hi, interior = util.unzip3(padding_config)
-  # Handle first the positive edge padding and interior
+  # 先处理正值的边缘填充与内部填充
   lo_pos, hi_pos = np.clip(lo, 0, None), np.clip(hi, 0, None)
   outshape = np.add(np.add(np.add(lo_pos, hi_pos), operand.shape),
                      np.multiply(interior, np.subtract(operand.shape, 1)))
@@ -423,7 +431,7 @@ def sort_key_val(keys, values, dimension=-1):
   idxs[dimension] = np.argsort(keys, axis=dimension)
   return keys[tuple(idxs)], values[tuple(idxs)]
 
-### conv util
+### 卷积工具
 
 def _conv(lhs, rhs, window_strides, pads):
   view, view_axes, rhs_axes, out_axes = _conv_view(
@@ -449,7 +457,7 @@ def padtype_to_pads(in_shape, filter_shape, window_strides, padding):
     return [(0, 0)] * len(in_shape)
 
 def _conv_view(lhs, rhs_shape, window_strides, pads, pad_value):
-  """Compute the view (and its axes) of a convolution or window reduction."""
+  """计算卷积或窗口归约的视图（及其轴）。"""
   if (_min(lhs.ndim, len(rhs_shape)) < 2 or lhs.ndim != len(rhs_shape)
       or lhs.shape[1] != rhs_shape[1]):
     raise ValueError('Dimension mismatch')
@@ -461,7 +469,7 @@ def _conv_view(lhs, rhs_shape, window_strides, pads, pad_value):
   lhs = _pad(lhs, [(0, 0)] * 2 + list(pads), pad_value)
   in_shape = lhs.shape[2:]
   filter_shape = rhs_shape[2:]
-  dim = len(filter_shape)  # number of 'spatial' dimensions in convolution
+  dim = len(filter_shape)  # 卷积中“空间”维度的数量
 
   out_strides = np.multiply(window_strides, lhs.strides[2:])
   view_strides = lhs.strides[:1] + tuple(out_strides) + lhs.strides[1:]
@@ -487,8 +495,8 @@ def _pad(arr, pads, pad_value):
   return out[slices]
 
 def _dilate(operand, factors, fill_value=0):
-  # this logic is like lax.pad, but with two leading dimensions, no edge
-  # padding, and factors are at least 1 (interior padding is at least 0)
+  # 这段逻辑与 lax.pad 类似，但会保留两个前导维度、不做边缘填充，
+  # 且各因子至少为 1（内部填充至少为 0）
   outspace = np.add(operand.shape[2:],
                      np.multiply(np.subtract(factors, 1),
                                   np.subtract(operand.shape[2:], 1)))
@@ -511,14 +519,14 @@ def _conv_general_permutations(dimension_numbers):
                              key=lambda i: rhs_spec.index(out_spec[i]))))
   return lhs_perm, rhs_perm, out_perm
 
-### reduce util
+### 归约工具
 
 def _make_reducer(py_binop, init_val):
-  """Make a reducer function given a Python binop and an initial value."""
-  # It's tempting to use np.ufunc.reduce (even with a ufunc generated by
-  # np.frompyfunc(py_binop)), but this may not agree with custom init_val.
-  # We make an attempt to uncover an underlying numpy ufunc (which might be
-  # wrapped by autograd or lax) and check its identity against init_val.
+  """根据 Python 二元运算与初始值构造归约函数。"""
+  # 直接用 np.ufunc.reduce 很诱人（即使用 np.frompyfunc(py_binop) 生成的
+  # ufunc 也一样），但它可能与自定义的 init_val 不一致。
+  # 我们尝试找出底层的 numpy ufunc（它可能被 autograd 或 lax 包装），
+  # 并检查其单位元是否与 init_val 相符。
   monoid_record = _monoids.get(getattr(py_binop, '__name__'))
   if monoid_record:
     reducer, monoid_identity = monoid_record

@@ -12,6 +12,12 @@
 # See the License for the ific language governing permissions and
 # limitations under the License.
 
+# 文件职责：描述 JAX 数组在设备内存中的物理布局，以及布局与分片的组合方式。
+# `Layout` 用 major_to_minor 维度顺序、可选的 tiling 和亚字节元素位宽刻画一个
+# 具体布局，并可与 XLA/PjRt 的布局表示互相转换；`AutoLayout` 表示交由编译器选择布局。
+# `Format` 把布局与 `Sharding` 配对，用于数组创建时的显式布局/分片指定；
+# `get_layout_for_vmap` 则为 `vmap` 新增的维度推导出对应的布局。
+
 from __future__ import annotations
 
 
@@ -109,7 +115,7 @@ class Format:
 
   def __init__(self, layout: LayoutOptions = None,
                sharding: ShardingOptions = None):
-    # If layout is concrete and sharding is not, error.
+    # 若 layout 是具体的而 sharding 未给出，则报错。
     if isinstance(layout, Layout) and sharding is None:
       raise ValueError(
           'Sharding has to be concrete when layout is of type'
@@ -149,7 +155,7 @@ class Format:
 
 
 def get_layout_for_vmap(dim: int, layout: Layout) -> Layout:
-  # Make the new dim major-most and shift all other dims by 1 in major_to_minor
+  # 让新维度处于最主位，并把其余各维在 major_to_minor 中整体加 1
   new_m2m = tuple(m + 1 for m in layout.major_to_minor)
   vmapped_major_to_minor = tuple_insert(new_m2m, dim, 0)
   return layout.update(major_to_minor=vmapped_major_to_minor)

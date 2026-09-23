@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：实现 JAX 的外部回调（callback）机制，让已暂存的 JAX 程序在运行时回调主机上的 Python 函数。
+# 核心是 `pure_callback_p`（纯回调，无副作用，可被变换重排或省略）与 `io_callback_p`
+# （不纯回调，带 IO 效果，可选有序执行）这两个原语，以及它们的抽象求值、JVP/转置、
+# 批处理规则、分片注解和 MLIR 降级规则。
+# 降级路径按后端区分：TPU 走 `send_to_host`/`receive_from_host` 这一主机传输通信机制，
+# CPU/GPU 则生成 XLA FFI 自定义调用；降级时会结合 SPMD/Shardy 的分片上下文决定回调在哪些设备上执行。
 """Module for JAX callbacks."""
 from __future__ import annotations
 
@@ -45,7 +51,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# `pure_callback_p` is the main primitive for staging out Python pure callbacks.
+# `pure_callback_p` 是把 Python 纯回调暂存出去的主原语。
 pure_callback_p = core.Primitive("pure_callback")
 pure_callback_p.multiple_results = True
 dispatch.prim_requires_devices_during_lowering.add(pure_callback_p)
@@ -56,15 +62,14 @@ zip, unsafe_zip = util.safe_zip, zip
 
 @dataclasses.dataclass(frozen=True, slots=True, weakref_slot=True)
 class _FlatCallback:
-  """A Python function callable with flat arguments and results.
+  """可用扁平参数和结果调用的 Python 函数。
 
-  An instance of this class is used as a parameter for the callback primitives.
-  We prefer it to an anonymous flattened function because it produces
-  equal objects when we call the same Python function with the same argument
-  structure.
+  该类的实例被用作回调原语的参数。
+  我们更偏好它而不是匿名的扁平化函数，因为当我们用相同的参数结构调用同一个
+  Python 函数时，它会产生相等的对象。
   """
   callback_func: Callable[..., Any]
-  in_tree: tree_util.PyTreeDef  # (args, kwargs) pytree for `callback_func`.
+  in_tree: tree_util.PyTreeDef  # `callback_func` 的 (args, kwargs) pytree。
 
   def __call__(self, *flat_args: Array) -> Sequence[Array]:
     args, kwargs = tree_util.tree_unflatten(self.in_tree, flat_args)
@@ -136,7 +141,7 @@ batching.primitive_batchers[pure_callback_p] = functools.partial(
 )
 
 def _get_sdy_array_list_for_callbacks(avals: Sequence[core.ShapedArray]) -> SdyArrayList:
-  """Returns an SdyArrayList with `max(1, len(avals))` replicated shardings."""
+  """返回一个 SdyArrayList，其中带有 `max(1, len(avals))` 个复制分片。"""
   ndims = [0]
   if avals:
     ndims = [x.ndim for x in avals if isinstance(x, core.ShapedArray)]
@@ -152,8 +157,8 @@ def _callback_op_sharding(
     axis_context, sharding: Sharding | None, avals_out
 ):
   if isinstance(axis_context, sharding_impls.SPMDAxisContext):
-    # If we have fully manual sharding during lowering, that means the JAX
-    # program has per-device semantics, so we run the callback on each device.
+    # 如果在降级期间处于完全手动分片状态，那就意味着该 JAX 程序具有按设备语义，
+    # 因此我们在每个设备上运行回调。
     if axis_context.manual_axes != frozenset(axis_context.mesh.axis_names):
       raise NotImplementedError(
           "callbacks are only supported in spmd computations when all mesh"
@@ -196,13 +201,11 @@ def _callback_op_sharding(
     else:
       device_index = 0
 
-    # If we have fully automatic sharding during lowering, that means the JAX
-    # program has bulk array semantics, so we run the callback with a MAXIMAL
-    # sharding and hence execute it only once on the full logical value).
+    # 如果在降级期间处于完全自动分片状态，那就意味着该 JAX 程序具有整体数组语义，
+    # 因此我们以 MAXIMAL 分片运行回调，也就是只在完整的逻辑值上执行一次。
     if config.use_shardy_partitioner.value:
-      # For shardy, we need to have the same number of shardy annotations as the
-      # number of result ops. If there are no result ops, we need 1 shardy
-      # annotation.
+      # 对于 shardy，分片注解的个数必须与结果算子的个数相同。如果没有结果算子，
+      # 则需要 1 个 shardy 注解。
       num_sdy_shardings = max(1, len(avals_out))
       op_sharding = SdyArrayList((
           SdyArray(mesh_shape=(), dim_shardings=(),
@@ -214,7 +217,7 @@ def _callback_op_sharding(
       op_sharding.tile_assignment_devices = [device_index]
     return op_sharding
 
-  # When there's no SPMD partitioning going on, don't annotate a sharding.
+  # 没有 SPMD 分区时，不要标注分片。
   return None
 
 
@@ -226,7 +229,7 @@ def pure_callback_lowering(
         pure_callback_impl(
             *flat_args,
             callback=callback,
-            sharding=None,  # unused.
+            sharding=None,  # 未使用。
             **params,
         )
     )
@@ -247,8 +250,8 @@ def pure_callback_lowering(
   return result
 
 
-# TODO(phawkins): On TPU, these have an embedded channel ID that should be
-# unique for each callback. Caching defeats this.
+# TODO(phawkins): 在 TPU 上，这些回调带有内嵌的通道 ID，该 ID 对每个回调都应当唯一。
+# 缓存会破坏这一点。
 mlir.register_lowering(pure_callback_p, pure_callback_lowering, cacheable=False)
 
 def _check_shape_dtype(shape_dtype):
@@ -266,78 +269,68 @@ def pure_callback(
     vmap_method: str | None = None,
     **kwargs: Any,
 ):
-  """Calls a pure Python callback. Works under :func:`jit`/:func:`~vmap`/etc.
+  """调用一个纯 Python 回调。可在 :func:`jit`/:func:`~vmap`/等变换下工作。
 
-  For more explanation, see `External Callbacks`_.
+  更多说明请参阅 `External Callbacks`_。
 
-  ``pure_callback`` enables calling a Python function in JIT-ed JAX functions.
-  The input ``callback`` will be passed JAX arrays placed on a local CPU, and
-  it should also return JAX arrays on CPU.
+  ``pure_callback`` 使得在经 JIT 编译的 JAX 函数中可以调用 Python 函数。
+  输入 ``callback`` 会收到被放置到本地 CPU 上的 JAX 数组，
+  它也应返回位于 CPU 上的 JAX 数组。
 
-  The callback is treated as functionally pure, meaning it has no side-effects
-  and its output value depends only on its argument values. As a consequence, it
-  is safe to be called multiple times (e.g. when transformed by :func:`~vmap` or
-  :func:`~pmap`), or not to be called at all when e.g. the output of a
-  `jit`-decorated function has no data dependence on its value. Pure callbacks
-  may also be reordered if data-dependence allows.
+  该回调被视为函数式纯函数，也就是说它没有副作用，其输出值只依赖参数值。
+  因此，它可以安全地被多次调用（例如被 :func:`~vmap` 或 :func:`~pmap` 变换时），
+  或者在 `jit` 装饰的函数的输出与其值之间没有数据依赖时完全不被调用。
+  在数据依赖允许的情况下，纯回调还可以被重排。
 
   .. warning::
 
-     In the context of JAX transformations, Python exceptions should be
-     considered side-effects: this means that intentionally raising an error
-     within a `pure_callback` breaks the API contract, and the behavior of
-     the resulting program is undefined.
+     在 JAX 变换的语境下，Python 异常应当被视为副作用：这意味着在
+     `pure_callback` 中故意抛出错误会违反 API 约定，由此产生的程序行为是未定义的。
 
-  When `vmap`-ed the behavior will depend on the value of the ``vmap_method``.
+  被 `vmap` 作用时，其行为取决于 ``vmap_method`` 的取值。
 
-  * Calling :func:`~jax.vmap` on a callback without an explicit ``vmap_method``
-    raises a ``NotImplementedError``.
-  * ``vmap_method="sequential"`` uses :func:`~jax.lax.map` to loop over
-    the batched arguments, calling ``callback`` once for each batch element.
-  * ``vmap_method="sequential_unrolled"`` is like ``sequential``, but the loop
-    is unrolled.
-  * ``vmap_method="expand_dims"`` calls ``callback`` with new axes of size ``1``
-    added as the leading dimension unbatched inputs.
-  * ``vmap_method="broadcast_all"`` behaves like ``expand_dims``, but the
-    inputs are tiled to the expected batched shape.
+  * 在没有显式指定 ``vmap_method`` 的情况下对回调调用 :func:`~jax.vmap`
+    会抛出 ``NotImplementedError``。
+  * ``vmap_method="sequential"`` 使用 :func:`~jax.lax.map` 遍历批处理后的
+    参数，对每个批元素调用一次 ``callback``。
+  * ``vmap_method="sequential_unrolled"`` 与 ``sequential`` 类似，但循环会被展开。
+  * ``vmap_method="expand_dims"`` 在未批处理的输入的前导维度上新增大小为 ``1``
+    的轴来调用 ``callback``。
+  * ``vmap_method="broadcast_all"`` 的行为与 ``expand_dims`` 类似，但输入会被
+    平铺到预期的批处理形状。
 
 
 
-  The current default behavior is to use ``vmap_method="sequential"`` when
-  not specified, but this behavior is deprecated, and in the future, the
-  default will be to raise a ``NotImplementedError`` unless ``vmap_method`` is
-  explicitly specified.
+  当前的默认行为是在未指定时使用 ``vmap_method="sequential"``，但该行为已被弃用，
+  未来除非显式指定 ``vmap_method``，否则默认将抛出 ``NotImplementedError``。
 
   Args:
-    callback: function to execute on the host. The callback is assumed to be a pure
-      function (i.e. one without side-effects): if an impure function is passed, it
-      may behave in unexpected ways, particularly under transformation. The callable
-      will be passed PyTrees of arrays as arguments, and should return a PyTree of
-      arrays that matches ``result_shape_dtypes``.
-    result_shape_dtypes: pytree whose leaves have ``shape`` and ``dtype`` attributes,
-      whose structure matches the expected output of the callback function at runtime.
-      :class:`jax.ShapeDtypeStruct` is often used to define leaf values.
-    *args: arguments to be passed to the callback function
-    sharding: optional sharding that specifies the device from which the callback should
-      be invoked.
-    vmap_method: string specifying how the callback transforms under
-      :func:`~jax.vmap` as described above.
-    **kwargs: keyword arguments to be passed to the callback function
+    callback: 在主机上执行的函数。该回调被假定为纯函数（即没有副作用）：
+      如果传入不纯的函数，它可能以意外的方式运行，尤其是在变换之下。该可调用对象
+      会收到以数组 pytree 形式给出的参数，并应返回与 ``result_shape_dtypes``
+      匹配的数组 pytree。
+    result_shape_dtypes: 一个 pytree，其叶子具有 ``shape`` 和 ``dtype`` 属性，
+      其结构与回调函数在运行时预期的输出结构匹配。
+      :class:`jax.ShapeDtypeStruct` 常用于定义叶子值。
+    *args: 传给回调函数的参数
+    sharding: 可选的分片，用于指定应该从哪个设备调用该回调。
+    vmap_method: 字符串，按上文所述指定该回调在
+      :func:`~jax.vmap` 下如何变换。
+    **kwargs: 传给回调函数的关键字参数
 
   Returns:
-    result: a pytree of :class:`jax.Array` objects whose structure matches that of
-      ``result_shape_dtypes``.
+    result: 一个 :class:`jax.Array` 对象的 pytree，其结构与
+      ``result_shape_dtypes`` 的结构匹配。
 
   See Also:
-    - :func:`jax.experimental.io_callback`: callback designed for impure functions.
-    - :func:`jax.debug.callback`: callback designed for general-purpose debugging.
-    - :func:`jax.debug.print`: callback designed for printing.
+    - :func:`jax.experimental.io_callback`：为不纯函数设计的回调。
+    - :func:`jax.debug.callback`：为通用调试设计的回调。
+    - :func:`jax.debug.print`：为打印设计的回调。
 
   Examples:
-    The behavior of ``pure_callback`` under :func:`~jax.vmap` is controlled by
-    the ``vmap_method`` argument as described above. It is useful to consider
-    some explicit examples that demonstrate the semantics. For example,
-    consider the following function:
+    ``pure_callback`` 在 :func:`~jax.vmap` 下的行为由上文所述的 ``vmap_method``
+    参数控制。考虑一些展示其语义的明确例子会很有帮助。例如，
+    考虑如下函数：
 
     >>> def callback(x, y):
     ...   print(jnp.shape(x), jnp.shape(y))
@@ -350,8 +343,7 @@ def pure_callback(
     ...   return jax.pure_callback(callback, out_type, x, y,
     ...                            vmap_method=vmap_method)
 
-    Calling this with ``vmap_method="expand_dims"`` adds a new axis of size ``1``
-    to ``y``:
+    以 ``vmap_method="expand_dims"`` 调用它会给 ``y`` 添加一个大小为 ``1`` 的新轴：
 
     >>> from functools import partial
     >>> x = jnp.arange(4)
@@ -360,8 +352,7 @@ def pure_callback(
     (4,) (1,)
     Array([1., 2., 3., 4.], dtype=float32)
 
-    Whereas, ``vmap_method="broadcast_all"`` adds an axis of size ``4`` to
-    ``y``:
+    而 ``vmap_method="broadcast_all"`` 会给 ``y`` 添加一个大小为 ``4`` 的轴：
 
     >>> jax.vmap(partial(fun, vmap_method="broadcast_all"),
     ...          in_axes=(0, None))(x, y)
@@ -494,7 +485,7 @@ def io_callback_lowering(ctx, *args, callback, sharding, ordered, **params):
         io_callback_impl(
             *flat_args,
             callback=callback,
-            sharding=None,  # unused.
+            sharding=None,  # 未使用。
             ordered=ordered,
             **params,
         )
@@ -531,8 +522,8 @@ def io_callback_lowering(ctx, *args, callback, sharding, ordered, **params):
     )
   return result
 
-# TODO(phawkins): On TPU, these have an embedded channel ID that should be
-# unique for each callback. Caching defeats this.
+# TODO(phawkins): 在 TPU 上，这些回调带有内嵌的通道 ID，该 ID 对每个回调都应当唯一。
+# 缓存会破坏这一点。
 mlir.register_lowering(io_callback_p, io_callback_lowering, cacheable=False)
 
 def io_callback(
@@ -543,31 +534,30 @@ def io_callback(
     ordered: bool = False,
     **kwargs: Any,
 ):
-  """Calls an impure Python callback.
+  """调用一个不纯的 Python 回调。
 
-  For more explanation, see `External Callbacks`_.
+  更多说明请参阅 `External Callbacks`_。
 
   Args:
-    callback: function to execute on the host. It is assumed to be an impure function.
-      If ``callback`` is pure, using :func:`jax.pure_callback` instead may lead to
-      more efficient execution.
-    result_shape_dtypes: pytree whose leaves have ``shape`` and ``dtype`` attributes,
-      whose structure matches the expected output of the callback function at runtime.
-      :class:`jax.ShapeDtypeStruct` is often used to define leaf values.
-    *args: arguments to be passed to the callback function
-    sharding: optional sharding that specifies the device from which the callback should
-      be invoked.
-    ordered: boolean specifying whether sequential calls to callback must be ordered.
-    **kwargs: keyword arguments to be passed to the callback function
+    callback: 在主机上执行的函数。它被假定为不纯函数。
+      如果 ``callback`` 是纯函数，改用 :func:`jax.pure_callback` 可能带来
+      更高效的执行。
+    result_shape_dtypes: 一个 pytree，其叶子具有 ``shape`` 和 ``dtype`` 属性，
+      其结构与回调函数在运行时预期的输出结构匹配。
+      :class:`jax.ShapeDtypeStruct` 常用于定义叶子值。
+    *args: 传给回调函数的参数
+    sharding: 可选的分片，用于指定应该从哪个设备调用该回调。
+    ordered: 布尔值，指定对回调的连续调用是否必须保持有序。
+    **kwargs: 传给回调函数的关键字参数
 
   Returns:
-    result: a pytree of :class:`jax.Array` objects whose structure matches that of
-      ``result_shape_dtypes``.
+    result: 一个 :class:`jax.Array` 对象的 pytree，其结构与
+      ``result_shape_dtypes`` 的结构匹配。
 
   See Also:
-    - :func:`jax.pure_callback`: callback designed for pure functions.
-    - :func:`jax.debug.callback`: callback designed for general-purpose debugging.
-    - :func:`jax.debug.print`: callback designed for printing.
+    - :func:`jax.pure_callback`：为纯函数设计的回调。
+    - :func:`jax.debug.callback`：为通用调试设计的回调。
+    - :func:`jax.debug.print`：为打印设计的回调。
 
   .. _External Callbacks: https://docs.jax.dev/en/latest/notebooks/external_callbacks.html
   """
@@ -615,11 +605,10 @@ def send_to_host(
   )
   if sharding is not None:
     if config.use_shardy_partitioner.value:
-      # `SendOp`'s return type is a StableHLO `TokenType`. However JAX passed
-      # in the maximal sharding of the array type. Since a token has no rank,
-      # we need to create an equivalent sharding with no dimensions. If there
-      # are multiple shardings, just grab the first one since all these
-      # shardings should be the same.
+      # `SendOp` 的返回类型是 StableHLO 的 `TokenType`。但 JAX 传入的是
+      # 数组类型的最大（MAXIMAL）分片。由于 token 没有秩，我们需要创建一个
+      # 等价的、没有维度的分片。如果有多个分片，
+      # 直接取第一个即可，因为这些分片应当都是相同的。
       assert isinstance(sharding, SdyArrayList)
       assert len(sharding.shardings) >= 1
       sharding = SdyArrayList((SdyArray(
@@ -655,18 +644,17 @@ def receive_from_host(
     if config.use_shardy_partitioner.value:
       assert isinstance(sharding, SdyArrayList)
       assert len(sharding.shardings) >= 1
-      # `RecvOp`'s last argument is a `TokenType`. Since Shardy requires the
-      # number of shardings to match the number of results, but JAX only sees
-      # the array result, we need to add an equivalent sharding for the token.
-      # Note that even if a function returns N results, we will end up with N
-      # `RecvOp`s, so we only need to get the first sharding. All shardings are
-      # the same anyways, operating on the same single device ID.
+      # `RecvOp` 的最后一个参数是 `TokenType`。由于 Shardy 要求分片数量与结果
+      # 数量一致，而 JAX 只看到数组结果，我们需要为 token 补上一个等价的分片。
+      # 注意即使一个函数返回 N 个结果，最终也会有 N 个 `RecvOp`，
+      # 因此我们只需要取第一个分片。所有分片反正都是一样的，
+      # 都作用于同一个设备 ID。
       sharding = SdyArrayList((
           sharding.shardings[0],
           SdyArray(mesh_shape=(), dim_shardings=(),
                    logical_device_ids=sharding.shardings[0].logical_device_ids)))
     mlir.set_sharding(ctx, recv_op, sharding)
-  # Token should be at the end of the results
+  # token 应位于结果的末尾
   result, token = recv_op.results
   return token, result
 
@@ -708,10 +696,9 @@ def _emit_tpu_python_callback(
 
   send_channels = []
   if not operand_avals:
-    # If there are no operands to the callback, we need to insert a dummy send
-    # op or the callback will never be triggered!
-    # TODO(sharadmv,chky): Enable this fix in the runtime as opposed to in
-    # MLIR builder.
+    # 如果回调没有任何操作数，我们需要插入一个哑元 send 算子，
+    # 否则该回调永远不会被触发！
+    # TODO(sharadmv,chky): 在运行时而不是在 MLIR 构建器中启用此修复。
     callback_without_args = _wrapped_callback
     def _wrapped_callback(*args):
       del args
@@ -732,9 +719,8 @@ def _emit_tpu_python_callback(
   recv_channels = []
   outputs = []
   if returns_token and not result_avals:
-    # If the caller expects a token, we need at least one result so that the
-    # token from the recv is used as an indication that the callback is
-    # complete. Without this, we would only wait for the send to finish.
+    # 如果调用方期望一个 token，我们至少需要一个结果，这样来自 recv 的 token
+    # 才能被用作回调已完成的标志。否则我们只会等待 send 结束。
     callback_without_results = _wrapped_callback
     def _wrapped_callback(*args):
       callback_without_results(*args)
@@ -775,24 +761,23 @@ def emit_python_callback(
     partitioned: bool = False,
     sharding: SdyArrayList | xc.OpSharding | None = None,
 ) -> tuple[Sequence[mlir.IrValues], Any, Any]:
-  """Emits MLIR that calls back to a provided Python function.
+  """生成回调到给定 Python 函数的 MLIR。
 
   Args:
-    ctx: The lowering context.
-    callback: The Python callback function.
-    token: The token to use for the callback.
-    operands: The operands to the callback.
-    operand_avals: The abstract values of the operands.
-    result_avals: The abstract values of the results.
-    has_side_effect: Whether the callback has side effects.
-    returns_token: Whether the callback should return a token.
-    partitioned: If True, then `callback` is called on local shards only. If
-      False, then `callback` is called on all shards.
-    sharding: The sharding of the callback.
+    ctx: 降级上下文。
+    callback: Python 回调函数。
+    token: 用于该回调的 token。
+    operands: 该回调的操作数。
+    operand_avals: 操作数的抽象值。
+    result_avals: 结果的抽象值。
+    has_side_effect: 该回调是否有副作用。
+    returns_token: 该回调是否应返回一个 token。
+    partitioned: 若为 True，则 `callback` 只在本地分片上被调用。
+      若为 False，则 `callback` 在所有分片上被调用。
+    sharding: 该回调的分片。
 
   Returns:
-    A tuple of MLIR result values, a new token (if any), and the host callback
-    object.
+    MLIR 结果值的元组、新的 token（如果有），以及主机回调对象。
   """
   if len(ctx.module_context.platforms) > 1:
     raise NotImplementedError("multi-platform lowering for python_callback")
@@ -810,15 +795,14 @@ def emit_python_callback(
   result_shapes = [_aval_to_xla_shape(aval) for aval in result_avals]
   operand_shapes = [_aval_to_xla_shape(aval) for aval in operand_avals]
 
-  # First we apply checks to ensure output shapes and dtypes match the expected
-  # ones.
+  # 首先我们施加检查，确保输出的形状和数据类型与预期一致。
   def _wrapped_callback(*args):
     out_vals = callback(*args)
     if len(out_vals) != len(result_avals):
       raise RuntimeError(
           "Mismatched number of outputs from callback. "
           "Expected: {}, Actual: {}".format(len(result_avals), len(out_vals)))
-    # Handle Python literals, and custom arrays, e.g., tf.Tensor.
+    # 处理 Python 字面量以及自定义数组，例如 tf.Tensor。
     out_vals = tuple(dtypes.canonicalize_value(np.asarray(a)) for a in out_vals)
     for i, (out_val, out_aval) in enumerate(zip(out_vals, result_avals)):
       if out_val.shape != out_aval.shape:
@@ -831,10 +815,9 @@ def emit_python_callback(
             f"Expected: {out_aval.dtype}, Actual: {out_val.dtype}")
 
     if platform == "tpu":
-      # On TPU we cannot receive empty arrays. So, we return from the wrapped
-      # callback only the non-empty results, and we will create empty constants
-      # in the receiving computation.
-      # TODO(b/238239458): fix TPU Recv to work with empty arrays.
+      # 在 TPU 上我们无法接收空数组。因此我们从被包装的回调中只返回非空结果，
+      # 并在接收计算中创建空常量。
+      # TODO(b/238239458): 修复 TPU Recv 使其能处理空数组。
       non_empty_out_vals = tuple(
           out_val
           for out_val, result_aval in zip(out_vals, result_avals)
@@ -874,9 +857,9 @@ def emit_python_callback(
         and len(ctx.avals_out) > 0
         and isinstance(sharding, SdyArrayList)
     ):
-      # Add a sharding annotation for the token if we have at least one
-      # output. Otherwise, the single shardy annotation required of all ops
-      # (even those without any results) can annotate the token.
+      # 如果我们至少有一个输出，就为 token 添加一个分片注解。
+      # 否则，所有算子（即使没有任何结果）都需要的那个 shardy 注解
+      # 可以标注在 token 上。
       sharding = SdyArrayList((
           SdyArray(mesh_shape=(), dim_shardings=(),
                    logical_device_ids=sharding.shardings[0].logical_device_ids),
@@ -887,8 +870,7 @@ def emit_python_callback(
         avals_out=[core.abstract_token, *ctx.avals_out],
     )
 
-  # TODO(dsuo): Remove this line once we deprecate the XLA custom call
-  # handler.
+  # TODO(dsuo): 一旦我们弃用 XLA 自定义调用处理器，就删除这一行。
   ifrt_callback = _wrapped_callback
   ctx.module_context.add_host_callback(ifrt_callback)
   index = np.uint64(len(ctx.module_context.host_callbacks) - 1)

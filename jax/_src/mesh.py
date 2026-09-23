@@ -11,7 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Definitions of Mesh and AbstractMesh"""
+# 文件职责：定义 `Mesh` 与 `AbstractMesh`，即 JAX 中逻辑网格的抽象。
+# `Mesh` 用一张多维设备数组加轴名描述可用硬件资源，是 `NamedSharding`、
+# `shard_map`、`jax.jit` 等接口进行分片与并行计算的基础；模块同时提供
+# `AxisType`（Auto/Explicit/Manual）区分各轴的自动、显式与手动分片类型，
+# 以及 `AbstractMesh`（只保留轴名与轴大小、不含具体设备）来避免设备变化
+# 引发的追踪与降级缓存失效。作用域内的网格通过线程局部的资源栈维护。
+"""Mesh 与 AbstractMesh 的定义"""
 
 from __future__ import annotations
 
@@ -86,20 +92,19 @@ def _get_local_mesh(global_mesh: Mesh, process_index: int) -> Mesh:
   is_local_device = np.vectorize(
       lambda d: d.process_index == process_index, otypes=[bool])(global_mesh.devices)
   subcube_indices = []
-  # We take the smallest slice of each dimension that doesn't skip any local device.
+  # 我们取每个维度上不会跳过任何本地设备的最小切片。
   for axis in range(global_mesh.devices.ndim):
     other_axes = tuple_delete(tuple(range(global_mesh.devices.ndim)), axis)
-    # NOTE: This re-reduces over many axes multiple times, so we could definitely
-    #       optimize it, but I hope it won't be a bottleneck anytime soon.
+    # 注意：这里会多次在多个轴上重复归约，所以肯定还有优化空间，
+    #       但我希望短期内它不会成为瓶颈。
     local_slices = is_local_device.any(other_axes, keepdims=False)
     nonzero_indices = np.flatnonzero(local_slices)
     start, end = int(np.min(nonzero_indices)), int(np.max(nonzero_indices))
     subcube_indices.append(slice(start, end + 1))
   subcube_indices_tuple = tuple(subcube_indices)
-  # We only end up with all conditions being true if the local devices formed a
-  # subcube of the full array. This is because we were biased towards taking a
-  # "hull" spanned by the devices, and in case the local devices don't form a
-  # subcube that hull will contain non-local devices.
+  # 只有当本地设备构成完整设备数组的一个子立方体时，最终才会所有条件都为真。
+  # 因为我们在取切片时倾向于取由这些设备张成的"外壳（hull）"，一旦本地设备
+  # 不构成子立方体，该外壳就会包含非本地设备。
   if not is_local_device[subcube_indices_tuple].all():
     raise ValueError(
         "When passing host local inputs to pjit, devices connected to a single"
@@ -215,19 +220,18 @@ class BaseMesh:
 
 @immutable
 class Mesh(BaseMesh, contextlib.ContextDecorator):
-  """Declare the hardware resources available in the scope of this manager.
+  """声明在该管理器作用域内可用的硬件资源。
 
-  See `Distributed arrays and automatic parallelization`_ and
-  `Explicit Sharding`_ tutorials.
+  参见 `Distributed arrays and automatic parallelization`_ 与
+  `Explicit Sharding`_ 教程。
 
   Args:
-    devices: A NumPy ndarray object containing JAX device objects (as
-      obtained e.g. from :py:func:`jax.devices`).
-    axis_names: A sequence of resource axis names to be assigned to the
-      dimensions of the ``devices`` argument. Its length should match the
-      rank of ``devices``.
-    axis_types: and optional tuple of :class:`jax.sharding.AxisType` entries corresponding to
-      the ``axis_names``. See `Explicit Sharding`_ for more information.
+    devices: 一个 NumPy ndarray 对象，其中包含 JAX 设备对象（例如通过
+      :py:func:`jax.devices` 获得）。
+    axis_names: 要分配给 ``devices`` 参数各维度的资源轴名称序列。
+      其长度应与 ``devices`` 的秩（rank）一致。
+    axis_types: 与 ``axis_names`` 对应的 :class:`jax.sharding.AxisType` 条目组成的
+      可选元组。更多信息参见 `Explicit Sharding`_。
 
   Examples:
 
@@ -235,7 +239,7 @@ class Mesh(BaseMesh, contextlib.ContextDecorator):
     >>> from jax.sharding import PartitionSpec as P, NamedSharding
     >>> import numpy as np
     ...
-    >>> # Declare a 2D mesh with axes `x` and `y`.
+    >>> # 声明一个带有轴 `x` 和 `y` 的二维网格。
     >>> devices = np.array(jax.devices()).reshape(4, 2)
     >>> mesh = Mesh(devices, ('x', 'y'))
     >>> inp = np.arange(16).reshape(8, 2)
@@ -288,7 +292,7 @@ class Mesh(BaseMesh, contextlib.ContextDecorator):
     return cls._create(devices_flat, devices.shape, axis_names,
                        axis_types, size)
 
-  # No __eq__ or __hash__: interned classes use object identity.
+  # 没有 __eq__ 或 __hash__：被驻留（intern）的类使用对象身份比较。
 
   @property
   def is_scalar(self):
@@ -453,22 +457,19 @@ def abstract_device_from(d) -> AbstractDevice | None:
 
 @immutable
 class AbstractMesh(BaseMesh):
-  """AbstractMesh contains only axis names and axis sizes.
+  """AbstractMesh 只包含轴名与轴大小。
 
-  It does not contain concrete devices compared to `jax.sharding.Mesh`. You
-  should use this as an input to the sharding passed to with_sharding_constraint
-  and mesh passed to shard_map to avoid tracing and lowering cache misses when
-  your mesh shape and axis names stay the same but the devices change.
-  See the description of https://github.com/jax-ml/jax/pull/23022 for more
-  details.
+  与 `jax.sharding.Mesh` 相比，它不包含具体设备。当网格形状与轴名保持不变、
+  但设备发生变化时，应把它用作 with_sharding_constraint 的 sharding 入参以及
+  shard_map 的 mesh 入参，以避免追踪与降级（lowering）的缓存未命中。
+  更多细节参见 https://github.com/jax-ml/jax/pull/23022 的描述。
 
   Args:
-    axis_sizes: A tuple of integers specifying the size of each resource axis.
-    axis_names: A tuple of resource axis names to be assigned to the
-      dimensions of the ``devices`` argument. Its length should match the
-      rank of ``devices``.
-    axis_types: and optional tuple of :class:`jax.sharding.AxisType` entries corresponding to
-      the ``axis_names``. See `Explicit Sharding`_ for more information.
+    axis_sizes: 一个整数元组，指定每个资源轴的大小。
+    axis_names: 要分配给 ``devices`` 参数各维度的资源轴名称元组。
+      其长度应与 ``devices`` 的秩（rank）一致。
+    axis_types: 与 ``axis_names`` 对应的 :class:`jax.sharding.AxisType` 条目组成的
+      可选元组。更多信息参见 `Explicit Sharding`_。
 
   .. _Explicit Sharding:  https://docs.jax.dev/en/latest/parallel.html
   """
@@ -494,7 +495,7 @@ class AbstractMesh(BaseMesh):
                                        AxisType.Explicit)
     return AbstractMesh._create(axis_sizes, axis_names, axis_types, abstract_device)
 
-  # No __eq__ or __hash__: interned classes use object identity.
+  # 没有 __eq__ 或 __hash__：被驻留（intern）的类使用对象身份比较。
 
   def __getnewargs_ex__(self):
     return ((self.axis_sizes, self.axis_names, self.axis_types),
@@ -573,8 +574,8 @@ class AbstractMesh(BaseMesh):
     _raise_value_error("__exit__")
 
 
-# Create this indirection because pytype fails to recognize a property if a
-# property raises an exception unconditionally. Remove this once that is fixed.
+# 之所以加这层间接调用，是因为如果某个 property 无条件抛异常，pytype 就无法把
+# 它识别为 property。等这个问题修好后即可移除。
 def _raise_value_error(name):
   raise ValueError(f"AbstractMesh does not implement {name}")
 
@@ -582,11 +583,11 @@ empty_abstract_mesh = AbstractMesh((), ())
 empty_concrete_mesh = Mesh(np.empty((), dtype=object), ())
 
 class use_abstract_mesh:
-  """Sets a abstract mesh in a thread-local context.
+  """在线程局部上下文中设置一个抽象网格。
 
-  ``jax.sharding.use_abstract_mesh`` can be used as a context manager.
+  ``jax.sharding.use_abstract_mesh`` 可以作为上下文管理器使用。
 
-  For example::
+  例如::
 
     abstract_device = jax.sharding.AbstractDevice(
         device_kind='TPU v6 lite', num_cores=1, platform='tpu')
@@ -598,14 +599,13 @@ class use_abstract_mesh:
       return x * 2
 
     with jax.sharding.use_abstract_mesh(abstract_mesh):
-      # Note: `f` will be traced and lowered for TPU platform.
+      # 注意：`f` 会针对 TPU 平台被追踪并降级。
       f.trace(inp).lower()
-      # Note: `f` will be traced for TPU and lowered for CPU.
+      # 注意：`f` 会针对 TPU 被追踪，但降级到 CPU。
       f.trace(inp).lower(lowering_platforms=('cpu',))
 
-  Note: In the example above, setting the abstract mesh at the top level only
-        takes effect if all mesh axes are Explicit. This is temporary until we
-        fix the underlying issues.
+  Note: 在上面的例子中，只有在所有网格轴都是 Explicit 时，在顶层设置抽象网格
+        才会生效。这属于临时限制，直到我们修复底层问题为止。
   """
   __slots__ = ['mesh', 'prev']
 

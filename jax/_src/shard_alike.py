@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：定义并注册 `shard_alike` 原语，强制两个 pytree 采用完全相同的分片方式。
+# 它按叶子成对地把 `x` 与 `y` 绑定到该原语上，并要求两棵树结构一致、对应叶子形状相同。
+# 同时为该原语实现转置（经 `ad.deflinear` 定义线性化规则）、批处理规则与 MLIR 降级规则。
+# 降级阶段借助 sharding group 约束这一对值：使用 Shardy 分片器时走 `sdy.sharding_group`，
+# 否则写入带 shard group 标识的 `OpSharding`，从而让编译器把它们放进同一分片组。
 
 from functools import partial
 import itertools
@@ -29,7 +34,7 @@ from jax._src.lib.mlir import dialects, ir
 _next_shard_group_id = itertools.count()
 
 def shard_alike(x, y):
-  """Shards x and y alike."""
+  """让 x 与 y 采用相同的分片方式。"""
   x_flat, x_tree = tree_flatten(x)
   y_flat, y_tree = tree_flatten(y)
 

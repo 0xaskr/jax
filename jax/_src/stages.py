@@ -11,22 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：定义 JAX 编译流程中各阶段的公开接口类型，以及让内部实现适配这些接口的工具。
+# 模块为编译流水线建模两个阶段：降级（lowering，产出编译器输入）与编译
+# （compilation，产出编译器输出），分别对应公开类型 `Lowered` 与 `Compiled`。
+# 内部的 `Lowering`/`Executable` 协议为上述公开类型提供支撑，并由下面的辅助类
+# 把 JAX 各种基于 XLA 的内部 lowering 与可执行文件适配到这些协议。
+# 这些类型由 `jax.jit`、`jax.pmap` 等面向用户的 API 返回，供用户检查已暂存、
+# 已降级、已编译的计算（文本表示、代价分析、内存分析、分片与布局信息）。
 """
-Interfaces to JAX's compilation steps, and utilities for conforming to them.
+与 JAX 各编译步骤交互的接口，以及用于适配这些接口的工具。
 
-This module defines a set of public-facing types that reflect the output of
-intermediate stages in the process of compilation. Currently there are two
-stages modeled: lowering (which produces compiler input), and compilation
-(which produces compiler output).
+本模块定义了一组面向公开的类型，它们反映编译过程中
+各中间阶段的输出。目前建模了两个阶段：降级（lowering，
+产出编译器输入）与编译（compilation，产出编译器输出）。
 
-It also defines some internal-facing types to guide what JAX can present in
-this common form: an internal ``Lowering`` suffices to back a public-facing
-``Lowered`` and an internal ``Executable`` suffices to back a public-facing
-``Compiled``.
+它还定义了一些面向内部的类型，用以指导 JAX 能以这种
+统一形式呈现什么：内部的 ``Lowering`` 足以支撑面向公开的
+``Lowered``，内部的 ``Executable`` 足以支撑面向公开的
+``Compiled``。
 
-Finally, this module defines a couple more classes to commonly adapt our
-various internal XLA-backed lowerings and executables into the lowering and
-executable protocols described above.
+最后，本模块还定义了几个类，用于把 JAX 内部各种基于 XLA 的
+lowering 与可执行文件方便地适配到上文所述的 lowering 与
+可执行协议。
 """
 from __future__ import annotations
 
@@ -67,7 +73,7 @@ zip, unsafe_zip = util.safe_zip, zip
 CompilerOptions = dict[str, str | bool]
 
 
-# -- Internal types
+# -- 内部类型
 
 
 class Executable:
@@ -78,27 +84,27 @@ class Executable:
         f"that {type(self)} defines an incomplete implementation.")
 
   def call(self, *args_flat) -> Sequence[Any]:
-    """Execute on the flat list of arguments, returning flat outputs."""
+    """在扁平参数列表上执行，返回扁平的输出。"""
     raise NotImplementedError("compiled executable does not support invocation")
 
   def create_cpp_call(self, params: CompiledCallParams) -> Any:
-    """Optionally constructs a fast c++ dispatcher."""
+    """可选地构造一个快速的 C++ 分派器。"""
     return None
 
   def input_shardings(self) -> Sequence[sharding_lib.Sharding]:
-    """Flat sequence of input shardings.
+    """扁平的输入分片序列。
 
-    May raise ``NotImplementedError`` if unavailable, e.g. based on backend,
-    compiler, or runtime.
+    在不可用时（例如取决于后端、
+    编译器或运行时）可能抛出 ``NotImplementedError``。
     """
     raise NotImplementedError(
         "compiled executable carries no input sharding information")
 
   def output_shardings(self) -> Sequence[sharding_lib.Sharding]:
-    """Flat sequence of output shardings.
+    """扁平的输出分片序列。
 
-    May raise ``NotImplementedError`` if unavailable, e.g. based on backend,
-    compiler, or runtime.
+    在不可用时（例如取决于后端、
+    编译器或运行时）可能抛出 ``NotImplementedError``。
     """
     raise NotImplementedError(
         "compiled executable carries no output sharding information")
@@ -112,13 +118,13 @@ class Executable:
         "compiled executable carries no output layout information")
 
   def as_text(self) -> str:
-    """A human-readable text representation of this executable.
+    """此可执行文件的、人类可读的文本表示。
 
-    Intended for visualization and debugging purposes. This need not be a valid
-    nor reliable serialization. It is relayed directly to external callers.
+    用于可视化和调试目的。它不必是有效或可靠的
+    序列化形式。它会被直接转交给外部调用者。
 
-    May raise ``NotImplementedError`` if unavailable, e.g. based on backend,
-    compiler, or runtime.
+    在不可用时（例如取决于后端、
+    编译器或运行时）可能抛出 ``NotImplementedError``。
     """
     xla_ext_exe = self.xla_extension_executable()
     err_msg = ("text view unsupported on current XLA backend: "
@@ -146,17 +152,17 @@ class Executable:
           raise
 
   def cost_analysis(self) -> Any:
-    """A summary of execution cost estimates.
+    """执行代价估计的摘要。
 
-    Intended for visualization and debugging purposes. The object output by
-    this is some simple data structure that can easily be printed or serialized
-    (e.g. nested dicts, lists, and tuples with numeric leaves). However, its
-    structure can be arbitrary: it need not be consistent across versions of JAX
-    and jaxlib, or even across invocations. It is relayed directly to external
-    callers.
+    用于可视化和调试目的。它输出的对象
+    是一些易于打印或序列化的简单数据结构
+    （例如以数值为叶子的嵌套 dict、list 和 tuple）。不过
+    其结构可以是任意的：它不必在 JAX 与 jaxlib 的
+    不同版本之间保持一致，甚至不必在多次调用之间保持一致。它会被
+    直接转交给外部调用者。
 
-    May raise ``NotImplementedError`` if unavailable, e.g. based on backend,
-    compiler, or runtime.
+    在不可用时（例如取决于后端、
+    编译器或运行时）可能抛出 ``NotImplementedError``。
     """
     xla_ext_exe = self.xla_extension_executable()
 
@@ -181,17 +187,17 @@ class Executable:
     )
 
   def memory_analysis(self) -> Any:
-    """A summary of estimated memory requirements.
+    """估计内存需求的摘要。
 
-    Intended for visualization and debugging purposes. The object output by
-    this is some simple data structure that can easily be printed or serialized
-    (e.g. nested dicts, lists, and tuples with numeric leaves). However, its
-    structure can be arbitrary: it need not be consistent across versions of JAX
-    and jaxlib, or even across invocations. It is relayed directly to external
-    callers.
+    用于可视化和调试目的。它输出的对象
+    是一些易于打印或序列化的简单数据结构
+    （例如以数值为叶子的嵌套 dict、list 和 tuple）。不过
+    其结构可以是任意的：它不必在 JAX 与 jaxlib 的
+    不同版本之间保持一致，甚至不必在多次调用之间保持一致。它会被
+    直接转交给外部调用者。
 
-    May raise ``NotImplementedError`` if unavailable, e.g. based on backend,
-    compiler, or runtime.
+    在不可用时（例如取决于后端、
+    编译器或运行时）可能抛出 ``NotImplementedError``。
     """
     xla_ext_exe = self.xla_extension_executable()
     err_msg = ("memory analysis unsupported on current XLA backend: "
@@ -208,14 +214,14 @@ class Executable:
         raise
 
   def runtime_executable(self) -> Any:
-    """An arbitrary object representation of this executable.
+    """此可执行文件的任意对象表示。
 
-    Intended for debugging purposes. This need not be a valid nor reliable
-    serialization. It is relayed directly to external callers, with no
-    guarantee on type, structure, or consistency across invocations.
+    用于调试目的。它不必是有效或可靠的
+    序列化形式。它会被直接转交给外部调用者，对其类型、
+    结构或多次调用之间的一致性不作任何保证。
 
-    May raise ``NotImplementedError`` if unavailable, e.g. based on backend or
-    compiler.
+    在不可用时（例如取决于后端或
+    编译器）可能抛出 ``NotImplementedError``。
     """
     return self.xla_extension_executable()
 
@@ -223,13 +229,13 @@ class Executable:
 class Lowering:
 
   compile_args: dict[str, Any]
-  # the constants that have been hoisted out and must be passed as first args,
-  # after the tokens.
-  # See https://docs.jax.dev/en/latest/internals/constants.html.
+  # 已被提到外层的常量，必须作为最前面的参数传入，
+  # 位于 tokens 之后。
+  # 参见 https://docs.jax.dev/en/latest/internals/constants.html。
   const_args: list[ArrayLike]
 
   def hlo(self) -> xc.XlaComputation:
-    """Return an HLO representation of this computation."""
+    """返回此计算的 HLO 表示。"""
     hlo = self.stablehlo()
     m: str | bytes
     m = mlir.module_to_bytecode(hlo)
@@ -237,24 +243,24 @@ class Lowering:
         m, use_tuple_args=self.compile_args["tuple_args"])
 
   def stablehlo(self) -> ir.Module:
-    """Return a StableHLO representation of this computation."""
+    """返回此计算的 StableHLO 表示。"""
     raise NotImplementedError(
         f"cost analysis unsupported on XLA computation: {type(self)}")
 
   def compile(
       self, compiler_options: CompilerOptions | None = None, *,
       device_assignment: tuple[xc.Device, ...] | None = None) -> Executable:
-    """Compile and return a corresponding ``Executable``."""
+    """编译并返回对应的 ``Executable``。"""
     raise NotImplementedError(
         f"cost analysis unsupported on XLA computation: {type(self)}")
 
   def as_text(self, dialect: str | None = None,
               *,
               debug_info: bool = False) -> str:
-    """A human-readable text representation of this lowering.
+    """此 lowering 的人类可读文本表示。
 
-    Intended for visualization and debugging purposes. This need not be a valid
-    nor reliable serialization. It is relayed directly to external callers.
+    用于可视化和调试目的。它不必是有效或可靠的序列化形式。
+    它会被直接转交给外部调用者。
     """
     if dialect is None:
       dialect = "stablehlo"
@@ -269,18 +275,18 @@ class Lowering:
       raise ValueError(f"unknown dialect: {dialect}")
 
   def compiler_ir(self, dialect: str | None = None) -> Any:
-    """An arbitrary object representation of this lowering.
+    """此 lowering 的任意对象表示。
 
-    Intended for debugging purposes. This need not be a valid nor reliable
-    serialization. It is relayed directly to external callers, with no
-    guarantee on type, structure, or consistency across invocations.
+    用于调试目的。它不必是有效或可靠的序列化形式。
+    它会被直接转交给外部调用者，对其类型、
+    结构或多次调用之间的一致性不作任何保证。
 
-    May raise ``NotImplementedError`` if unavailable, e.g. based on backend or
-    compiler.
+    在不可用时（例如取决于后端或
+    编译器）可能抛出 ``NotImplementedError``。
 
     Args:
-      dialect: Optional string specifying a representation dialect
-      (e.g. "stablehlo")
+      dialect: 可选字符串，指定表示所用的方言
+      （例如 "stablehlo"）
     """
     if dialect is None:
       dialect = "stablehlo"
@@ -292,28 +298,28 @@ class Lowering:
       raise ValueError(f"unknown dialect: {dialect}")
 
   def cost_analysis(self) -> Any:
-    """A summary of execution cost estimates.
+    """执行代价估计的摘要。
 
-    Intended for visualization and debugging purposes. The object output by
-    this is some simple data structure that can easily be printed or serialized
-    (e.g. nested dicts, lists, and tuples with numeric leaves). However, its
-    structure can be arbitrary: it need not be consistent across versions of JAX
-    and jaxlib, or even across invocations. It is relayed directly to external
-    callers.
+    用于可视化和调试目的。它输出的对象
+    是一些易于打印或序列化的简单数据结构
+    （例如以数值为叶子的嵌套 dict、list 和 tuple）。不过
+    其结构可以是任意的：它不必在 JAX 与 jaxlib 的
+    不同版本之间保持一致，甚至不必在多次调用之间保持一致。它会被
+    直接转交给外部调用者。
 
-    This function estimates execution cost in the absence of compiler
-    optimizations, which may drastically affect the cost. For execution cost
-    estimates after optimizations, compile this lowering and see
-    ``Compiled.cost_analysis``.
+    此函数估计的是在没有编译器优化时的执行代价，
+    优化可能大幅改变代价。若需要优化之后的执行代价
+    估计，请编译此 lowering 并参见
+    ``Compiled.cost_analysis``。
 
-    May raise ``NotImplementedError`` if unavailable, e.g. based on backend,
-    compiler, or runtime.
+    在不可用时（例如取决于后端、
+    编译器或运行时）可能抛出 ``NotImplementedError``。
     """
     raise NotImplementedError(
         f"cost analysis unsupported on XLA computation: {type(self)}")
 
 
-# -- Public-facing API, plus helpers
+# -- 面向公开的 API，以及辅助函数
 
 @dataclass(frozen=True, slots=True)
 class ArgInfo:
@@ -334,21 +340,21 @@ class ArgInfo:
 
 
 class Stage:
-  args_info: Any  # PyTree of ArgInfo
+  args_info: Any  # ArgInfo 的 PyTree
 
   @property
   def in_tree(self) -> tree_util.PyTreeDef:
-    """Tree structure of the pair (positional arguments, keyword arguments)."""
+    """由（位置参数, 关键字参数）组成的对的树结构。"""
     return tree_util.tracing_registry.flatten(self.args_info)[1]
 
   @property
   def in_avals(self):
-    """Tree of input avals."""
+    """输入 aval 的树。"""
     return tree_util.tree_map(lambda x: x._aval, self.args_info)
 
   @property
   def donate_argnums(self):
-    """Flat tuple of donated argument indices."""
+    """被捐赠参数索引组成的扁平元组。"""
     return tuple(
         i for i, x in enumerate(tree_util.tree_leaves(self.args_info))
         if x.donated)
@@ -356,7 +362,7 @@ class Stage:
 
 def make_args_info(in_tree, in_avals, donate_argnums):
   donate_argnums = frozenset(donate_argnums)
-  flat_avals, _ = tree_util.tree_flatten(in_avals)  # todo: remove
+  flat_avals, _ = tree_util.tree_flatten(in_avals)  # todo: 待移除
   return in_tree.unflatten([
       ArgInfo(aval, i in donate_argnums)
       for i, aval in enumerate(flat_avals)])
@@ -365,8 +371,8 @@ def make_args_info(in_tree, in_avals, donate_argnums):
 class CompiledCallParams(NamedTuple):
   executable: Executable
   no_kwargs: bool
-  in_tree: tree_util.PyTreeDef  # lo tree
-  out_tree: tree_util.PyTreeDef  # lo tree
+  in_tree: tree_util.PyTreeDef  # lo tree（低层树）
+  out_tree: tree_util.PyTreeDef  # lo tree（低层树）
   const_args: list[ArrayLike]  # https://docs.jax.dev/en/latest/internals/constants.html
   in_types: tuple[tree_util.PyTreeDef, list[core.AbstractValue]] | None
   out_types: tuple[tree_util.PyTreeDef, list[core.AbstractValue]] | None
@@ -404,14 +410,14 @@ def _traced_out_info(self):
 
 
 class Traced(Stage):
-  """Traced form of a function specialized to argument types and values.
+  """针对参数类型和值特化后的函数的已追踪形式。
 
-  A traced computation is ready for lowering. This class carries the
-  traced representation with the remaining information needed to later
-  lower, compile, and execute it.
+  已追踪的计算即可进行降级（lowering）。此类携带
+  追踪后的表示，以及后续对其进行降级、编译和执行
+  所需的其余信息。
 
-  Provides access to both the hijax (high-level) and lojax (low-level)
-  representations via `.jaxpr` and `.lojax` properties respectively.
+  分别通过 `.jaxpr` 与 `.lojax` 属性提供对
+  hijax（高层）和 lojax（低层）表示的访问。
   """
   __slots__ = ['_meta_tys_flat', '_params', '_in_tree', 'out_tree', '_consts',
                '_fun_sourceinfo', '_lojax', '_closure_converted']
@@ -443,16 +449,16 @@ class Traced(Stage):
     return tree_unflatten(self.out_tree, out_flat)
 
   def closure_convert(self):
-    """Closure conversion: makes this Traced's captured constants explicit.
+    """闭包转换：把此 Traced 捕获的常量显式化。
 
-    Returns a pair ``(consts, fun)``, where ``consts`` are the values this
-    Traced captured from its function's closure during tracing (not Python
-    ``__closure__`` cells: any values encountered during tracing that
-    determine the output), and ``fun`` is a closed function such that
-    ``fun(consts, *args, **kwargs)`` computes the same results as this Traced
-    applied to ``args`` and ``kwargs``. The environment ``consts`` is passed
-    as a single leading argument, and may be replaced by any pytree of values
-    of the same types.
+    返回一对 ``(consts, fun)``，其中 ``consts`` 是此 Traced
+    在追踪期间从其函数闭包中捕获的值（不是 Python 的
+    ``__closure__`` 单元：而是追踪期间遇到的、任何
+    决定输出的值），而 ``fun`` 是一个封闭函数，满足
+    ``fun(consts, *args, **kwargs)`` 的计算结果与此 Traced
+    作用于 ``args`` 和 ``kwargs`` 时相同。环境 ``consts`` 作为
+    单个前导参数传入，并且可以替换为具有相同类型的
+    值组成的任意 pytree。
     """
     if self._closure_converted is None:
       consts = [*self.jaxpr.consts, *self._consts]
@@ -469,13 +475,13 @@ class Traced(Stage):
     return self._closure_converted
 
   def with_consts_as_arg(self) -> tuple[list[Any], Traced]:
-    """Returns consts and an equivalent Traced taking them as one leading argument.
+    """返回 consts 以及一个把它们作为单个前导参数的等价 Traced。
 
-    Built on ``closure_convert``: the converted function is re-traced with the
-    consts environment as a single leading argument, so that the tracing
-    machinery reconstructs all per-argument bookkeeping consistently. The
-    non-const argument types are taken from this Traced. The retrace stages a
-    single call eqn, not a re-trace of the original function.
+    基于 ``closure_convert`` 构建：转换后的函数会以
+    consts 环境作为单个前导参数被重新追踪，从而让追踪
+    机制一致地重建所有按参数维护的记账信息。非 const
+    参数类型取自此 Traced。重新追踪只会暂存
+    单个 call 方程，而不会重新追踪原函数。
     """
     from jax._src.api import jit  # type: ignore
     consts, fun = self.closure_convert()
@@ -505,7 +511,7 @@ class Traced(Stage):
           self._consts, self._fun_sourceinfo)
       return self._lojax
 
-    # TODO(mattjj): when pmap is deleted, merge with pjit.py BUILD rule
+    # TODO(mattjj): 当 pmap 被删除后，与 pjit.py 的 BUILD 规则合并
     from jax._src.pjit import _lojax_expand_params  # pyrefly: ignore[missing-import]
     hi_jaxpr = self.jaxpr
     in_avals = ft.flatten(([a.lo_ty() for a in hi_jaxpr.in_avals], {}))
@@ -531,7 +537,7 @@ class Traced(Stage):
 
   def lower(self, *, lowering_platforms: tuple[str, ...] | None = None,
             _private_parameters: mlir.LoweringParameters | None = None):
-    """Lower to compiler input, returning a ``Lowered`` instance."""
+    """降级为编译器输入，返回 ``Lowered`` 实例。"""
     from jax._src.pjit import _resolve_and_lower  # pyrefly: ignore[missing-import]
     lo = self.lojax
     if _private_parameters is None:
@@ -571,7 +577,7 @@ class LoJax:
     self.out_tree = out_tree
     self._consts = consts
     self._fun_sourceinfo = fun_sourceinfo
-    self._in_types = in_types  # hi types
+    self._in_types = in_types  # hi types（高层类型）
     self._out_types = out_types
 
   jaxpr = property(lambda self: self._params['jaxpr'])
@@ -582,19 +588,19 @@ class LoJax:
 
 
 class Lowered(Stage):
-  """Lowering of a function specialized to argument types and values.
+  """针对参数类型和值特化后的函数的降级结果。
 
-  A lowering is a computation ready for compilation. This class
-  carries a lowering together with the remaining information needed to
-  later compile and execute it. It also provides a common API for
-  querying properties of lowered computations across JAX's various
-  lowering paths (:func:`~jax.jit`, :func:`~jax.pmap`, etc.).
+  一个 lowering 就是一份可编译的计算。此类
+  携带一个 lowering，以及后续编译和执行它
+  所需的其余信息。它还提供统一的 API，
+  用于在 JAX 各种降级路径（:func:`~jax.jit`、:func:`~jax.pmap` 等）
+  上查询已降级计算的属性。
   """
   __slots__ = ["_lowering", "args_info", "out_tree", "_no_kwargs",
                "_in_types", "_out_types"]
 
   _lowering: Lowering
-  args_info: Any  # PyTree of ArgInfo, not including the const_args
+  args_info: Any  # ArgInfo 的 PyTree，不包含 const_args
   out_tree: tree_util.PyTreeDef
   _no_kwargs: bool
   _in_types: tuple[tree_util.PyTreeDef, list[core.AbstractValue]] | None
@@ -624,7 +630,7 @@ class Lowered(Stage):
     return self.in_tree.unflatten(in_avals_)
 
   @property
-  def out_info(self):  # PyTree of OutInfo
+  def out_info(self):  # OutInfo 的 PyTree
     out_avals = self._lowering.compile_args["global_out_avals"]
     out_shardings = self._lowering.compile_args["out_shardings"]
     out_layouts = self._lowering.compile_args["out_layouts"]
@@ -639,7 +645,7 @@ class Lowered(Stage):
   def compile(
       self, compiler_options: CompilerOptions | None = None, *,
       device_assignment: tuple[xc.Device, ...] | None = None) -> Compiled:
-    """Compile, returning a corresponding ``Compiled`` instance."""
+    """编译，返回对应的 ``Compiled`` 实例。"""
     kw: dict[str, Any] = {"compiler_options": compiler_options,
                           "device_assignment": device_assignment}
     return Compiled(self._lowering.compile(**kw), self._lowering.const_args,
@@ -648,34 +654,34 @@ class Lowered(Stage):
 
   def as_text(self, dialect: str | None = None, *,
               debug_info: bool = False) -> str:
-    """A human-readable text representation of this lowering.
+    """此 lowering 的人类可读文本表示。
 
-    Intended for visualization and debugging purposes. This need not be a valid
-    nor reliable serialization.
-    Use `jax.export` if you want reliable and portable serialization.
+    用于可视化和调试目的。它不必是有效或可靠的
+    序列化形式。
+    若需要可靠且可移植的序列化，请使用 `jax.export`。
 
     Args:
-      dialect: Optional string specifying a lowering dialect (e.g. "stablehlo",
-        or "hlo").
-      debug_info: Whether to include debugging information,
-        e.g., source location.
+      dialect: 可选字符串，指定降级方言（例如 "stablehlo"
+        或 "hlo"）。
+      debug_info: 是否包含调试信息，
+        例如源码位置。
     """
     return self._lowering.as_text(dialect, debug_info=debug_info)
 
   def compiler_ir(self, dialect: str | None = None) -> Any | None:
-    """An arbitrary object representation of this lowering.
+    """此 lowering 的任意对象表示。
 
-    Intended for debugging purposes. This is not a valid nor reliable
-    serialization. The output has no guarantee of consistency across
-    invocations.
-    Use `jax.export` if you want reliable and portable serialization.
+    用于调试目的。它不是有效或可靠的
+    序列化形式。其输出不保证在多次调用之间
+    保持一致。
+    若需要可靠且可移植的序列化，请使用 `jax.export`。
 
-    Returns ``None`` if unavailable, e.g. based on backend, compiler, or
-    runtime.
+    在不可用时返回 ``None``，例如取决于后端、编译器或
+    运行时。
 
     Args:
-      dialect: Optional string specifying a lowering dialect (e.g. "stablehlo",
-        or "hlo").
+      dialect: 可选字符串，指定降级方言（例如 "stablehlo"
+        或 "hlo"）。
     """
     try:
       return self._lowering.compiler_ir(dialect)
@@ -683,18 +689,18 @@ class Lowered(Stage):
       return None
 
   def cost_analysis(self) -> Any | None:
-    """A summary of execution cost estimates.
+    """执行代价估计的摘要。
 
-    Intended for visualization and debugging purposes. The object output by
-    this is some simple data structure that can easily be printed or serialized
-    (e.g. nested dicts, lists, and tuples with numeric leaves). However, its
-    structure can be arbitrary: it may be inconsistent across versions of JAX
-    and jaxlib, or even across invocations.
+    用于可视化和调试目的。它输出的对象
+    是一些易于打印或序列化的简单数据结构
+    （例如以数值为叶子的嵌套 dict、list 和 tuple）。不过
+    其结构可以是任意的：它可能在 JAX 与 jaxlib 的
+    不同版本之间不一致，甚至可能在多次调用之间不一致。
 
-    Returns ``None`` if unavailable, e.g. based on backend, compiler, or
-    runtime.
+    在不可用时返回 ``None``，例如取决于后端、编译器或
+    运行时。
     """
-    # TODO(frostig): improve annotation (basic pytree of arbitrary structure)
+    # TODO(frostig): 改进类型注解（任意结构的基础 pytree）
     try:
       return self._lowering.cost_analysis()
     except NotImplementedError:
@@ -702,16 +708,16 @@ class Lowered(Stage):
 
 
 class Compiled(Stage):
-  """Compiled representation of a function specialized to types/values.
+  """针对类型/值特化后的函数的已编译表示。
 
-  A compiled computation is associated with an executable and the
-  remaining information needed to execute it. It also provides a
-  common API for querying properties of compiled computations across
-  JAX's various compilation paths and backends.
+  已编译的计算关联着一个可执行文件，以及执行它
+  所需的其余信息。它还提供统一的 API，
+  用于在 JAX 各种编译路径和后端上查询
+  已编译计算的属性。
   """
   __slots__ = ["args_info", "out_tree", "_executable", "_no_kwargs", "_params"]
 
-  # PyTree of ArgInfo, including dead args, but not const_args
+  # ArgInfo 的 PyTree，包含死参数，但不包含 const_args
   args_info: Any
   out_tree: tree_util.PyTreeDef
   _executable: Executable
@@ -730,13 +736,13 @@ class Compiled(Stage):
     self._call = None
 
   def as_text(self) -> str | None:
-    """A human-readable text representation of this executable.
+    """此可执行文件的人类可读文本表示。
 
-    Intended for visualization and debugging purposes. This is not a valid nor
-    reliable serialization.
+    用于可视化和调试目的。它不是有效或可靠的
+    序列化形式。
 
-    Returns ``None`` if unavailable, e.g. based on backend, compiler, or
-    runtime.
+    在不可用时返回 ``None``，例如取决于后端、编译器或
+    运行时。
     """
     try:
       return self._executable.as_text()
@@ -744,36 +750,36 @@ class Compiled(Stage):
       return None
 
   def cost_analysis(self) -> Any | None:
-    """A summary of execution cost estimates.
+    """执行代价估计的摘要。
 
-    Intended for visualization and debugging purposes. The object output by
-    this is some simple data structure that can easily be printed or serialized
-    (e.g. nested dicts, lists, and tuples with numeric leaves). However, its
-    structure can be arbitrary: it may be inconsistent across versions of JAX
-    and jaxlib, or even across invocations.
+    用于可视化和调试目的。它输出的对象
+    是一些易于打印或序列化的简单数据结构
+    （例如以数值为叶子的嵌套 dict、list 和 tuple）。不过
+    其结构可以是任意的：它可能在 JAX 与 jaxlib 的
+    不同版本之间不一致，甚至可能在多次调用之间不一致。
 
-    Returns ``None`` if unavailable, e.g. based on backend, compiler, or
-    runtime.
+    在不可用时返回 ``None``，例如取决于后端、编译器或
+    运行时。
     """
-    # TODO(frostig): improve annotation (basic pytree of arbitrary structure)
+    # TODO(frostig): 改进类型注解（任意结构的基础 pytree）
     try:
       return self._executable.cost_analysis()
     except NotImplementedError:
       return None
 
   def memory_analysis(self) -> Any | None:
-    """A summary of estimated memory requirements.
+    """估计内存需求的摘要。
 
-    Intended for visualization and debugging purposes. The object output by
-    this is some simple data structure that can easily be printed or serialized
-    (e.g. nested dicts, lists, and tuples with numeric leaves). However, its
-    structure can be arbitrary: it may be inconsistent across versions of JAX
-    and jaxlib, or even across invocations.
+    用于可视化和调试目的。它输出的对象
+    是一些易于打印或序列化的简单数据结构
+    （例如以数值为叶子的嵌套 dict、list 和 tuple）。不过
+    其结构可以是任意的：它可能在 JAX 与 jaxlib 的
+    不同版本之间不一致，甚至可能在多次调用之间不一致。
 
-    Returns ``None`` if unavailable, e.g. based on backend, compiler, or
-    runtime.
+    在不可用时返回 ``None``，例如取决于后端、编译器或
+    运行时。
     """
-    # TODO(frostig): improve annotation (basic pytree of arbitrary structure)
+    # TODO(frostig): 改进类型注解（任意结构的基础 pytree）
     try:
       return self._executable.memory_analysis()
     except NotImplementedError:
@@ -781,7 +787,7 @@ class Compiled(Stage):
 
   @property
   def in_avals(self):
-    # Including dead args, but not const_args
+    # 包含死参数，但不包含 const_args
     nr_const_args = len(self._params.const_args)
     in_avals_ = self._executable.in_avals[nr_const_args:]  # pyrefly: ignore[missing-attribute]
     if self.in_tree.num_leaves > len(in_avals_):
@@ -793,7 +799,7 @@ class Compiled(Stage):
     return self.in_tree.unflatten(in_avals_)
 
   @property
-  def out_info(self):  # PyTree of jax.ShapeDtypeStruct
+  def out_info(self):  # jax.ShapeDtypeStruct 的 PyTree
     out_avals = self._executable.out_avals  # pyrefly: ignore[missing-attribute]
     out_formats_flat = self._output_formats_flat
     return self.out_tree.unflatten(
@@ -801,21 +807,21 @@ class Compiled(Stage):
          for o, f in zip(out_avals, out_formats_flat)])
 
   def runtime_executable(self) -> Any | None:
-    """An arbitrary object representation of this executable.
+    """此可执行文件的任意对象表示。
 
-    Intended for debugging purposes. This is not valid nor reliable
-    serialization. The output has no guarantee of consistency across
-    invocations.
+    用于调试目的。它不是有效或可靠的
+    序列化形式。其输出不保证在多次调用之间
+    保持一致。
 
-    Returns ``None`` if unavailable, e.g. based on backend, compiler, or
-    runtime.
+    在不可用时返回 ``None``，例如取决于后端、编译器或
+    运行时。
     """
     return self._executable.runtime_executable()
 
   def _input_shardings_flat(self):
     nr_const_args = len(self._params.const_args)
     shardings_flat = self._executable._in_shardings[nr_const_args:]  # pyrefly: ignore[missing-attribute]
-    # Some input shardings got DCE'd
+    # 一些输入分片被 DCE（死代码消除）掉了
     if self.in_tree.num_leaves > len(shardings_flat):
       iter_shardings_flat = iter(shardings_flat)
       shardings_flat = [next(iter_shardings_flat) if i + nr_const_args in self._executable._kept_var_idx  # pyrefly: ignore[missing-attribute]
@@ -824,7 +830,7 @@ class Compiled(Stage):
 
   @property
   def input_shardings(self):  # -> PyTree[sharding.Sharding]
-    # Including dead args, but not const_args
+    # 包含死参数，但不包含 const_args
     shardings_flat = self._input_shardings_flat()
     return tree_util.tree_unflatten(self.in_tree, shardings_flat)
 
@@ -836,7 +842,7 @@ class Compiled(Stage):
   def _input_layouts_flat(self):
     nr_const_args = len(self._params.const_args)
     layouts_flat = self._executable._xla_in_layouts[nr_const_args:]  # pyrefly: ignore[missing-attribute]
-    # Some input layouts got DCE'd
+    # 一些输入布局被 DCE 掉了
     if self.in_tree.num_leaves > len(layouts_flat):
       iter_layouts_flat = iter(layouts_flat)
       layouts_flat = [next(iter_layouts_flat) if i + nr_const_args in self._executable._kept_var_idx  # pyrefly: ignore[missing-attribute]
@@ -845,7 +851,7 @@ class Compiled(Stage):
 
   @property
   def input_formats(self):
-    # Including dead args, but not const_args
+    # 包含死参数，但不包含 const_args
     layouts_flat = self._input_layouts_flat()
     shardings_flat = self._input_shardings_flat()
     formats_flat = [Format(l, s) for l, s in zip(layouts_flat, shardings_flat)]
@@ -866,12 +872,12 @@ class Compiled(Stage):
   @staticmethod
   def call(*args, **kwargs):
     util.test_event("stages_compiled_call")
-    # This is because `__call__` passes in `self._params` as the first argument.
-    # Instead of making the call signature `call(params, *args, **kwargs)`
-    # extract it from args because `params` can be passed as a kwarg by users
-    # which might conflict here.
+    # 这是因为 `__call__` 会把 `self._params` 作为第一个参数传入。
+    # 这里没有把调用签名写成 `call(params, *args, **kwargs)`，
+    # 而是从 args 中把它提取出来，因为用户可能以关键字参数的形式传入
+    # `params`，那样会与此处冲突。
     params = args[0]
-    args = args[1:]  # Not including const_args
+    args = args[1:]  # 不包含 const_args
     if params.no_kwargs and kwargs:
       kws = ', '.join(kwargs.keys())
       raise NotImplementedError(
@@ -886,7 +892,7 @@ class Compiled(Stage):
     else:
       args_flat, in_tree = tree_util.tracing_registry.flatten((args, kwargs))
 
-    # TODO(mattjj): improve wrong-number-of-args error
+    # TODO(mattjj): 改进参数个数错误的报错
     if in_tree != params.in_tree:
       errs = list(tree_util.equality_errors_pytreedef(in_tree, params.in_tree))
       msg = []
@@ -902,10 +908,10 @@ class Compiled(Stage):
       raise TypeError('\n'.join(msg))
 
     if not core.trace_state_clean():
-      # We check for tracers when we are under a transformation, and skip the
-      # check in the common path. We can't transform ahead-of-time compiled
-      # calls, since we've lowered and compiled for a fixed function signature,
-      # and JAX transformations change signatures.
+      # 只有在处于某个变换之下时我们才检查追踪器，在常见路径上
+      # 跳过该检查。我们无法变换提前（ahead-of-time）编译的
+      # 调用，因为我们是针对固定的函数签名做降级和编译的，
+      # 而 JAX 的变换会改变签名。
       for arg in args_flat:
         if isinstance(arg, core.Tracer):
           raise TypeError(
@@ -935,7 +941,7 @@ class Compiled(Stage):
         self._call = cpp_call_fallback
     return self._call(*args, **kwargs)
 
-# TODO(mattjj): de-dup with partial_eval.py
+# TODO(mattjj): 与 partial_eval.py 去重
 def raise_lo_outs(hi_avals, lo_outs):
   lo_outs_ = iter(lo_outs)
   hi_outs = [t.raise_val(*it.islice(lo_outs_, len(t.lo_ty()))) for t in hi_avals]
@@ -944,40 +950,40 @@ def raise_lo_outs(hi_avals, lo_outs):
 
 @runtime_checkable
 class Wrapped(Protocol):
-  """A function ready to be traced, lowered, and compiled.
+  """一个已准备好被追踪、降级和编译的函数。
 
-  This protocol reflects the output of functions such as
-  ``jax.jit``. Calling it results in JIT (just-in-time) lowering,
-  compilation, and execution. It can also be explicitly lowered prior
-  to compilation, and the result compiled prior to execution.
+  此协议反映 `jax.jit` 等函数的返回值。
+  调用它会进行 JIT（即时）降级、
+  编译和执行。它也可以在编译之前显式降级，
+  并在执行之前编译其结果。
   """
 
   def __call__(self, *args, **kwargs):
-    """Executes the wrapped function, lowering and compiling as needed."""
+    """执行被包装的函数，按需进行降级和编译。"""
     raise NotImplementedError
 
   def trace(self, *args, **kwargs) -> Traced:
-    """Trace this function explicitly for the given arguments.
+    """针对给定参数显式追踪此函数。
 
-    A traced function is staged out of Python and translated to a jaxpr. It is
-    ready for lowering but not yet lowered.
+    被追踪的函数会从 Python 中暂存出来并翻译成 jaxpr。它
+    已准备好降级，但尚未降级。
 
     Returns:
-      A ``Traced`` instance representing the tracing.
+      表示本次追踪的 ``Traced`` 实例。
     """
     raise NotImplementedError
 
   def lower(self, *args, **kwargs) -> Lowered:
-    """Lower this function explicitly for the given arguments.
+    """针对给定参数显式降级此函数。
 
-    This is a shortcut for ``self.trace(*args, **kwargs).lower()``.
+    这是 ``self.trace(*args, **kwargs).lower()`` 的快捷方式。
 
-    A lowered function is staged out of Python and translated to a
-    compiler's input language, possibly in a backend-dependent
-    manner. It is ready for compilation but not yet compiled.
+    被降级的函数会从 Python 中暂存出来，并翻译为
+    编译器的输入语言，这一过程可能依赖于具体后端。
+    它已准备好编译，但尚未编译。
 
     Returns:
-      A ``Lowered`` instance representing the lowering.
+      表示本次降级的 ``Lowered`` 实例。
     """
     raise NotImplementedError
 
@@ -1082,7 +1088,7 @@ def _device_assignment_mismatch_error(fun_name, fails, args_flat, api_name,
     extra_msg = f" Got {first} and {second}"
   elif len(mismatched_args_msg) == 1:
     first, second = fails
-    # Choose the failure left which is not already covered by ARG_SHARDING.
+    # 选择尚未被 ARG_SHARDING 覆盖的那一侧失败。
     left = second if first.m_type == MismatchType.ARG_SHARDING else first
     extra_msg = f" Got {mismatched_args_msg[0]} and{left._str(api_name)}"
   else:

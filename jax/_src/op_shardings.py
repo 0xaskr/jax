@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sharding utilities"""
+# 文件职责：把 XLA 的 `HloSharding` / `OpSharding` 描述转换成主机侧可用的分片索引。
+# 供 JAX 中需要查询分片方式的代码使用，例如判断分片是否等价、是否只是复制。
+# 核心逻辑会解析 tile assignment 的维度与子分组类型（复制、非规约），得出每个维度
+# 的分片数；再据此求出每台设备对应的多维切片索引，供上层按设备重建数组分片。
+"""分片工具"""
 
 from __future__ import annotations
 
@@ -70,9 +74,9 @@ def op_sharding_to_numpy_indices(
     num_devices: int) -> np.ndarray:
   indices = np.empty(num_devices, dtype=np.object_)
 
-  # num_devices is required as an argument when hlo_sharding is
-  # REPLICATED. `jax.device_count()` cannot be used because you can create
-  # an opsharding with less number of devices than `jax.device_count()`.
+  # 当 hlo_sharding 为 REPLICATED 时，必须把 num_devices 作为参数传入。
+  # 不能使用 `jax.device_count()`，因为可以创建出设备数少于
+  # `jax.device_count()` 的 opsharding。
   if is_hlo_sharding_replicated(hlo_sharding):
     indices.fill((slice(None),) * len(shape))
     return indices

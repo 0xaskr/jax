@@ -12,8 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现遵循 TC39 source map 规范的源码映射（sourcemap）读写。
+# 供 JAX 在生成代码时记录生成代码与原始源码的位置对应，
+# 让报错与调试信息能映射回用户写的原始源码。
+# 提供 SourceMap 数据类（JSON 序列化/反序列化）、Base-64-VLQ 与
+# segment 编解码，以及 TC39 mappings 字符串的解析与生成。
+# MappingsGenerator 以绝对索引为输入，负责转成 TC39 的相对增量形式。
+
 """
-An implementation of sourcemaps following `TC39 <https://tc39.es/source-map>`_.
+遵循 `TC39 <https://tc39.es/source-map>`_ 的 sourcemap 实现。
 """
 
 from __future__ import annotations
@@ -22,14 +29,14 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 import json
 
-# A Segment encodes how parts in the generated source relate to the original source.
-# Each segment is made up of 1, 4 or 5 variable-length fields. For their semantics see
+# 一个 Segment 编码生成源码中的各部分与原始源码之间的对应关系。
+# 每个 segment 由 1、4 或 5 个变长字段组成，其语义见
 # https://tc39.es/source-map/#mappings-structure
 Segment = (
     tuple[int] | tuple[int, int, int, int] | tuple[int, int, int, int, int]
 )
 
-# Mappings are sequences of segments for each line in the generated source.
+# Mappings 是生成源码中每一行的 segment 序列。
 Mappings = Sequence[Sequence[Segment]]
 
 
@@ -45,7 +52,7 @@ class SourceMap:
 
   @classmethod
   def from_json(cls, json_data: str) -> SourceMap:
-    """Deserialize a source map from JSON."""
+    """从 JSON 反序列化出一个 source map。"""
     data = json.loads(json_data)
     return cls(
         version=data["version"],
@@ -56,7 +63,7 @@ class SourceMap:
     )
 
   def to_json(self) -> str:
-    """Serialize a source map to JSON."""
+    """把 source map 序列化为 JSON。"""
     data = {
         "version": self.version,
         "sources": self.sources,
@@ -88,12 +95,12 @@ VLQ_DECODE_TABLE = make_vlq_decode_table()
 
 
 def decode_vlq(enc: Iterable[int]) -> int:
-  """Decode a Base-64-VLQ into an integer."""
+  """把 Base-64-VLQ 解码为整数。"""
   enc_iter = iter(enc)
   d = VLQ_DECODE_TABLE[next(enc_iter)]
   sign = bool(d & VLQ_SIGN_MASK)
   value = (d & VLQ_VALUE_MASK) >> 1
-  # Compensate for first quantum containing sign as LSB:
+  # 补偿第一个量元把符号位放在最低位的情况：
   shift = -1
 
   while d & VLQ_MORE_MASK:
@@ -105,8 +112,8 @@ def decode_vlq(enc: Iterable[int]) -> int:
 
 
 def encode_vlq(value: int) -> bytes:
-  """Encode an integer into a Base-64-VLQ."""
-  # Move sign to LSB
+  """把整数编码为 Base-64-VLQ。"""
+  # 把符号位移到最低位
   value = ((-value) << 1 | 1) if value < 0 else value << 1
   buf = []
 
@@ -123,32 +130,32 @@ def encode_vlq(value: int) -> bytes:
 
 
 def decode_segment(enc: Iterable[int]) -> Segment:
-  """Decode a sequence of VLQs into a segment."""
+  """把一串 VLQ 解码为一个 segment。"""
   enc_iter = iter(enc)
   col = decode_vlq(enc_iter)
   try:
     source = decode_vlq(enc_iter)
   except StopIteration:
-    # Stopping here is fine (1-segment).
+    # 在这里停止是可以的（1 字段 segment）。
     return (col,)
   source_line = decode_vlq(enc_iter)
   source_col = decode_vlq(enc_iter)
   try:
     name = decode_vlq(enc_iter)
   except StopIteration:
-    # Stopping here is fine too (4-segment).
+    # 在这里停止也可以（4 字段 segment）。
     return col, source, source_line, source_col
-  # (5-segment)
+  # （5 字段 segment）
   return col, source, source_line, source_col, name
 
 
 def encode_segment(seg: Segment) -> bytes:
-  """Encode a segment into a sequence of VLQs."""
+  """把 segment 编码为一串 VLQ。"""
   return b"".join(encode_vlq(value) for value in seg)
 
 
 def deserialize_mappings(mappings_str: str) -> Mappings:
-  """Decode a string of TC39 mapping data."""
+  """解码 TC39 映射数据字符串。"""
   mappings_bytes = bytes(mappings_str, encoding="ascii")
   return [
       list(map(decode_segment, mapping.split(b","))) if mapping else []
@@ -157,7 +164,7 @@ def deserialize_mappings(mappings_str: str) -> Mappings:
 
 
 def serialize_mappings(mappings: Mappings) -> str:
-  """Encode mappings into a string of TC39 mapping data."""
+  """把 mappings 编码为 TC39 映射数据字符串。"""
   enc = b";".join(
       b",".join(encode_segment(seg) for seg in segs) for segs in mappings
   )
@@ -165,12 +172,11 @@ def serialize_mappings(mappings: Mappings) -> str:
 
 
 class MappingsGenerator:
-  """MappingsGenerator is a builder API for mappings.
+  """MappingsGenerator 是用于构建 mappings 的构造器 API。
 
-  TC39 mapping data is inconvenient to emit directly: in an effort to compress
-  data
-  it encodes most indices using values _relative_ to the previous element.
-  MappingsGenerator simplifies things by taking absolute indices everywhere.
+  TC39 映射数据不便于直接生成：为了压缩数据，
+  它用相对于前一个元素的数值来编码大多数索引。
+  MappingsGenerator 通过在所有地方接受绝对索引来简化这件事。
   """
 
   def __init__(self):
@@ -183,20 +189,20 @@ class MappingsGenerator:
     self._cur_group = None
 
   def new_group(self):
-    """Start a new group (line)."""
+    """开始一个新的组（行）。"""
     self._last_col = 0
     self._cur_group = []
     self._mappings.append(self._cur_group)
 
   def new_segment(self, *seg):
-    """Start a new source mapping segment in the current group.
+    """在当前组中开始一个新的源码映射 segment。
 
     Args:
-      *seg: A segment as in TC39, but all indices are absolute. See
-        https://tc39.es/source-map/#mappings-structure for details.
+      *seg: 与 TC39 中相同的 segment，但所有索引都是绝对索引。详见
+        https://tc39.es/source-map/#mappings-structure。
 
     Raises:
-      RuntimeError: If no current group exists.
+      RuntimeError: 若当前不存在组。
     """
     assert len(seg) >= 1
     group = self._cur_group
@@ -231,5 +237,5 @@ class MappingsGenerator:
     assert False, "invalid segment"
 
   def mappings(self) -> Mappings:
-    """Return the mapping as a list of segments per line."""
+    """把映射按行返回为 segment 列表。"""
     return self._mappings

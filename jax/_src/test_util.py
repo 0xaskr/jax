@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：JAX 内部测试基础设施的核心模块，提供编写 JAX 测试所需的基类与工具。
+# 这里定义 JaxTestCase 等测试基类，以及按设备/平台跳过或限定测试的装饰器
+# （skip_on_devices、run_on_devices、skip_on_flag 等）与 device_under_test 等探测函数。
+# 还提供数据类型与容差比较工具（to_default_dtype、with_jax_dtype_defaults、check_eq）、
+# 用于统计编译缓存命中/缺失的线程局部事件计数器，以及基于 mpmath 的 numpy 包装器，
+# 供 JAX 自身的单元测试使用。
+
 # pyformat: disable
 from __future__ import annotations
 
@@ -74,14 +81,13 @@ import numpy.random as npr
 
 logger = logging.getLogger(__name__)
 
-# When running tests, install the ABSL failure signal handler. This dumps a
-# C++ back trace on fatal signals, which is helpful for debugging.
+# 运行测试时安装 ABSL 失败信号处理器。它会在收到致命信号时转储 C++
+# 回溯，这有助于调试。
 util.install_failure_signal_handler()
 
 
-# This submodule includes private test utilities that are not exported to
-# jax.test_util. Functionality appearing here is for internal use only, and
-# may be changed or removed at any time and without any deprecation cycle.
+# 这个子模块包含不导出到 jax.test_util 的私有测试工具。此处出现的功能
+# 仅供内部使用，可能随时被修改或移除，且不提供任何弃用周期。
 
 _TEST_DUT = config.string_flag(
     'jax_test_dut', '',
@@ -115,12 +121,12 @@ TEST_WITH_PERSISTENT_COMPILATION_CACHE = config.bool_flag(
     'test cases. This can be used to increase compilation cache coverage.')
 
 
-# Global flag ensuring we only patch the subprocess env once per process.
+# 全局标志，确保每个进程只对子进程环境打补丁一次。
 _bazel_subprocess_env_patched = False
 
-# We sanitize test names to ensure they work with "unitttest -k" and
-# "pytest -k" test filtering. pytest accepts '[' and ']' but unittest -k
-# does not. We replace sequences of problematic characters with a single '_'.
+# 我们会对测试名做净化，确保它们能与 "unitttest -k" 和 "pytest -k"
+# 的测试过滤配合工作。pytest 接受 '[' 和 ']'，但 unittest -k 不接受。
+# 我们把连续的问题字符替换为单个 '_'。
 kSanitizeNameRE = re.compile(r"[ \"'\[\](){}<>=,._]+")
 def sanitize_test_name(s: str) -> str:
   return kSanitizeNameRE.sub("_", s)
@@ -129,26 +135,24 @@ def num_float_bits(dtype: DTypeLike) -> int:
   return _dtypes.finfo(_dtypes.canonicalize_dtype(dtype)).bits
 
 def to_default_dtype(arr: ArrayLike) -> np.ndarray:
-  """Convert a value to an array with JAX's default dtype.
+  """把一个值转换为具有 JAX 默认数据类型的数组。
 
-  This is generally used for type conversions of values returned by numpy functions,
-  to make their dtypes take into account the state of the ``jax_enable_x64`` flag.
+  这通常用于对 numpy 函数返回的值做类型转换，使其数据类型考虑
+  ``jax_enable_x64`` 标志的状态。
   """
   arr = np.asarray(arr)
   dtype_fn = _dtypes.default_types.get(arr.dtype.kind)
   return arr.astype(dtype_fn()) if dtype_fn else arr
 
 def with_jax_dtype_defaults(func: Callable[..., Any], use_defaults: bool = True):
-  """Return a version of a function with outputs that match JAX's default dtypes.
+  """返回该函数的一个版本，其输出与 JAX 的默认数据类型保持一致。
 
-  This is generally used to wrap numpy functions within tests, in order to make
-  their default output dtypes match those of corresponding JAX functions, taking
-  into account the state of the ``jax_enable_x64`` flag.
+  这通常用于在测试中包装 numpy 函数，以便让它们的默认输出数据类型与对应的
+  JAX 函数一致，并考虑 ``jax_enable_x64`` 标志的状态。
 
   Args:
-    use_defaults : whether to convert any given output to the default dtype. May be
-      a single boolean, in which case it specifies the conversion for all outputs,
-      or may be a pytree with the same structure as the function output.
+    use_defaults : 是否把给定的输出转换为默认数据类型。可以是单个布尔值，
+      此时它对所有输出统一指定是否转换；也可以是与函数输出结构相同的 pytree。
   """
   @functools.wraps(func)
   def wrapped(*args, **kwargs):
@@ -193,10 +197,10 @@ def check_eq(xs: Any, ys: Any, err_msg: str = '') -> None:
 
 @contextmanager
 def _capture_output(fp: TextIO) -> Generator[Callable[[], str]]:
-  """Context manager to capture all output written to a given file object.
+  """上下文管理器，用于捕获写入给定文件对象的所有输出。
 
-  Unlike ``contextlib.redirect_stdout``, this context manager works for
-  any file object and also for both pure Python and native code.
+  与 ``contextlib.redirect_stdout`` 不同，这个上下文管理器适用于任意文件
+  对象，也同时适用于纯 Python 代码和原生代码。
 
   Example::
 
@@ -205,10 +209,10 @@ def _capture_output(fp: TextIO) -> Generator[Callable[[], str]]:
     print("Captured": get_output())
 
   Yields:
-    A function returning the captured output. The function must be called
-    *after* the context is no longer active.
+    一个返回所捕获输出的函数。该函数必须在上下文不再处于活动状态
+    *之后*调用。
   """
-  # ``None`` means nothing has not been captured yet.
+  # ``None`` 表示还没有捕获任何内容。
   captured = None
 
   def get_output() -> str:
@@ -222,7 +226,7 @@ def _capture_output(fp: TextIO) -> Generator[Callable[[], str]]:
     try:
       yield get_output
     finally:
-      # Python also has its own buffers, make sure everything is flushed.
+      # Python 也有自己的缓冲区，要确保所有内容都已刷新。
       fp.flush()
       os.fsync(fp.fileno())
       f.seek(0)
@@ -237,10 +241,10 @@ capture_stderr = partial(_capture_output, sys.stderr)
 
 class EventThreadLocalState(threading.local):
   def __init__(self):
-    self.counts = {}  # Mapping from string name to count.
-    self.nested_device_put_count = 0  # Number of recursive calls to device_put
+    self.counts = {}  # 从字符串名到计数的映射。
+    self.nested_device_put_count = 0  # 对 device_put 的递归调用次数
 
-    # Per-function counts
+    # 按函数统计的计数
     self.lower_jaxpr_to_fun_counts = None
 
     self.collect_lowered_jaxprs = None
@@ -252,10 +256,9 @@ def event_listener(name, *args):
   counts = thread_local_state.counts
   counts[name] = counts.get(name, 0) + 1
 
-  # device_put handlers might call `dispatch.device_put` (e.g. on an
-  # underlying payload or several). We only want to count these
-  # recursive puts once, so we skip counting more than the outermost
-  # one in such a call stack.
+  # device_put 处理器可能会调用 `dispatch.device_put`（例如针对底层
+  # payload，或多个 payload）。我们只想把这些递归的 put 计数一次，
+  # 因此在这种调用栈中只统计最外层的那一次。
   if name == "batched_device_put_start":
     if thread_local_state.nested_device_put_count == 0:
       counts["batched_device_put"] = counts.get("batched_device_put", 0) + 1
@@ -264,8 +267,8 @@ def event_listener(name, *args):
     thread_local_state.nested_device_put_count -= 1
 
   elif name == "lower_jaxpr_to_fun":
-    # For infer_params, we collect per-function data, but only while a context
-    # manager is active.
+    # 对于 infer_params，我们按函数收集数据，但仅在某个上下文
+    # 管理器处于活动状态时进行。
     lower_counts = thread_local_state.lower_jaxpr_to_fun_counts
     if lower_counts is not None:
       (fun,) = args
@@ -280,7 +283,7 @@ util.test_event_listener = event_listener
 
 
 def count_events(event):
-  "Returns a context-manager that yields a function that counts a test event."
+  "返回一个上下文管理器，它产出一个统计测试事件的函数。"
   @contextmanager
   def count_event():
     before = thread_local_state.counts.get(event, 0)
@@ -329,7 +332,7 @@ def collect_lowered_jaxprs() -> Generator[
     Sequence[tuple[core.Jaxpr, mlir.ir.Module]],
 ]:
   """
-  Collects all the pairs of (jaxpr, mlir_module) that are lowered.
+  收集所有被降级的 (jaxpr, mlir_module) 对。
   """
   assert thread_local_state.collect_lowered_jaxprs is None
   collection: list[tuple[core.Jaxpr, mlir.ir.Module]] = []
@@ -421,7 +424,7 @@ def is_gil_disabled() -> bool:
   return not sys._is_gil_enabled() if hasattr(sys, "_is_gil_enabled") else False
 
 def is_test_rbe() -> bool:
-  """Check for a variable set by the RBE toolchain under testing."""
+  """检查测试环境下 RBE 工具链设置的变量。"""
   return (
       os.getenv("IS_JAX_RBE_TESTING", "").lower() in {"true", "1", "yes", "y"}
       )
@@ -462,7 +465,7 @@ def is_device_tpu(version: int | None = None, variant: str = "") -> bool:
     return True
   device_kind = xla_bridge.devices()[0].device_kind
   expected_version = f"v{version}{variant}"
-  # Special case v5e until the name is updated in device_kind
+  # 在 device_kind 中的名称更新之前，对 v5e 做特殊处理
   if expected_version == "v5e":
     return "v5 lite" in device_kind
   elif expected_version == "v6e":
@@ -490,13 +493,13 @@ def device_kind_match(device_patterns: str | Sequence[str]) -> str | None:
   return matching_pattern
 
 def get_cuda_nonportable_max_cluster_size():
-  # Per-device nonportable maximum cluster sizes for Jetson Thor and DGX
-  # Spark (GB10) determined by querying cuOccupancyMaxPotentialClusterSize
+  # Jetson Thor 与 DGX Spark (GB10) 的每设备不可移植最大 cluster 大小，
+  # 通过查询 cuOccupancyMaxPotentialClusterSize 得到
   if device_kind_match("Thor$"):
     return 8
   elif device_kind_match("GB10$"):
     return 12
-  # 16 is the nonportable maximum cluster size on:
+  # 16 是以下架构上的不可移植最大 cluster 大小：
   # - Hopper: https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#:~:text=cluster%20size%20of-,16,-by%20opting%20in
   # - Blackwell: https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html#:~:text=cluster%20size%20of-,16,-by%20opting%20in
   return 16
@@ -525,16 +528,16 @@ def is_cuda_version_at_least(major: int, minor: int) -> bool:
       and cuda_versions.cuda_runtime_get_version() >= major * 1000 + minor * 10
   )
 
-# Artificial shared memory size used for some tests. 99 KiB is the limit for compute
-# capabilities 8.6, 8.9 and 12.0. Using a smaller limit when running architecture
-# agnostic tests on all hardware helps avoid introducing architecture-specific OOM
-# errors in those tests.
+# 某些测试使用的人为设定的共享内存大小。99 KiB 是计算能力
+# 8.6、8.9 和 12.0 的上限。在所有硬件上运行与架构无关的测试时
+# 使用更小的上限，有助于避免在这些测试中引入架构相关的 OOM
+# 错误。
 # https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html#compute-capabilities-table-memory-information-per-compute-capability
 _SMEM_SIZE_BOUND_FOR_TESTS = 99 * 1024
 
 class CudaArchSpecificTest:
-  """A mixin with methods allowing to skip arch specific tests."""
-  skipTest: Callable[[str], Any]  # must be provided via inheritance
+  """一个 mixin，其方法用于跳过与特定架构相关的测试。"""
+  skipTest: Callable[[str], Any]  # 必须通过继承提供
 
   def skip_unless_sm90a(self):
     if not is_cuda_compute_capability_equal("9.0"):
@@ -556,7 +559,7 @@ class CudaArchSpecificTest:
       self.skipTest("tcgen05 in int8 only works on GPU with capability sm100a/sm101a/sm110a")
 
 def _get_device_tags():
-  """returns a set of tags defined for the device under test"""
+  """返回为被测设备定义的一组标签"""
   if is_device_rocm():
     return {device_under_test(), "rocm"}
   elif is_device_cuda():
@@ -577,7 +580,7 @@ def test_device_matches(device_types: Iterable[str]) -> bool:
       return True
   return False
 
-test_device_matches.__test__ = False  # This isn't a test case, pytest.  # pyrefly: ignore[missing-attribute]
+test_device_matches.__test__ = False  # 这不是测试用例，pytest。  # pyrefly: ignore[missing-attribute]
 
 def _device_filter(predicate, skip_reason=None):
   def skip(test_method):
@@ -596,22 +599,22 @@ def _device_filter(predicate, skip_reason=None):
   return skip
 
 def skip_on_devices(*disabled_devices, skip_reason=None):
-  """A decorator for test methods to skip the test on certain devices.
+  """用于测试方法的装饰器，在特定设备上跳过该测试。
 
   Args:
-    *disabled_devices: Device names that the test should skip on.
-    skip_reason: Optional custom skip message when test is skipped.
+    *disabled_devices: 测试应当跳过的设备名。
+    skip_reason: 测试被跳过时可选的自定义跳过消息。
   """
   if skip_reason is None:
     skip_reason = "Skipped on devices with tags: " + ", ".join(disabled_devices)
   return _device_filter(lambda: not test_device_matches(disabled_devices), skip_reason)
 
 def run_on_devices(*enabled_devices, skip_reason=None):
-  """A decorator for test methods to run the test only on certain devices.
+  """用于测试方法的装饰器，只在特定设备上运行该测试。
 
   Args:
-    *enabled_devices: Device names that the test should run on.
-    skip_reason: Optional custom skip message when test is skipped.
+    *enabled_devices: 测试应当运行的设备名。
+    skip_reason: 测试被跳过时可选的自定义跳过消息。
   """
   if skip_reason is None:
     skip_reason = (
@@ -620,28 +623,25 @@ def run_on_devices(*enabled_devices, skip_reason=None):
   return _device_filter(lambda: test_device_matches(enabled_devices), skip_reason)
 
 def device_supports_buffer_donation():
-  """A decorator for test methods to run the test only on devices that support
-  buffer donation."""
+  """用于测试方法的装饰器，只在支持缓冲区捐赠的设备上运行该测试。"""
   return _device_filter(
       lambda: test_device_matches(mlir._platforms_with_donation)
   )
 
 
 def request_cpu_devices(nr_devices: int):
-  """Requests at least `nr_devices` CPU devices.
+  """请求至少 `nr_devices` 个 CPU 设备。
 
-  request_cpu_devices should be called at the top-level of a test module before
-  main() runs.
+  应在测试模块的顶层、main() 运行之前调用 request_cpu_devices。
 
-  It is not guaranteed that the number of CPU devices will be exactly
-  `nr_devices`: it may be more or less, depending on how exactly the test is
-  invoked. Test cases that require a specific number of devices should skip
-  themselves if that number is not met.
+  并不保证 CPU 设备数量恰好等于 `nr_devices`：它可能更多或更少，
+  取决于测试的具体调用方式。需要特定数量设备的测试用例，在数量
+  不满足时应自行跳过。
   """
   if xla_bridge.num_cpu_devices.value < nr_devices:
     xla_bridge.get_backend.cache_clear()
-    # Don't raise an error for `request_cpu_devices` because we initialize the
-    # backend in OSS during collecting tests in pytest via `device_under_test`.
+    # 不要为 `request_cpu_devices` 抛出错误，因为在开源版中通过
+    # `device_under_test` 在 pytest 收集测试时就会初始化后端。
     try:
       config.update("jax_num_cpu_devices", nr_devices)
     except RuntimeError:
@@ -649,7 +649,7 @@ def request_cpu_devices(nr_devices: int):
 
 
 def skip_on_flag(flag_name, skip_value):
-  """A decorator for test methods to skip the test when flags are set."""
+  """用于测试方法的装饰器，在设置了相应标志时跳过该测试。"""
   def skip(test_method):
     @functools.wraps(test_method)
     def test_method_wrapper(self, *args, **kwargs):
@@ -664,7 +664,7 @@ def skip_on_flag(flag_name, skip_value):
 
 
 def pytest_mark_if_available(marker: str):
-  """A decorator for test classes or methods to pytest.mark if installed."""
+  """若已安装 pytest，则为测试类或方法加上 pytest.mark 的装饰器。"""
   def wrap(func_or_class):
     try:
       import pytest  # pyrefly: ignore[missing-import]
@@ -679,15 +679,15 @@ def is_running_under_pytest():
 
 
 def skip_under_pytest(reason: str):
-  """A decorator for test methods to skip the test when run under pytest."""
+  """用于测试方法的装饰器，在 pytest 下运行时跳过该测试。"""
   reason = "Running under pytest: " + reason
   def skip(test_method):
     return unittest.skipIf(is_running_under_pytest(), reason)(test_method)
   return skip
 
 
-# We use special symbols, represented as singleton objects, to distinguish
-# between NumPy scalars, Python scalars, and 0-D arrays.
+# 我们使用以单例对象表示的特殊符号，来区分 NumPy 标量、Python 标量
+# 和 0 维数组。
 class ScalarShape:
   def __len__(self): return 0
   def __getitem__(self, i): raise IndexError(f"index {i} out of range.")
@@ -697,7 +697,7 @@ NUMPY_SCALAR_SHAPE = _NumpyScalar()
 PYTHON_SCALAR_SHAPE = _PythonScalar()
 
 
-# Some shape combinations don't make sense.
+# 有些形状组合没有意义。
 def is_valid_shape(shape, dtype):
   if shape == PYTHON_SCALAR_SHAPE:
     return dtype == np.dtype(type(np.array(0, dtype=dtype).item()))
@@ -705,7 +705,7 @@ def is_valid_shape(shape, dtype):
 
 
 def _dims_of_shape(shape):
-  """Converts `shape` to a tuple of dimensions."""
+  """把 `shape` 转换为由各维度构成的元组。"""
   if type(shape) in (list, tuple):
     return shape
   elif isinstance(shape, ScalarShape):
@@ -717,12 +717,12 @@ def _dims_of_shape(shape):
 
 
 def _cast_to_shape(value, shape, dtype):
-  """Casts `value` to the correct Python type for `shape` and `dtype`."""
+  """把 `value` 转换为 `shape` 与 `dtype` 对应的正确 Python 类型。"""
   if shape is NUMPY_SCALAR_SHAPE:
-    # explicitly cast to NumPy scalar in case `value` is a Python scalar.
+    # 显式转换为 NumPy 标量，以防 `value` 是 Python 标量。
     return np.dtype(dtype).type(value)
   elif shape is PYTHON_SCALAR_SHAPE:
-    # explicitly cast to Python scalar via https://stackoverflow.com/a/11389998
+    # 通过 https://stackoverflow.com/a/11389998 显式转换为 Python 标量
     return np.asarray(value).item()
   elif type(shape) in (list, tuple):
     assert np.shape(value) == tuple(shape)
@@ -761,20 +761,20 @@ def _format_shape_dtype_string(shape, dtype):
 
 
 def _rand_dtype(rand, shape, dtype, scale=1., post=lambda x: x):
-  """Produce random values given shape, dtype, scale, and post-processor.
+  """根据 shape、dtype、scale 与后处理器生成随机值。
 
   Args:
-    rand: a function for producing random values of a given shape, e.g. a
-      bound version of either np.RandomState.randn or np.RandomState.rand.
-    shape: a shape value as a tuple of positive integers.
-    dtype: a numpy dtype.
-    scale: optional, a multiplicative scale for the random values (default 1).
-    post: optional, a callable for post-processing the random values (default
-      identity).
+    rand: 用于生成给定形状随机值的函数，例如 np.RandomState.randn 或
+      np.RandomState.rand 的绑定版本。
+    shape: 以正整数元组表示的形状值。
+    dtype: 一个 numpy 数据类型。
+    scale: 可选，随机值的乘性缩放系数（默认为 1）。
+    post: 可选，用于对随机值做后处理的可调用对象
+      （默认为恒等函数）。
 
   Returns:
-    An ndarray of the given shape and dtype using random values based on a call
-    to rand but scaled, converted to the appropriate dtype, and post-processed.
+    一个具有给定形状与数据类型的 ndarray，其随机值基于对 rand 的调用，
+    但经过缩放、转换为相应数据类型并做了后处理。
   """
   if _dtypes.issubdtype(dtype, np.unsignedinteger):
     r = lambda: np.asarray(scale * abs(rand(*_dims_of_shape(shape)))).astype(dtype)
@@ -788,21 +788,21 @@ def _rand_dtype(rand, shape, dtype, scale=1., post=lambda x: x):
 
 
 def rand_fullrange(rng, standardize_nans=False):
-  """Random numbers that span the full range of available bits."""
+  """覆盖全部可用比特取值范围的随机数。"""
   def gen(shape, dtype, post=lambda x: x):
     dtype = np.dtype(dtype)
     size = dtype.itemsize * math.prod(_dims_of_shape(shape))
     vals = rng.randint(0, np.iinfo(np.uint8).max, size=size, dtype=np.uint8)
     vals = post(vals).view(dtype)
     if shape is PYTHON_SCALAR_SHAPE:
-      # Sampling from the full range of the largest available uint type
-      # leads to overflows in this case; sample from signed ints instead.
+      # 从最大可用无符号整型类型的整个取值范围采样，在此情况下会导致溢出；
+      # 因此改为从有符号整型采样。
       if dtype == np.uint64:
         vals = vals.astype(np.int64)
       elif dtype == np.uint32 and not config.enable_x64.value:
         vals = vals.astype(np.int32)
     vals = vals.reshape(shape)
-    # Non-standard NaNs cause errors in numpy equality assertions.
+    # 非标准 NaN 会导致 numpy 相等性断言出错。
     if standardize_nans and np.issubdtype(dtype, np.floating):
       vals[np.isnan(vals)] = np.nan
     return _cast_to_shape(vals, shape, dtype)
@@ -854,15 +854,15 @@ def rand_some_equal(rng):
 
 
 def rand_some_inf(rng):
-  """Return a random sampler that produces infinities in floating types."""
+  """返回一个会在浮点类型中产生无穷大的随机采样器。"""
   base_rand = rand_default(rng)
 
-  # TODO: Complex numbers are not correctly tested
-  # If blocks should be switched in order, and relevant tests should be fixed
+  # TODO: 复数没有被正确地测试
+  # 应交换 if 块的顺序，并修复相关测试
   def rand(shape, dtype):
-    """The random sampler function."""
+    """随机采样器函数。"""
     if not _dtypes.issubdtype(dtype, np.floating):
-      # only float types have inf
+      # 只有浮点类型才有 inf
       return base_rand(shape, dtype)
 
     if _dtypes.issubdtype(dtype, np.complexfloating):
@@ -884,11 +884,11 @@ def rand_some_inf(rng):
   return rand
 
 def rand_some_nan(rng):
-  """Return a random sampler that produces nans in floating types."""
+  """返回一个会在浮点类型中产生 nan 的随机采样器。"""
   base_rand = rand_default(rng)
 
   def rand(shape, dtype):
-    """The random sampler function."""
+    """随机采样器函数。"""
     if _dtypes.issubdtype(dtype, np.complexfloating):
       base_dtype = np.real(np.array(0, dtype=dtype)).dtype
       out = (rand(shape, base_dtype) +
@@ -896,7 +896,7 @@ def rand_some_nan(rng):
       return _cast_to_shape(out, shape, dtype)
 
     if not _dtypes.issubdtype(dtype, np.floating):
-      # only float types have inf
+      # 只有浮点类型才有 inf
       return base_rand(shape, dtype)
 
     dims = _dims_of_shape(shape)
@@ -913,15 +913,15 @@ def rand_some_nan(rng):
   return rand
 
 def rand_some_inf_and_nan(rng):
-  """Return a random sampler that produces infinities in floating types."""
+  """返回一个会在浮点类型中产生无穷大的随机采样器。"""
   base_rand = rand_default(rng)
 
-  # TODO: Complex numbers are not correctly tested
-  # If blocks should be switched in order, and relevant tests should be fixed
+  # TODO: 复数没有被正确地测试
+  # 应交换 if 块的顺序，并修复相关测试
   def rand(shape, dtype):
-    """The random sampler function."""
+    """随机采样器函数。"""
     if not _dtypes.issubdtype(dtype, np.floating):
-      # only float types have inf
+      # 只有浮点类型才有 inf
       return base_rand(shape, dtype)
 
     if _dtypes.issubdtype(dtype, np.complexfloating):
@@ -944,13 +944,13 @@ def rand_some_inf_and_nan(rng):
 
   return rand
 
-# TODO(mattjj): doesn't handle complex types
+# TODO(mattjj): 不处理复数类型
 def rand_some_zero(rng):
-  """Return a random sampler that produces some zeros."""
+  """返回一个会产生一些零的随机采样器。"""
   base_rand = rand_default(rng)
 
   def rand(shape, dtype):
-    """The random sampler function."""
+    """随机采样器函数。"""
     dims = _dims_of_shape(shape)
     zeros = rng.rand(*dims) < 0.5
 
@@ -983,9 +983,9 @@ def rand_unique_int(rng, high=None):
   return fn
 
 def rand_indices_unique_along_axis(rng):
-  """Sample an array of given shape containing indices up to dim (exclusive),
-  such that the indices are unique along the given axis.
-  Optionally, convert some of the resulting indices to negative indices."""
+  """采样一个给定形状的数组，其中包含小于 dim（不含）的索引，
+  且这些索引在给定轴上互不重复。
+  可选地把部分结果索引转换为负索引。"""
   def fn(dim, shape, axis, allow_negative=True):
     batch_size = math.prod(shape[:axis] + shape[axis:][1:])
     idx = [
@@ -996,7 +996,7 @@ def rand_indices_unique_along_axis(rng):
     idx = idx.reshape(shape[:axis] + shape[axis:][1:] + (shape[axis],))
     idx = np.moveaxis(idx, -1, axis)
 
-    # assert that indices are unique along the given axis
+    # 断言索引在给定轴上互不重复
     count = partial(np.bincount, minlength=dim)
     assert (np.apply_along_axis(count, axis, idx) <= 1).all()
 
@@ -1030,7 +1030,7 @@ def check_raises_regexp(thunk, err_type, pattern):
 
 
 def iter_eqns(jaxpr):
-  # TODO(necula): why doesn't this search in params?
+  # TODO(necula): 为什么这里不搜索 params？
   yield from jaxpr.eqns
   for subjaxpr in core.subjaxprs(jaxpr):
     yield from iter_eqns(subjaxpr)
@@ -1086,15 +1086,15 @@ def named_cases_from_sampler(gen):
     yield case
 
 
-# Random sampling for every parameterized test is expensive. Do it once and
-# cache the result.
+# 为每个参数化测试都做随机采样开销很大。只做一次并
+# 缓存结果。
 @functools.cache
 def _choice(n, m):
   rng = np.random.RandomState(42)
   return rng.choice(n, size=m, replace=False)
 
 def sample_product_testcases(*args, **kw):
-  """Non-decorator form of sample_product."""
+  """sample_product 的非装饰器形式。"""
   args = [list(arg) for arg in args]
   kw = [(k, list(v)) for k, v in kw.items()]
   n = math.prod(len(a) for a in args) * math.prod(len(v) for _, v in kw)
@@ -1111,24 +1111,24 @@ def sample_product_testcases(*args, **kw):
   return testcases
 
 def sample_product(*args, **kw):
-  """Decorator that samples from a cartesian product of test cases.
+  """从测试用例的笛卡尔积中采样的装饰器。
 
-  Similar to absltest.parameterized.product(), except that it samples from the
-  cartesian product rather than returning the whole thing.
+  与 absltest.parameterized.product() 类似，区别在于它从笛卡尔积中
+  采样，而不是返回整个笛卡尔积。
 
   Arguments:
-    *args: each positional argument is a list of dictionaries. The entries
-      in a dictionary correspond to name=value argument pairs; one dictionary
-      will be chosen for each test case. This allows multiple parameters to be
-      correlated.
-    **kw: each keyword argument is a list of values. One value will be chosen
-      for each test case.
+    *args: 每个位置参数都是一个字典列表。字典中的条目对应
+      name=value 形式的参数对；每个测试用例会选取其中一个
+      字典。这样可以让多个参数相互关联，而不是各自
+      独立取值。
+    **kw: 每个关键字参数都是一个取值列表。每个测试用例会选取
+      其中一个值。
   """
   return parameterized.parameters(*sample_product_testcases(*args, **kw))
 
 
 def with_config(**kwds):
-  """Test case decorator for subclasses of JaxTestCase"""
+  """用于 JaxTestCase 子类的测试用例装饰器"""
   def decorator(cls):
     assert inspect.isclass(cls) and issubclass(cls, JaxTestCase), "@with_config can only wrap JaxTestCase class definitions."
     cls._default_thread_local_config = {}
@@ -1140,7 +1140,7 @@ def with_config(**kwds):
   return decorator
 
 def with_global_config(**kwds):
-  """Test case decorator for subclasses of JaxTestCase"""
+  """用于 JaxTestCase 子类的测试用例装饰器"""
   def decorator(cls):
     assert inspect.isclass(cls) and issubclass(cls, JaxTestCase), "@with_config can only wrap JaxTestCase class definitions."
     cls._default_global_config = {}
@@ -1153,11 +1153,11 @@ def with_global_config(**kwds):
 
 
 def promote_like_jnp(fun, inexact=False):
-  """Decorator that promotes the arguments of `fun` to `jnp.result_type(*args)`.
+  """把 `fun` 的参数提升为 `jnp.result_type(*args)` 的装饰器。
 
-  jnp and np have different type promotion semantics; this decorator allows
-  tests make an np reference implementation act more like a jnp
-  implementation.
+  jnp 与 np 的类型提升语义不同；这个装饰器允许测试把一个
+  作为参照的 np 实现表现得更加接近 jnp 实现，从而让参照实现
+  与 jnp 实现的类型提升行为保持一致。
   """
   _promote = promote_dtypes_inexact if inexact else promote_dtypes
   def wrapper(*args, **kw):
@@ -1215,7 +1215,7 @@ def assert_global_configs_unchanged():
 
 
 class JaxTestCase(parameterized.TestCase):
-  """Base class for JAX tests including numerical checks and boilerplate."""
+  """JAX 测试的基类，包含数值检查和样板代码。"""
   _default_global_config: dict[str, Any] = {}
   _default_thread_local_config = {
     'jax_enable_checks': True,
@@ -1230,9 +1230,9 @@ class JaxTestCase(parameterized.TestCase):
     self._configure_subprocess_env()
     self.enterContext(assert_global_configs_unchanged())
 
-    # We use the adler32 hash for two reasons.
-    # a) it is deterministic run to run, unlike hash() which is randomized.
-    # b) it returns values in int32 range, which RandomState requires.
+    # 我们使用 adler32 哈希，原因有两个。
+    # a) 它每次运行都是确定性的，而 hash() 是随机化的。
+    # b) 它返回 int32 范围内的值，而 RandomState 需要这样的值。
     self._rng = npr.RandomState(zlib.adler32(self._testMethodName.encode()))
 
     self.enterContext(global_config_context(**self._default_global_config))
@@ -1251,12 +1251,12 @@ class JaxTestCase(parameterized.TestCase):
 
   def _configure_subprocess_env(self):
     """
-    Propagates the current Bazel environment to subprocesses.
+    把当前的 Bazel 环境传播到子进程。
 
-    Note: Fix for rules_python >= 1.7.0 (Strict Hermeticity):
-    The parent process sees dependencies via sys.path, but modern rules_python
-    does not export this to PYTHONPATH by default. We must manually propagate
-    it so child workers can locate dependencies.
+    Note: 针对 rules_python >= 1.7.0（严格密封性）的修复：
+    父进程通过 sys.path 看到依赖，但新版 rules_python 默认不把它
+    导出到 PYTHONPATH。我们必须手动传播，以便子 worker 能够
+    定位到这些依赖。
     """
     global _bazel_subprocess_env_patched
 
@@ -1266,7 +1266,7 @@ class JaxTestCase(parameterized.TestCase):
     sys_path = os.pathsep.join(sys.path)
     pythonpath_env = os.environ.get('PYTHONPATH', '')
 
-    # Check if strict hermeticity is already satisfied
+    # 检查严格密封性是否已经满足
     if sys_path in pythonpath_env:
       _bazel_subprocess_env_patched = True
       return
@@ -1285,9 +1285,9 @@ class JaxTestCase(parameterized.TestCase):
 
   def assertDeprecationWarnsOrRaises(self, deprecation_id: str, message: str, *,
                                      error_class: type[Exception] = ValueError):
-    """Assert warning or error, depending on deprecation state.
+    """根据弃用状态断言警告或错误。
 
-    For use with functions that call :func:`jax._src.deprecations.warn`.
+    用于配合调用 :func:`jax._src.deprecations.warn` 的函数。
     """
     if deprecations.is_accelerated(deprecation_id):
       return self.assertRaisesRegex(error_class, message)
@@ -1296,28 +1296,28 @@ class JaxTestCase(parameterized.TestCase):
 
   def assertArraysEqual(self, actual, desired, *, check_dtypes=True, err_msg='',
                         allow_object_dtype=False, verbose=True):
-    """Assert that x and y arrays are exactly equal."""
+    """断言 x 与 y 数组完全相等。"""
     if check_dtypes:
       self.assertDtypesMatch(actual, desired)
     actual = np.asarray(actual)
     desired = np.asarray(desired)
 
     if (not allow_object_dtype) and (actual.dtype == object or desired.dtype == object):
-      # See https://github.com/jax-ml/jax/issues/17867
+      # 参见 https://github.com/jax-ml/jax/issues/17867
       raise TypeError(
         "assertArraysEqual may be poorly behaved when np.asarray casts to dtype=object. "
         "If comparing PRNG keys, consider random_test.KeyArrayTest.assertKeysEqual. "
         "If comparing collections of arrays, consider using assertAllClose. "
         "To let this test proceed anyway, pass allow_object_dtype=True.")
 
-    # Work around https://github.com/numpy/numpy/issues/18992
+    # 规避 https://github.com/numpy/numpy/issues/18992
     with np.errstate(over='ignore'):
       np.testing.assert_array_equal(actual, desired, err_msg=err_msg,
                                     verbose=verbose)
 
   def assertArraysAllClose(self, actual, desired, *, check_dtypes=True, atol=None,
                            rtol=None, err_msg=''):
-    """Assert that actual and desired are close (up to numerical tolerances)."""
+    """断言 actual 与 desired 接近（在数值容差范围内）。"""
     self.assertEqual(actual.shape, desired.shape)
     atol = max(tolerance(_dtype(actual), atol), tolerance(_dtype(desired), atol))
     rtol = max(tolerance(_dtype(actual), rtol), tolerance(_dtype(desired), rtol))
@@ -1336,7 +1336,7 @@ class JaxTestCase(parameterized.TestCase):
 
   def assertAllClose(self, actual, desired, *, check_dtypes=True, atol=None, rtol=None,
                      canonicalize_dtypes=True, err_msg=''):
-    """Assert that actual and desired, either arrays or nested tuples/lists, are close."""
+    """断言 actual 与 desired（数组或嵌套元组/列表）接近。"""
     if isinstance(actual, dict):
       self.assertIsInstance(desired, dict)
       self.assertEqual(set(actual.keys()), set(desired.keys()))
@@ -1367,14 +1367,14 @@ class JaxTestCase(parameterized.TestCase):
       raise TypeError((type(actual), type(desired)))
 
   def assertMultiLineStrippedEqual(self, expected, what):
-    """Asserts two strings are equal, after dedenting and stripping each line."""
+    """断言两个字符串在逐行去除公共缩进与首尾空白后相等。"""
     expected = textwrap.dedent(expected)
     what = textwrap.dedent(what)
     ignore_space_re = re.compile(r'\s*\n\s*')
     expected_clean = re.sub(ignore_space_re, '\n', expected.strip())
     what_clean = re.sub(ignore_space_re, '\n', what.strip())
     if what_clean != expected_clean:
-      # Print it so we can copy-and-paste it into the test
+      # 打印出来，以便复制粘贴到测试中
       print(f"Found\n{what}\n")
       self.assertMultiLineEqual(expected_clean, what_clean,
                                 msg=f"Found\n{what}\nExpecting\n{expected}")
@@ -1384,9 +1384,9 @@ class JaxTestCase(parameterized.TestCase):
     with test_warning_util.raise_on_warnings():
       yield
 
-  # We replace assertWarns and assertWarnsRegex with functions that use the
-  # thread-safe warning utilities. Unlike the unittest versions these only
-  # function as context managers.
+  # 我们用基于线程安全警告工具的函数替换 assertWarns 与
+  # assertWarnsRegex。与 unittest 中的版本不同，这些函数
+  # 只能作为上下文管理器使用。
   @contextmanager
   def assertWarns(self, warning, *, msg=None):  # pyrefly: ignore[bad-override]
     with test_warning_util.record_warnings() as ws:
@@ -1419,7 +1419,7 @@ class JaxTestCase(parameterized.TestCase):
 
   def _CompileAndCheck(self, fun, args_maker, *, check_dtypes=True, tol=None,
                        rtol=None, atol=None, check_cache_misses=True):
-    """Helper method for running JAX compilation and allclose assertions."""
+    """运行 JAX 编译与 allclose 断言的辅助方法。"""
     args = args_maker()
 
     def wrapped_fun(*args):
@@ -1519,14 +1519,14 @@ class BufferDonationTestCase(JaxTestCase):
 
 ignore_warning = test_warning_util.ignore_warning
 
-# -------------------- Mesh parametrization helpers --------------------
+# -------------------- 网格参数化辅助函数 --------------------
 
 MeshSpec = list[tuple[str, int]]
 
 @contextmanager
 def with_mesh(named_shape: MeshSpec) -> Generator[None]:
-  """Test utility for setting up meshes given mesh data from `schedules`."""
-  # This is similar to the `with_mesh` function above, but isn't a decorator.
+  """在给定来自 `schedules` 的网格数据时搭建网格的测试工具。"""
+  # 这与上面的 `with_mesh` 函数类似，但它不是装饰器。
   axis_names, shape = unzip2(named_shape)
   size = math.prod(shape)
   local_devices = list(xla_bridge.local_devices())
@@ -1566,10 +1566,10 @@ def create_mesh(mesh_shape, axis_names, iota_order=False, axis_types=None):
 
 
 class _LazyDtypes:
-  """A class that unifies lists of supported dtypes.
+  """一个统一管理受支持 dtype 列表的类。
 
-  These could be module-level constants, but device_under_test() is not always
-  known at import time, so we need to define these lists lazily.
+  这些列表本可以是模块级常量，但 device_under_test() 在导入时并不总是
+  已知，因此我们需要惰性地定义这些列表。
   """
   def supported(self, dtypes: Sequence[DTypeLike]) -> list[DTypeLike]:
     supported = supported_dtypes()
@@ -1646,8 +1646,8 @@ dtypes = _LazyDtypes()
 
 def strict_promotion_if_dtypes_match(dtypes):
   """
-  Context manager to enable strict promotion if all dtypes match,
-  and enable standard dtype promotion otherwise.
+  若所有 dtype 都相同，则启用严格提升；
+  否则启用标准 dtype 提升的上下文管理器。
   """
   if all(dtype == dtypes[0] for dtype in dtypes):
     return config.numpy_dtype_promotion('strict')
@@ -1668,16 +1668,15 @@ def parameterized_filterable(*,
     testcase_name: Callable[[dict[str, Any]], str] | None = None,
     one_containing: str | None = None,
 ):
-  """Decorator for named parameterized tests, with filtering support.
+  """支持过滤的具名参数化测试装饰器。
 
-  Works like ``parameterized.named_parameters``, except that it sanitizes the test
-  names so that we can use ``pytest -k`` and ``python test.py -k`` test filtering.
-  This means, e.g., that many special characters are replaced with `_`.
-  It also supports the ``one_containing`` arg to select one of the tests, while
-  leaving the name unchanged, which is useful for IDEs to be able to easily
-  pick up the enclosing test name.
+  行为类似 ``parameterized.named_parameters``，但它会净化测试名，以便
+  我们能使用 ``pytest -k`` 和 ``python test.py -k`` 进行测试过滤。
+  这意味着，例如许多特殊字符会被替换成 `_`。
+  它还支持 ``one_containing`` 参数来选中其中一个测试，同时保持名称
+  不变，这便于 IDE 轻松识别出所属的测试名。
 
-  Usage:
+  用法：
      @jtu.parameterized_filterable(
        # one_containing="a_4",
        [dict(a=4, b=5),
@@ -1685,16 +1684,17 @@ def parameterized_filterable(*,
      def test_my_test(self, *, a, b): ...
 
   Args:
-    kwargs: Each entry is a set of kwargs to be passed to the test function.
-    testcase_name: Optionally, a function to construct the testcase_name from
-      one kwargs dict. If not given then ``kwargs`` may contain ``testcase_name`` and
-      otherwise the test case name is constructed as ``str(kwarg)``.
-      We sanitize the test names to work with -k test filters. See
-      ``sanitize_test_name``.
-    one_containing: If given, then leaves the test name unchanged, and use
-      only one of the ``kwargs`` whose `testcase_name` includes ``one_containing``.
+    kwargs: 每个条目都是要传给测试函数的一组 kwargs。
+    testcase_name: 可选，一个从单个 kwargs 字典构造 testcase_name 的
+      函数。若未给出，则 ``kwargs`` 中可以包含 ``testcase_name``，
+      否则测试用例名按 ``str(kwarg)`` 构造。
+      我们会净化测试名以配合 -k 测试过滤器。参见
+      ``sanitize_test_name``。
+    one_containing: 若给出，则保持测试名不变，并且只使用
+      ``kwargs`` 中 `testcase_name` 包含
+      ``one_containing`` 的那一个。
   """
-  # Ensure that all kwargs contain a testcase_name
+  # 确保所有 kwargs 都包含 testcase_name
   kwargs_with_testcase_name: Sequence[dict[str, Any]]
   if testcase_name is not None:
     kwargs_with_testcase_name = [
@@ -1723,7 +1723,7 @@ def parameterized_filterable(*,
 
 @contextmanager
 def register_event_duration_listener(callback):
-  """Manages registering/unregistering an event duration listener callback."""
+  """管理事件耗时监听器回调的注册与注销。"""
   try:
     monitoring.register_event_duration_secs_listener(callback)
     yield
@@ -1733,11 +1733,11 @@ def register_event_duration_listener(callback):
 
 @contextmanager
 def set_env(**kwargs):
-  """Context manager to temporarily set/unset one or more environment variables.
+  """临时设置/取消设置一个或多个环境变量的上下文管理器。
 
-  Caution: setting environment variables is not thread-safe. If you use this
-  utility, you must annotate your test using, e.g., @thread_unsafe_test() or
-  @thread_unsafe_test_class().
+  注意：设置环境变量不是线程安全的。若你使用这个工具，
+  必须用例如 @thread_unsafe_test() 或
+  @thread_unsafe_test_class() 来标注你的测试。
 
   Examples:
 
@@ -1772,14 +1772,14 @@ def fwd_bwd_jaxprs(f, *example_args):
 
 
 def complex_plane_sample(dtype, size_re=10, size_im=None):
-  """Return a 2-D array of complex numbers that covers the complex plane
-     with a grid of samples.
+  """返回一个覆盖复平面的二维复数数组，
+     它由一组网格采样点组成。
 
-     The size of the grid is (3 + 2 * size_im) x (3 + 2 * size_re)
-     that includes infinity points, extreme finite points, and the
-     specified number of points from real and imaginary axis.
+     网格大小为 (3 + 2 * size_im) x (3 + 2 * size_re)，
+     其中包括无穷远点、极端有限点，以及
+     在实轴和虚轴上指定数目的点。
 
-     For example:
+     例如：
 
      >>> print(complex_plane_sample(np.complex64, 0, 3))
      [[-inf          -infj   0.          -infj  inf          -infj]
@@ -1808,7 +1808,7 @@ def complex_plane_sample(dtype, size_re=10, size_im=None):
     axis_points = np.zeros(3 + 2 * size, dtype=finfo.dtype)
 
     with ignore_warning(category=RuntimeWarning):
-      # Silence RuntimeWarning: overflow encountered in cast
+      # 抑制 RuntimeWarning: cast 时发生溢出
       half_neg_line = -np.logspace(logmin, logtiny, size, dtype=finfo.dtype)
       half_line = -half_neg_line[::-1]
       axis_points[-size - 1:-1] = half_line
@@ -1837,7 +1837,7 @@ def complex_plane_sample(dtype, size_re=10, size_im=None):
 
 
 class vectorize_with_mpmath(np.vectorize):
-  """Same as numpy.vectorize but using mpmath backend for function evaluation.
+  """与 numpy.vectorize 相同，但使用 mpmath 后端进行函数求值。
   """
 
   map_float_to_complex = dict(float16='complex32', float32='complex64', float64='complex128', float128='complex256', longdouble='clongdouble')
@@ -1890,7 +1890,7 @@ class vectorize_with_mpmath(np.vectorize):
     raise NotImplementedError(f'get mpmath context from {type(x).__name__} instance')
 
   def nptomp(self, x):
-    """Convert numpy array/scalar to an array/instance of mpmath number type.
+    """把 numpy 数组/标量转换为 mpmath 数值类型的数组/实例。
     """
     if isinstance(x, np.ndarray):
       return np.fromiter(map(self.nptomp, x.flatten()), dtype=object).reshape(x.shape)
@@ -1917,7 +1917,7 @@ class vectorize_with_mpmath(np.vectorize):
     raise NotImplementedError(f'convert {type(x).__name__} instance to mpmath number type')
 
   def mptonp(self, x):
-    """Convert mpmath instance to numpy array/scalar type.
+    """把 mpmath 实例转换为 numpy 数组/标量类型。
     """
     if isinstance(x, np.ndarray) and x.dtype.kind == 'O':
       x_flat = x.flatten()
@@ -1995,8 +1995,8 @@ class vectorize_with_mpmath(np.vectorize):
 
 
 class numpy_with_mpmath:
-  """Namespace of universal functions on numpy arrays that use mpmath
-  backend for evaluation and return numpy arrays as outputs.
+  """一个由 numpy 数组上的通用函数构成的命名空间，这些函数使用 mpmath
+  后端进行求值，并把 numpy 数组作为输出返回。
   """
 
   _provides = [
@@ -2030,9 +2030,9 @@ class numpy_with_mpmath:
 
       setattr(self, name, vectorize_with_mpmath(op, mpmath=mpmath, extra_prec_multiplier=extra_prec_multiplier, extra_prec=extra_prec))
 
-  # The following function methods operate on mpmath number instances.
-  # The corresponding function names must be listed in
-  # numpy_with_mpmath._provides list.
+  # 以下函数方法作用于 mpmath 数值实例。
+  # 对应的函数名必须列在
+  # numpy_with_mpmath._provides 列表中。
 
   def square(self, x):
     return x * x
@@ -2046,9 +2046,9 @@ class numpy_with_mpmath:
   def sqrt(self, x):
     ctx = x.context
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in sqrt(+-inf+-infj) evaluation (see mpmath/mpmath#776).
-      # TODO(pearu): remove this function when mpmath 1.4 or newer
-      # will be the required test dependency.
+      # 规避 mpmath 1.3 中 sqrt(+-inf+-infj) 求值的缺陷（见 mpmath/mpmath#776）。
+      # TODO(pearu): 当 mpmath 1.4 或更新版本
+      # 成为必需的测试依赖时，移除这个函数。
       if ctx.isinf(x.imag):
         return ctx.make_mpc((ctx.inf._mpf_, x.imag._mpf_))
     return ctx.sqrt(x)
@@ -2059,9 +2059,9 @@ class numpy_with_mpmath:
   def log1p(self, x):
     ctx = x.context
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in log(+-inf+-infj) evaluation (see mpmath/mpmath#774).
-      # TODO(pearu): remove this function when mpmath 1.4 or newer
-      # will be the required test dependency.
+      # 规避 mpmath 1.3 中 log(+-inf+-infj) 求值的缺陷（见 mpmath/mpmath#774）。
+      # TODO(pearu): 当 mpmath 1.4 或更新版本
+      # 成为必需的测试依赖时，移除这个函数。
       if ctx.isinf(x.real) and ctx.isinf(x.imag):
         pi = ctx.pi
         if x.real > 0 and x.imag > 0:
@@ -2077,9 +2077,9 @@ class numpy_with_mpmath:
   def tan(self, x):
     ctx = x.context
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in tan(+-inf+-infj) evaluation (see mpmath/mpmath#781).
-      # TODO(pearu): remove this function when mpmath 1.4 or newer
-      # will be the required test dependency.
+      # 规避 mpmath 1.3 中 tan(+-inf+-infj) 求值的缺陷（见 mpmath/mpmath#781）。
+      # TODO(pearu): 当 mpmath 1.4 或更新版本
+      # 成为必需的测试依赖时，移除这个函数。
       if ctx.isinf(x.imag) and (ctx.isinf(x.real) or ctx.isfinite(x.real)):
         if x.imag > 0:
           return ctx.make_mpc((ctx.zero._mpf_, ctx.one._mpf_))
@@ -2091,9 +2091,9 @@ class numpy_with_mpmath:
   def tanh(self, x):
     ctx = x.context
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in tanh(+-inf+-infj) evaluation (see mpmath/mpmath#781).
-      # TODO(pearu): remove this function when mpmath 1.4 or newer
-      # will be the required test dependency.
+      # 规避 mpmath 1.3 中 tanh(+-inf+-infj) 求值的缺陷（见 mpmath/mpmath#781）。
+      # TODO(pearu): 当 mpmath 1.4 或更新版本
+      # 成为必需的测试依赖时，移除这个函数。
       if ctx.isinf(x.imag) and (ctx.isinf(x.real) or ctx.isfinite(x.real)):
         if x.imag > 0:
           return ctx.make_mpc((ctx.zero._mpf_, ctx.one._mpf_))
@@ -2114,10 +2114,10 @@ class numpy_with_mpmath:
   def arcsin(self, x):
     ctx = x.context
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in asin(+-inf+-infj) evaluation (see
-      # mpmath/mpmath#793).
-      # TODO(pearu): remove the if-block below when mpmath 1.4 or
-      # newer will be the required test dependency.
+      # 规避 mpmath 1.3 中 asin(+-inf+-infj) 求值的缺陷
+      # （见 mpmath/mpmath#793）。
+      # TODO(pearu): 当 mpmath 1.4 或
+      # 更新版本成为必需的测试依赖时，移除下面的 if 块。
       pi = ctx.pi
       inf = ctx.inf
       zero = ctx.zero
@@ -2129,10 +2129,10 @@ class numpy_with_mpmath:
       elif ctx.isinf(x.imag):
         return ctx.make_mpc((zero._mpf_, x.imag._mpf_))
 
-      # On branch cut, mpmath.mp.asin returns different value compared
-      # to mpmath.fp.asin and numpy.arcsin (see
-      # mpmath/mpmath#786). The following if-block ensures
-      # compatibility with numpy.arcsin.
+      # 在分支割线上，mpmath.mp.asin 返回的值与
+      # mpmath.fp.asin 和 numpy.arcsin 不同（见
+      # mpmath/mpmath#786）。下面的 if 块确保
+      # 与 numpy.arcsin 兼容。
       if x.real > 1 and x.imag == 0:
         return ctx.asin(x).conjugate()
 
@@ -2142,10 +2142,10 @@ class numpy_with_mpmath:
     ctx = x.context
 
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in acos(+-inf+-infj) evaluation (see
-      # mpmath/mpmath#793).
-      # TODO(pearu): remove the if-block below when mpmath 1.4 or
-      # newer will be the required test dependency.
+      # 规避 mpmath 1.3 中 acos(+-inf+-infj) 求值的缺陷
+      # （见 mpmath/mpmath#793）。
+      # TODO(pearu): 当 mpmath 1.4 或
+      # 更新版本成为必需的测试依赖时，移除下面的 if 块。
       pi = ctx.pi
       inf = ctx.inf
       zero = ctx.zero
@@ -2162,10 +2162,10 @@ class numpy_with_mpmath:
         sign_imag = -1 if x.imag < 0 else 1
         real = zero if x.real > 0 else pi
         return ctx.make_mpc((real._mpf_, (-sign_imag * inf)._mpf_))
-      # On branch cut, mpmath.mp.acos returns different value
-      # compared to mpmath.fp.acos and numpy.arccos. The
-      # following if-block ensures compatibility with
-      # numpy.arccos.
+      # 在分支割线上，mpmath.mp.acos 返回的值
+      # 与 mpmath.fp.acos 和 numpy.arccos 不同。
+      # 下面的 if 块确保与
+      # numpy.arccos 兼容。
       if x.imag == 0 and x.real > 1:
         return -ctx.acos(x)
 
@@ -2175,10 +2175,10 @@ class numpy_with_mpmath:
     ctx = x.context
 
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in asinh(+-inf+-infj) evaluation
-      # (see mpmath/mpmath#749).
-      # TODO(pearu): remove the if-block below when mpmath 1.4 or
-      # newer will be the required test dependency.
+      # 规避 mpmath 1.3 中 asinh(+-inf+-infj) 求值的缺陷
+      # （见 mpmath/mpmath#749）。
+      # TODO(pearu): 当 mpmath 1.4 或
+      # 更新版本成为必需的测试依赖时，移除下面的 if 块。
       pi = ctx.pi
       inf = ctx.inf
       zero = ctx.zero
@@ -2190,10 +2190,10 @@ class numpy_with_mpmath:
       elif ctx.isinf(x.real):
         return ctx.make_mpc((x.real._mpf_, zero._mpf_))
 
-      # On branch cut, mpmath.mp.asinh returns different value
-      # compared to mpmath.fp.asinh and numpy.arcsinh (see
-      # mpmath/mpmath#786).  The following if-block ensures
-      # compatibility with numpy.arcsinh.
+      # 在分支割线上，mpmath.mp.asinh 返回的值
+      # 与 mpmath.fp.asinh 和 numpy.arcsinh 不同（见
+      # mpmath/mpmath#786）。下面的 if 块确保
+      # 与 numpy.arcsinh 兼容。
       if x.real == 0 and x.imag < -1:
         return (-ctx.asinh(x)).conjugate()
     return ctx.asinh(x)
@@ -2202,8 +2202,8 @@ class numpy_with_mpmath:
     ctx = x.context
 
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in acosh(+-inf+-infj) evaluation
-      # (see mpmath/mpmath#749).
+      # 规避 mpmath 1.3 中 acosh(+-inf+-infj) 求值的缺陷
+      # （见 mpmath/mpmath#749）。
       pi = ctx.pi
       inf = ctx.inf
       zero = ctx.zero
@@ -2225,10 +2225,10 @@ class numpy_with_mpmath:
     ctx = x.context
 
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in atan(+-inf+-infj) evaluation
-      # (see mpmath/mpmath#775 with the fix).
-      # TODO(pearu): remove the if-block below when mpmath 1.4 or
-      # newer will be the required test dependency.
+      # 规避 mpmath 1.3 中 atan(+-inf+-infj) 求值的缺陷
+      # （见 mpmath/mpmath#775 中的修复）。
+      # TODO(pearu): 当 mpmath 1.4 或
+      # 更新版本成为必需的测试依赖时，移除下面的 if 块。
       pi = ctx.pi
       zero = ctx.zero
       if ctx.isinf(x.real) or ctx.isinf(x.imag):
@@ -2236,10 +2236,10 @@ class numpy_with_mpmath:
           return ctx.make_mpc(((-pi / 2)._mpf_, zero._mpf_))
         return ctx.make_mpc(((pi / 2)._mpf_, zero._mpf_))
 
-      # On branch cut, mpmath.mp.atan returns different value compared
-      # to mpmath.fp.atan and numpy.arctan (see mpmath/mpmath#865).
-      # The following if-block ensures compatibility with
-      # numpy.arctan.
+      # 在分支割线上，mpmath.mp.atan 返回的值与
+      # mpmath.fp.atan 和 numpy.arctan 不同（见 mpmath/mpmath#865）。
+      # 下面的 if 块确保与
+      # numpy.arctan 兼容。
       if x.real == 0 and x.imag < -1:
         return (-ctx.atan(x)).conjugate()
     return ctx.atan(x)
@@ -2248,10 +2248,10 @@ class numpy_with_mpmath:
     ctx = x.context
 
     if isinstance(x, ctx.mpc):
-      # Workaround mpmath 1.3 bug in atanh(+-inf+-infj) evaluation
-      # (see mpmath/mpmath#775 with the fix).
-      # TODO(pearu): remove the if-block below when mpmath 1.4 or
-      # newer will be the required test dependency.
+      # 规避 mpmath 1.3 中 atanh(+-inf+-infj) 求值的缺陷
+      # （见 mpmath/mpmath#775 中的修复）。
+      # TODO(pearu): 当 mpmath 1.4 或
+      # 更新版本成为必需的测试依赖时，移除下面的 if 块。
       pi = ctx.pi
       zero = ctx.zero
       if ctx.isinf(x.real) or ctx.isinf(x.imag):
@@ -2259,16 +2259,16 @@ class numpy_with_mpmath:
           return ctx.make_mpc((zero._mpf_, (-pi / 2)._mpf_))
         return ctx.make_mpc((zero._mpf_, (pi / 2)._mpf_))
 
-      # On branch cut, mpmath.mp.atanh returns different value
-      # compared to mpmath.fp.atanh and numpy.arctanh.  The following
-      # if-block ensures compatibility with numpy.arctanh.
+      # 在分支割线上，mpmath.mp.atanh 返回的值
+      # 与 mpmath.fp.atanh 和 numpy.arctanh 不同。下面的
+      # if 块确保与 numpy.atanh 兼容。
       if x.imag == 0 and x.real > 1:
         return ctx.atanh(x).conjugate()
     return ctx.atanh(x)
 
   def normalize(self, exact, reference, value):
-    """Normalize reference and value using precision defined by the
-    difference of exact and reference.
+    """使用由 exact 与 reference 之差所定义的精度，
+    来归一化 reference 与 value。
     """
     def worker(ctx, s, e, r, v):
       ss, sm, se, sbc = s._mpf_
@@ -2281,13 +2281,13 @@ class numpy_with_mpmath:
 
       me = min(se, ee, re, ve)
 
-      # transform mantissa parts to the same exponent base
+      # 把尾数部分转换到相同的指数基
       sm_e = sm << (se - me)
       em_e = em << (ee - me)
       rm_e = rm << (re - me)
       vm_e = vm << (ve - me)
 
-      # find matching higher and non-matching lower bits of e and r
+      # 找出 e 与 r 相匹配的高位比特和不相匹配的低位比特
       sm_b = bin(sm_e)[2:] if sm_e else ''
       em_b = bin(em_e)[2:] if em_e else ''
       rm_b = bin(rm_e)[2:] if rm_e else ''
@@ -2304,11 +2304,11 @@ class numpy_with_mpmath:
         c1 += 1
       c0 = m - c1
 
-      # truncate r and v mantissa
+      # 截断 r 与 v 的尾数
       rm_m = rm_e >> c0
       vm_m = vm_e >> c0
 
-      # normalized r and v
+      # 归一化后的 r 与 v
       nr = ctx.make_mpf((rs, rm_m, -c1, len(bin(rm_m)) - 2)) if rm_m else (-ctx.zero if rs else ctx.zero)
       nv = ctx.make_mpf((vs, vm_m, -c1, len(bin(vm_m)) - 2)) if vm_m else (-ctx.zero if vs else ctx.zero)
 
@@ -2323,12 +2323,12 @@ class numpy_with_mpmath:
     elif isinstance(exact, ctx.mpf):
       return worker(ctx, scale, exact, reference, value)
     else:
-      assert 0  # unreachable
+      assert 0  # 不可达
 
 
 
 def runtime_environment() -> str | None:
-  """Returns None, "bazel" or "pytest"."""
+  """返回 None、"bazel" 或 "pytest"。"""
   if sys.executable is None:
     return None
   elif "TEST_TMPDIR" in os.environ:

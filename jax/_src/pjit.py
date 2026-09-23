@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 jax.jit 的追踪、降级、编译与 C++ 快速分派路径，并保留
+# 已废弃的 jax.experimental.pjit.pjit 入口。
+#
+# 核心内容：PjitInfo/PjitParams 保存 jit 的静态属性、分片与布局信息；
+# _trace_for_jit/_infer_params 负责追踪并缓存 jaxpr；jit_p 作为同名原语，
+# 统一处理方法追踪规则、partial_eval/线性化/重物化/转置等变换规则以及 MLIR 降级；
+# 另含分片约束（with_sharding_constraint）、重分片（reshard）与自动/显式轴等工具。
 from __future__ import annotations
+
 
 from collections.abc import Callable, Sequence, Iterable
 import contextlib
@@ -92,15 +100,14 @@ PjitSharding = GSPMDSharding | UnspecifiedValue
 
 
 class PjitInfo(NamedTuple):
-  """Things that we know about a jit instance before it is called.
+  """在 jit 实例被调用之前，我们已经掌握的有关它的信息。
 
-  In other words, this structure contains arguments to jit()/pjit(),
-  preprocessed and validated.
+  换句话说，该结构保存的是 jit()/pjit() 的实参，且已经过预处理与校验。
   """
   fun_sourceinfo: str
   fun_signature: inspect.Signature | None
-  # Shardings, as specified by the user. These can either be UNSPECIFIED or they
-  # can be a tree (prefix) of shardings or None.
+  # 用户指定的分片。这些分片可以是 UNSPECIFIED，也可以是一棵分片树（前缀）
+  # 或 None。
   user_specified_in_shardings: bool
   in_shardings_treedef: PyTreeDef
   in_shardings_leaves: tuple[Any, ...]
@@ -118,10 +125,10 @@ class PjitInfo(NamedTuple):
   backend: str | None
   keep_unused: bool
   inline: bool | api.Inline
-  use_resource_env: bool  # False for jit, True for pjit
+  use_resource_env: bool  # jit 为 False，pjit 为 True
   compiler_options_kvs: tuple[tuple[str, Any], ...]
 
-  # Hash and compare PjitInfo by identity when used as a cache key.
+  # 用作缓存键时，按对象标识对 PjitInfo 做哈希与比较。
   def __hash__(self):
     return id(self)
 
@@ -154,7 +161,7 @@ def _run_python_pjit(p, args_flat, fun: Callable, args, kwargs):
     raise ValueError(msg) from None
   except dtypes.InvalidInputException as e:
     arg_names = [''] * len(args_flat) if p.arg_names is None else p.arg_names
-    # Run canonicalization again to figure out which arg failed.
+    # 再次执行规范化，以确定是哪个实参失败了。
     if p.params['jaxpr'].consts:
       raise TypeError(e.args[0]) from e
     else:
@@ -165,7 +172,7 @@ def _run_python_pjit(p, args_flat, fun: Callable, args, kwargs):
             raise dtypes.InvalidInputException(
                 f"Argument '{name}' of type {type(arg)} is not a valid JAX type.")
         except dtypes.InvalidInputException as _:
-          # Reraise as TypeError with the new message.
+          # 用新的错误信息以 TypeError 重新抛出。
           raise TypeError(
               f"Argument '{name}' of shape {aval.str_short()} of type"
               f' {type(arg)} is not a valid JAX type.') from e
@@ -174,8 +181,8 @@ def _run_python_pjit(p, args_flat, fun: Callable, args, kwargs):
     if getattr(fun, '_apply_primitive', False):
       raise FloatingPointError(
           f"invalid value ({e.ty}) encountered in {fun.__qualname__}") from None
-    api_util.maybe_recursive_nan_check(e, fun, args, kwargs)  # should always raise.
-    raise RuntimeError("Internal error") from e  # fall-back error to be safe.
+    api_util.maybe_recursive_nan_check(e, fun, args, kwargs)  # 应当总是抛出异常。
+    raise RuntimeError("Internal error") from e  # 为保险起见的回退错误。
 
   outs = tree_unflatten(p.out_tree, out_flat)
   return (outs, out_flat, p.out_tree, args_flat,
@@ -194,10 +201,10 @@ def _get_fastpath_data(
       executable is None
       or not isinstance(executable, pxla.MeshExecutable)
       or not isinstance(executable.unsafe_call, pxla.ExecuteReplicated)
-      # No effects in computation
+      # 计算中没有效果
       or executable.unsafe_call.ordered_effects
       or executable.unsafe_call.has_unordered_effects
-      # no ref state effects
+      # 没有 ref 状态效果
       or any(isinstance(e, RefEffect) for e in effects)
       or _need_to_rebuild_with_fdo(pgle_profiler)
       or config.no_execution.value
@@ -230,17 +237,17 @@ def _get_fastpath_data(
 def make_jit_cpp_cache(capacity):
   return _jax.PjitFunctionCache(capacity=capacity)
 
-# The entries are doubled here from the default 4096 because _pjit_call_impl
-# also has a cpp dispatch path and that would double the number of entries in
-# the global shared cache.
-# This cache is only used for jit's with only fun. For example: jax.jit(f)
+# 这里的条目数比默认的 4096 翻了一倍，因为 `_pjit_call_impl` 也有一条
+# cpp 分派路径，会让全局共享缓存中的条目数翻倍。
+# 全局共享缓存中的条目数。
+# 此缓存只用于仅传入 fun 的 jit，例如 jax.jit(f)。
 _cpp_pjit_cache_fun_only = make_jit_cpp_cache(8192)
 
-# This cache is used for jit where extra arguments are defined other than the
-# fun. For example: jax.jit(f, donate_argnums=...) OR
-# jax.jit(f, out_shardings=...), etc. We don't use the same cache because the
-# capacity might get full very fast because of all the jitted function in JAX
-# which might evict train_step for example.
+# 此缓存用于除 fun 之外还定义了其他参数的 jit。例如
+# jax.jit(f, donate_argnums=...) 或者
+# jax.jit(f, out_shardings=...) 等等。我们不共用同一个缓存，因为
+# JAX 中所有被 jit 的函数可能很快把容量占满，
+# 例如可能逐出 train_step。
 _cpp_pjit_cache_explicit_attributes = make_jit_cpp_cache(8192)
 
 
@@ -255,8 +262,8 @@ def _cpp_pjit(fun: Callable, jit_info: PjitInfo):
 
   @api_boundary
   def cache_miss(*args, **kwargs):
-    # args do not include the const args
-    # See https://docs.jax.dev/en/latest/internals/constants.html.
+    # args 不包含常量实参
+    # 参见 https://docs.jax.dev/en/latest/internals/constants.html。
     if config.no_tracing.value:
       raise RuntimeError(f"re-tracing function {jit_info.fun_sourceinfo} for "
                          "`jit`, but 'no_tracing' is set")
@@ -367,10 +374,10 @@ def _parse_jit_arguments(fun: Callable, *, in_shardings: Any,
                          backend: str | None, inline: bool | api.Inline,
                          compiler_options: dict[str, Any] | None,
                          use_resource_env: bool) -> PjitInfo:
-  """Parses the arguments to jit/pjit.
+  """解析 jit/pjit 的实参。
 
-  Performs any preprocessing and validation of the arguments that we can do
-  ahead of time before the jit()-ed function is invoked.
+  在调用被 jit 的函数之前，尽可能提前完成所有可做的实参
+  预处理与校验。
   """
   check_callable(fun)
 
@@ -394,11 +401,11 @@ def _parse_jit_arguments(fun: Callable, *, in_shardings: Any,
                        'out_shardings should not be specified.')
 
   if isinstance(in_shardings, list):
-    # To be a tree prefix of the positional args tuple, in_axes can never be a
-    # list: if in_axes is not a leaf, it must be a tuple of trees. However,
-    # in cases like these users expect tuples and lists to be treated
-    # essentially interchangeably, so we canonicalize lists to tuples here
-    # rather than raising an error. https://github.com/jax-ml/jax/issues/2367
+    # 作为位置实参元组的树前缀，in_axes 不可能是列表：
+    # 如果 in_axes 不是叶子，它必须是树的元组。不过在类似这样的场景中，
+    # 用户期望元组和列表基本可以互换使用，
+    # 因此这里把列表规范化为元组，
+    # 而不是抛出错误。参见 https://github.com/jax-ml/jax/issues/2367
     in_shardings = tuple(in_shardings)
 
   in_layouts, in_shardings = _split_layout_and_sharding(in_shardings)
@@ -457,7 +464,7 @@ def make_jit(fun: Callable,
              inline: bool | api.Inline,
              compiler_options: dict[str, Any] | None,
              use_resource_env: bool) -> Any:
-  """jit() and pjit() are thin wrappers around this function."""
+  """jit() 和 pjit() 都只是对此函数的轻量包装器。"""
   jit_info = _parse_jit_arguments(
         fun, in_shardings=in_shardings, out_shardings=out_shardings,
         static_argnums=static_argnums, static_argnames=static_argnames,
@@ -469,16 +476,16 @@ def make_jit(fun: Callable,
 
 
 class PjitParams(NamedTuple):
-  # Only jaxpr constants, we can't keep other arguments alive. These go as
-  # first arguments for `params['jaxpr']`.
-  consts: list[ArrayLike]  # Corresponding to jaxpr.constvars
-  # Everything we need to trace, lower, and compile the jit function; passed
-  # to `pjit_call_impl_python`, along with the `args_flat`
+  # 只保留 jaxpr 常量，其他实参我们无法保活。这些常量会作为
+  # `params['jaxpr']` 的首批实参。
+  consts: list[ArrayLike]  # 对应 jaxpr.constvars
+  # 追踪、降级并编译该 jit 函数所需的全部内容；会连同 `args_flat`
+  # 一起传给 `pjit_call_impl_python`
   params: dict[str, Any]
-  in_avals: tuple[core.AbstractValue, ...]  # Not including the const_args
-  in_tree: PyTreeDef  # Not including the const_args
+  in_avals: tuple[core.AbstractValue, ...]  # 不包含 const_args
+  in_tree: PyTreeDef  # 不包含 const_args
   out_tree: PyTreeDef
-  arg_names: tuple[str, ...]  # Not including the const_args
+  arg_names: tuple[str, ...]  # 不包含 const_args
 
 
 def _trace_for_jit(
@@ -505,9 +512,9 @@ def _trace_for_jit(
   else:
     donated_invars = (False,) * len(avals_ft)
 
-  # If backend or device is set as an arg on jit, then resolve them to
-  # in_shardings and out_shardings as if user passed in in_shardings
-  # and out_shardings.
+  # 如果 jit 的参数中设置了 backend 或 device，就把它们解析为
+  # in_shardings 和 out_shardings，如同用户显式传入了 in_shardings
+  # 和 out_shardings 一样。
   device_or_backend_set = bool(ji.backend or ji.device)
   if device_or_backend_set:
     sharding = _create_sharding_with_device_backend(ji.device, ji.backend)
@@ -549,7 +556,7 @@ def _trace_for_jit(
       jaxpr, out_avals = pe.trace_to_jaxpr(fun, avals_ft, dbg)
 
   if config.debug_key_reuse.value:
-    # Import here to avoid circular imports
+    # 在此处导入以避免循环导入
     from jax.experimental.key_reuse._core import check_key_reuse_jaxpr  # pyrefly: ignore[missing-import]
     check_key_reuse_jaxpr(jaxpr)
 
@@ -557,8 +564,8 @@ def _trace_for_jit(
                        for path in out_avals.paths)
   jaxpr._debug_info = jaxpr.debug_info._replace(result_paths=result_paths)
 
-  # TODO(mattjj,yashkatariya): if we take the 'true' path then we *must* fall
-  # off the C++ dispatch fast path for correctness. Ensure that happens.
+  # TODO(mattjj,yashkatariya)：如果走 'true' 路径，为了正确性我们*必须*
+  # 避开 C++ 分派快速路径。请确保这一点。
   if any(isinstance(c, core.Tracer) for c in jaxpr.consts):
     jaxpr, consts = pe.separate_consts(jaxpr)
   else:
@@ -618,9 +625,9 @@ def get_ctx_mesh(use_resource_env):
       return conc_mesh
     else:
       abs_mesh = mesh_lib.get_abstract_mesh()
-      # TODO(yashkatariya): Make top-level use_abstract_mesh work with Auto mode
-      # too. But there are failures in user code so restricting it to Explicit
-      # mode for now.
+      # TODO(yashkatariya)：让顶层 use_abstract_mesh 也支持 Auto 模式。
+      # 但用户代码中存在失败案例，因此暂时限制为 Explicit 模式。
+      # 目前仅限 Explicit 模式。
       if not abs_mesh.empty and abs_mesh._any_axis_explicit:
         return abs_mesh
       return conc_mesh
@@ -681,15 +688,15 @@ def _infer_input_type(fun: Callable, dbg_fn: Callable[[], core.DebugInfo],
 class JitWrapped(stages.Wrapped):
 
   def eval_shape(self, *args, **kwargs):
-    """See ``jax.eval_shape``."""
+    """参见 ``jax.eval_shape``。"""
     raise NotImplementedError
 
   def trace(self, *args, **kwargs) -> stages.Traced:
     raise NotImplementedError
 
 
-# in_shardings and out_shardings can't be None as the default value
-# because `None` means that the input is fully replicated.
+# in_shardings 和 out_shardings 的默认值不能是 None，
+# 因为 `None` 表示输入被完全复制。
 @partial(api_boundary, repro_api_name="pjit.pjit")
 def pjit(
     fun: Callable,
@@ -705,15 +712,13 @@ def pjit(
     inline: bool = False,
     compiler_options: dict[str, Any] | None = None,
 ) -> JitWrapped:
-  """`jax.experimental.pjit.pjit` has been deprecated. Please use `jax.jit`."""
+  """`jax.experimental.pjit.pjit` 已废弃。请使用 `jax.jit`。"""
   return make_jit(
       fun, in_shardings=in_shardings, out_shardings=out_shardings,
       static_argnums=static_argnums, static_argnames=static_argnames,
       donate_argnums=donate_argnums, donate_argnames=donate_argnames,
       keep_unused=keep_unused, device=device, backend=backend, inline=inline,
       compiler_options=compiler_options, use_resource_env=True)
-
-
 def hashable_pytree(pytree):
   vals, treedef = tree_flatten(pytree)
   vals = tuple(vals)
@@ -761,7 +766,7 @@ def _process_in_axis_resources(in_shardings_treedef, in_shardings_leaves,
     in_tree, _ = treedef_children(in_tree)
 
   orig_in_shardings = tree_unflatten(in_shardings_treedef, in_shardings_leaves)
-  # Only do this if original in_shardings are unspecified.
+  # 仅在原始 in_shardings 未指定时才这样做。
   if isinstance(orig_in_shardings, UnspecifiedValue):
     in_shardings_flat = (orig_in_shardings,) * len(in_avals)
   else:
@@ -820,7 +825,7 @@ class IgnoreKey:
   def __hash__(self):
     return hash(self.__class__)
   def __eq__(self, other):
-    return isinstance(other, IgnoreKey)  # ignore self.val!
+    return isinstance(other, IgnoreKey)  # 忽略 self.val！
 
 
 def pjit_check_aval_sharding(
@@ -847,7 +852,7 @@ def pjit_check_aval_sharding(
 
     if not allow_uneven_sharding:
       try:
-        s.shard_shape(aval.shape)  # will check for divisibility
+        s.shard_shape(aval.shape)  # 会检查能否整除
       except IndivisibleError as e:
         print(source_info_util.summarize(source_info_util.current()))
         raise IndivisibleError(
@@ -870,7 +875,7 @@ def check_aval_layout_compatibility(
           f'annotation {l}: {e}')
 
 
-# -------------------- pjit rules --------------------
+# -------------------- pjit 规则 --------------------
 
 jit_p = core.Primitive("jit")
 jit_p.is_effectful = lambda params: bool(params['jaxpr'].effects)
@@ -918,10 +923,10 @@ def _lojax_expand_params(
 
 def _resolve_in_layouts(args, jit_in_layouts, resolved_in_shardings,
                         in_avals) -> Sequence[Layout | AutoLayoutSingleton | None]:
-  # If device or backend is set, return the default layout. This is because you
-  # can pass arrays on cpu (with untiled layouts) to jit with backend='tpu'
-  # which causes error checks to fail. Returning the default layout allows
-  # this to exist. It's the same for handling shardings.
+  # 如果设置了 device 或 backend，就返回默认布局。这是因为你可以把 cpu 上的数组
+  # （带未分块布局）传给 backend='tpu' 的 jit，
+  # 而这会让错误检查失败。返回默认布局可以让这种用法成立。
+  # 分片的处理方式也是如此。
   if pxla.check_device_backend_on_shardings(resolved_in_shardings):
     return (None,) * len(jit_in_layouts)
 
@@ -929,10 +934,10 @@ def _resolve_in_layouts(args, jit_in_layouts, resolved_in_shardings,
   for arg, jit_in_l, rs, aval in safe_zip(
       args, jit_in_layouts, resolved_in_shardings, in_avals):
     committed = arg.committed
-    # `arg_layout` is only used for checking purposes in the `else` branch
-    # below. We cannot replace default layout with None to raise nicer errors.
-    # `dispatch_arg_layout` replaces default layouts with `None` to simplify
-    # dispatch and lowering logic downstream.
+    # 在下面的 `else` 分支中，`arg_layout` 只用于检查目的。
+    # 为了给出更友好的报错，我们不能把默认布局替换为 None。
+    # `dispatch_arg_layout` 会把默认布局替换为 `None`，以简化下游的
+    # 分派与降级逻辑。
     if arg.format is not None:
       arg_layout = arg.format.layout
       dispatch_arg_layout = (None if pxla.is_default_layout(arg_layout, rs, aval)
@@ -948,8 +953,8 @@ def _resolve_in_layouts(args, jit_in_layouts, resolved_in_shardings,
       else:
         resolved_in_layouts.append(None)
     else:
-      # arg_layout can be None because some backends don't implement the
-      # required layout methods. Hence `arr.format` can return
+      # arg_layout 可能为 None，因为有些后端没有实现
+      # 所需的布局方法。因此 `arr.format` 可能返回
       # `Format(None, sharding)`
       if (committed
           and not isinstance(rs, UnspecifiedValue)
@@ -1001,18 +1006,18 @@ def finalize_arg_sharding(arg_s, committed):
 
 def _resolve_in_shardings(args, pjit_in_shardings: Sequence[PjitSharding]
                           ) -> Sequence[PjitSharding]:
-  # If True, means that device or backend is set by the user on pjit and it
-  # has the same semantics as device_put i.e. doesn't matter which device the
-  # arg is on, reshard it to the device mentioned. So don't do any of the
-  # checks and just return the pjit_in_shardings directly. `shard_args` will
-  # handle the resharding.
+  # 若为 True，表示用户在 pjit 上设置了 device 或 backend，其语义与
+  # device_put 相同，即无论实参位于哪个设备上，
+  # 都把它重分片到指定的设备。因此不做任何检查，
+  # 直接返回 pjit_in_shardings。重分片会由
+  # `shard_args` 处理。
   if pxla.check_device_backend_on_shardings(pjit_in_shardings):
     return pjit_in_shardings
 
   resolved_in_shardings: list[PjitSharding] = []
   for i, (arg, pjit_in_s) in enumerate(zip(args, pjit_in_shardings)):
-    # arg sharding can be None in case of ShapeDtypeStruct. jax.Array does
-    # not allow None as the sharding.
+    # 对于 ShapeDtypeStruct，实参的分片可以为 None。jax.Array
+    # 不允许分片为 None。
     arg_s, committed = ((arg.sharding, arg.committed) if arg.sharding is not None
                         else (UNSPECIFIED, False))
     if isinstance(arg_s, NamedSharding) and arg_s.mesh.empty:
@@ -1033,9 +1038,9 @@ def _resolve_in_shardings(args, pjit_in_shardings: Sequence[PjitSharding]
             '`jax.make_array_from_callback(...) to create a `jax.Array` which '
             f'you can pass to jit. Got arg type: {arg.aval}')
       if not isinstance(arg_s, UnspecifiedValue) and arg_s._is_concrete:
-        # jax.jit does not allow resharding across different memory kinds even
-        # if the argument is uncommitted. Use jax.device_put for those cases,
-        # either outside or inside jax.jit.
+        # 即使实参未提交，jax.jit 也不允许跨不同内存类型进行重分片。
+        # 这类情况请使用 jax.device_put，无论是在
+        # jax.jit 外部还是内部。
         if pjit_in_s.memory_kind != arg_s.memory_kind:
           raise ValueError(
               'Memory kinds passed to jax.jit does not match memory kind on the'
@@ -1096,8 +1101,8 @@ def create_meta_ty(aval, arg_sharding, arg_format, arg_committed, is_np_array):
   return MetaTy(aval, arg_sharding, arg_format, arg_committed, is_np_array)
 
 def convert_to_metaty(arg):
-  # TODO(yashkatariya): Remove this Tracer special case after
-  # getattr(Tracer, 'sharding') is fast.
+  # TODO(yashkatariya)：等 getattr(Tracer, 'sharding') 变快之后，
+  # 再移除这个 Tracer 特例。
   if isinstance(arg, core.Tracer):
     return create_meta_ty(arg.aval, None, None, True, False)
   aval = core.shaped_abstractify(arg)
@@ -1126,16 +1131,16 @@ def _pjit_call_impl_python(
           config.pgle_aggregation_percentile.value)
       _pgle_profiler_dict[compilation_target_key] = pgle_profiler
 
-    # The method below will return FDO profile when module was profiled
-    # config.jax_pgle_profiling_runs amount of times, otherwise the result will
-    # be None.
+    # 下面的方法会在模块被剖析 config.jax_pgle_profiling_runs 次之后
+    # 返回 FDO profile，否则结果为 None。
+    # 即结果为 None。
     fdo_profile = pgle_profiler.consume_fdo_profile()
     if fdo_profile is not None:
       pgle_compile_options['fdo_profile'] = fdo_profile
 
   compiler_options_kvs = compiler_options_kvs + tuple(pgle_compile_options.items())
-  # Passing mutable PGLE profile here since it should be extracted by JAXPR to
-  # initialize the fdo_profile compile option.
+  # 这里传入可变的 PGLE profile，因为它需要被 JAXPR 提取，
+  # 以初始化 fdo_profile 编译选项。
   arg_types = map(convert_to_metaty, args)
   computation = _resolve_and_lower(
       arg_types, jaxpr=jaxpr, in_shardings=in_shardings,
@@ -1151,7 +1156,7 @@ def _pjit_call_impl_python(
   sharded_const_args = compiled.shard_const_args(computation.const_args)
 
   if config.distributed_debug.value:
-    # Defensively only perform fingerprint logic if debug logging is enabled
+    # 出于防御考虑，仅在启用调试日志时才执行指纹相关逻辑
     fingerprint = None
     if hasattr(compiled.runtime_executable(), "fingerprint"):
       fingerprint = compiled.runtime_executable().fingerprint
@@ -1169,12 +1174,12 @@ def _pjit_call_impl_python(
 def _get_jaxpr_as_fun(jaxpr, in_shardings, out_shardings, in_layouts,
                       out_layouts, donated_invars, ctx_mesh, name,
                       keep_unused, inline, compiler_options_kvs):
-  # The input jaxpr to `_get_jaxpr_as_fun` is under a weakref_lru_cache so
-  # returning `core.jaxpr_as_fun(jaxpr)` directly creates a strong reference to
-  # the jaxpr defeating the purpose of weakref_lru_cache. So return a function
-  # that closes over a weakrefed jaxpr and gets called inside that function.
-  # This way there won't be a strong reference to the jaxpr from the output
-  # function.
+  # 传给 `_get_jaxpr_as_fun` 的输入 jaxpr 处于 weakref_lru_cache 之下，
+  # 因此直接返回 `core.jaxpr_as_fun(jaxpr)` 会对该 jaxpr 产生强引用，
+  # 从而违背 weakref_lru_cache 的初衷。所以要返回一个函数，
+  # 它闭包持有弱引用的 jaxpr，并在该函数内部被调用。
+  # 这样从输出函数一侧就不会对 jaxpr 保持强引用。
+  # 对 jaxpr 产生强引用。
   jaxpr = weakref.ref(jaxpr)
   return lambda *args: core.jaxpr_as_fun(jaxpr())(*args)
 
@@ -1184,9 +1189,9 @@ def _pjit_call_impl(*args, jaxpr: core.Jaxpr,
                     donated_invars, ctx_mesh, name, keep_unused, inline,
                     compiler_options_kvs):
   def call_impl_cache_miss(*args_, **kwargs_):
-    # args_ do not include the const args
-    # See https://docs.jax.dev/en/latest/internals/constants.html.
-    # TODO(necula): remove num_const_args when fixing the C++ path
+    # args_ 不包含常量实参
+    # 参见 https://docs.jax.dev/en/latest/internals/constants.html。
+    # TODO(necula)：修复 C++ 路径时移除 num_const_args
     out_flat, compiled, pgle_profiler, const_args = _pjit_call_impl_python(
         *args, jaxpr=jaxpr, in_shardings=in_shardings,
         out_shardings=out_shardings, in_layouts=in_layouts,
@@ -1218,7 +1223,7 @@ def _pjit_call_impl(*args, jaxpr: core.Jaxpr,
 
 jit_p.def_impl(_pjit_call_impl)
 
-# This cache is important for python dispatch performance.
+# 这个缓存对 Python 分派性能很重要。
 @weakref_lru_cache
 def _pjit_lower(
     jaxpr: core.Jaxpr,
@@ -1253,8 +1258,8 @@ def pjit_staging_rule(trace, source_info, *args, **params):
         f' compiler_options={dict(params["compiler_options_kvs"])} specified on'
         f' a nested jit with name: {params["name"]} and source info:'
         f' {source_info_util.summarize(source_info)}')
-  # If we're inlining, no need to compute forwarding information; the inlined
-  # computation will in effect forward things.
+  # 如果正在内联，就不需要计算转发信息；
+  # 内联后的计算实际上会自动转发。
   if (params["inline"] is api.Inline.JAX_EARLY and
       all(isinstance(i, UnspecifiedValue) for i in params["in_shardings"]) and
       all(isinstance(o, UnspecifiedValue) for o in params["out_shardings"]) and
@@ -1285,7 +1290,7 @@ pe.custom_staging_rules[jit_p] = pjit_staging_rule
 
 def pjit_forwarding_rule(eqn):
   return [None] * len(eqn.outvars), eqn
-# TODO(mattjj): Remove pjit_forwarding_rule and also in staging rule.
+# TODO(mattjj)：移除 pjit_forwarding_rule，以及 staging rule 中的相关部分。
 pe.forwarding_rules[jit_p] = pjit_forwarding_rule
 
 
@@ -1332,10 +1337,10 @@ def _pjit_lower_jaxpr_to_fun(
                    for i in in_shardings_expanded]
   result_shardings = [None if isinstance(o, UnspecifiedValue) else o
                       for o in out_shardings]
-  # TODO(b/228598865): non-top-level functions cannot have shardings set
-  # directly on the inputs or outputs because they are lost during MLIR->HLO
-  # conversion. using_sharding_annotation=False means we add an identity
-  # operation instead.
+  # TODO(b/228598865)：非顶层函数无法直接在输入或输出上设置分片，
+  # 因为这些分片会在 MLIR->HLO 转换过程中丢失。
+  # using_sharding_annotation=False 表示我们改为添加一个
+  # 恒等操作。
   func = mlir.lower_jaxpr_to_fun(
       mod_ctx, name, jaxpr, effects,
       num_const_args=len(const_args), in_avals=in_avals,
@@ -1408,9 +1413,9 @@ def _pjit_lowering(ctx: mlir.LoweringRuleContext, *args, name: str,
     ctx.set_tokens_out(tokens_out)
   return out_nodes
 
-# TODO(phawkins): this is marked uncacheable because it has its own cache and
-# because the cache breaks jaxpr metadata like source locations. We should fix
-# the metadata problem and consolidate the caches.
+# TODO(phawkins)：这里标记为不可缓存，是因为它有自己的缓存，
+# 而且该缓存会破坏源码位置等 jaxpr 元数据。我们应当修复
+# 元数据问题并合并这些缓存。
 mlir.register_lowering(jit_p, _pjit_lowering, cacheable=False)
 
 def const_args_shardings(const_args: Sequence[Array | np.ndarray]) -> Sequence[PjitSharding]:
@@ -1444,7 +1449,7 @@ def _pjit_batcher(axis_data, vals_in,
                                  aval)
       if axis_out is not None else o
       for axis_out, o, aval in zip(axes_out, out_shardings, new_jaxpr.out_avals))
-  # TODO(yashkatariya): Figure out layouts should change under vmap.
+  # TODO(yashkatariya): 弄清在 vmap 下 `layouts` 应该如何变化。
   if not (all(l is None for l in in_layouts) and
           all(l is None for l in out_layouts)):
     raise NotImplementedError(
@@ -1475,7 +1480,7 @@ def _pjit_batcher_for_sharding(
   if isinstance(s, UnspecifiedValue):
     return s
   if not hasattr(aval, 'ndim'):
-    # TODO(mattjj,yashkatariya): implement this?
+    # TODO(mattjj,yashkatariya): 要实现这个吗？
     raise NotImplementedError(
         f'vmap-of-jit with a specified sharding {s} on a value of non-array '
         f'type {aval} is not supported; only unspecified shardings are '
@@ -1563,9 +1568,9 @@ def _pjit_linearize(is_vjp, nzs, *primals_in, jaxpr, in_shardings, out_shardings
   def keep_where(l, should_keep):
     return tuple(x for x, keep in zip(l, should_keep) if keep)
 
-  # Input-to-output forwarding. Forwarded ures were already pruned by
-  # linearize_jaxpr (hence the assert); sres keep their tree structure either
-  # way, so we can forward them here and re-duplicate after the bind below.
+  # 输入到输出转发。被转发的 ures 已经由 linearize_jaxpr 剪除（因此有那个
+  # assert）；而 sres 无论哪种情况都会保留自身的树结构，所以我们可以在此转发
+  # 它们，并在下方 bind 之后再重新复制一份。
   in_fwd = pe._jaxpr_forwarding(fwd_jaxpr)
   in_fwd_primal, in_fwd_ures, in_fwd_sres = \
       split_list(in_fwd, [len(primal_out_avals), len(ures_out_avals)])
@@ -1583,10 +1588,10 @@ def _pjit_linearize(is_vjp, nzs, *primals_in, jaxpr, in_shardings, out_shardings
   num_kept_residuals = sum(kept_res)
   del keep, kept_res, primal_out_avals
 
-  # Output-to-output forwarding. A residual can duplicate a primal output or
-  # an earlier residual (e.g. structured residuals can carry the same value in
-  # multiple tree positions), so return one copy of each and re-duplicate
-  # after the bind below.
+  # 输出到输出转发。一个残差可能只是对某个原始输出的重复，
+  # 也可能是对更早某个残差的重复（例如结构化残差可能在多个树位置
+  # 上携带同一个值），因此我们对每个值只返回一份副本，
+  # 并在下方 bind 之后再重新复制。
   num_primals_out = len(fwd_jaxpr.out_avals) - num_kept_residuals
   fwd_jaxpr, out_fwd = pe.dedup_jaxpr_outputs(fwd_jaxpr, num_primals_out)
   keep = [f is None for f in out_fwd]
@@ -1686,7 +1691,7 @@ def _pjit_partial_eval(trace: pe.JaxprTrace,
   unknown_outs = tuple(unknown_outs)
   known_outs = tuple(not uk for uk in unknown_outs)
 
-  # out_shardings and out_layouts for residual values output by known_jaxpr
+  # known_jaxpr 输出的残差值所用的 out_shardings 与 out_layouts
   def keep_where(l, should_keep):
     return tuple(x for x, keep in zip(l, should_keep) if keep)
 
@@ -1695,7 +1700,7 @@ def _pjit_partial_eval(trace: pe.JaxprTrace,
   known_out_layouts = (keep_where(out_layouts, known_outs)
                        + (None,) * len(res_out_avals))
 
-  # Input-to-output forwarding: compute which outputs are just forwarded inputs.
+  # 输入到输出转发：计算哪些输出只是被转发的输入。
   num_out_primals = len(known_jaxpr.out_avals) - len(res_out_avals)
   in_fwd: list[int | None] = pe._jaxpr_forwarding(known_jaxpr)
   in_fwd_primal, in_fwd_res_ = split_list(in_fwd, [num_out_primals])
@@ -1707,21 +1712,21 @@ def _pjit_partial_eval(trace: pe.JaxprTrace,
           keep_where(out_layouts, known_outs), in_fwd_primal)
   ] + in_fwd_res_
   del in_fwd_primal, in_fwd_res_
-  # Prune jaxpr outputs and out_shardings by removing the input-forwards.
+  # 通过移除输入转发项来剪除 jaxpr 的输出与 out_shardings。
   keep = [f is None for f in in_fwd]
   known_jaxpr = pe.prune_closed_jaxpr_outputs(known_jaxpr, keep)
   known_out_shardings = keep_where(known_out_shardings, keep)
   known_out_layouts = keep_where(known_out_layouts, keep)
-  # Update num_out_primals to reflect pruning.
+  # 更新 num_out_primals 以反映剪除结果。
   kept_primals, kept_res = split_list(keep, [num_out_primals])
   num_out_primals = sum(kept_primals)
   del keep, kept_primals, kept_res
 
-  # Output-to-output forwarding: compute which residuals are just primal outputs
+  # 输出到输出转发：计算哪些残差只是原始输出
   out_vars, res_vars = split_list(known_jaxpr.outvars, [num_out_primals])
   idx_map = {id(v): i for i, v in enumerate(out_vars)}
   out_fwd = [None] * num_out_primals + [idx_map.get(id(v)) for v in res_vars]
-  # Prune jaxpr outputs and out_shardings by removing forwarded residuals.
+  # 通过移除被转发的残差来剪除 jaxpr 的输出与 out_shardings。
   keep = [f is None for f in out_fwd]
   known_jaxpr = pe.prune_closed_jaxpr_outputs(known_jaxpr, keep)
   known_out_shardings = keep_where(known_out_shardings, keep)
@@ -1740,12 +1745,12 @@ def _pjit_partial_eval(trace: pe.JaxprTrace,
   assert len(known_params['out_shardings']) == len(known_params['jaxpr'].out_avals)
   assert len(known_params['out_layouts']) == len(known_params['jaxpr'].out_avals)
 
-  # Bind known things to pjit_p.
+  # 把已知部分绑定到 pjit_p。
   known_inputs = [pv.get_known() for pv in in_pvals if pv.is_known()]
   all_known_outs = jit_p.bind(*known_inputs, **known_params)
-  # Add back in the output fwds.
+  # 把输出转发项加回来。
   all_known_outs = subs_list(out_fwd, all_known_outs, all_known_outs)
-  # Add back in the input fwds.
+  # 把输入转发项加回来。
   all_known_outs = subs_list(in_fwd, known_inputs, all_known_outs)
 
   known_out_vals, residual_vals = split_list(
@@ -1756,14 +1761,14 @@ def _pjit_partial_eval(trace: pe.JaxprTrace,
   assert next(residual_vals_, None) is None
   residual_tracers = map(trace.new_instantiated_const, residual_vals)
 
-  # The convention of partial_eval_jaxpr_nounits is to place residual binders at
-  # the front of the jaxpr produced, so we move them to the back since both the
-  # jaxpr equation built below and the pjit transpose rule assume a
-  # residual-inputs-last convention.
+  # partial_eval_jaxpr_nounits 的约定是把残差绑定器放在所生成
+  # jaxpr 的前部；这里我们把它们移到后部，因为下面构建的 jaxpr 方程
+  # 以及 pjit 的转置规则都假定
+  # “残差输入放在最后”这一约定。
   unknown_jaxpr = pe.move_binders_to_back(
       unknown_jaxpr, [True] * len(residual_vals) + [False] * sum(unknown_ins))
 
-  # Set up staged-out 'unknown' eqn
+  # 建立暂存输出的 'unknown' 方程
   unknown_in_shardings = (keep_where(in_shardings, unknown_ins)
                           + (UNSPECIFIED,) * len(residual_tracers))
   unknown_in_layouts = (keep_where(in_layouts, unknown_ins)
@@ -1808,7 +1813,7 @@ def _pjit_partial_eval_custom_params_updater(
     kept_outs_known: Sequence[bool], kept_outs_staged: Sequence[bool],
     num_res_out: int, num_res_in: int, params_known: dict, params_staged: dict
   ) -> tuple[dict, dict]:
-  # prune inputs to jaxpr_known according to unks_in
+  # 根据 unks_in 剪除 jaxpr_known 的输入
   donated_invars_known, _ = pe.partition_list(unks_in, params_known['donated_invars'])
   in_shardings_known, _ = pe.partition_list(unks_in, params_known['in_shardings'])
   _, out_shardings_known = pe.partition_list(kept_outs_known, params_known['out_shardings'])
@@ -1827,7 +1832,7 @@ def _pjit_partial_eval_custom_params_updater(
   assert len(new_params_known['in_layouts']) == len(params_known['jaxpr'].in_avals)
   assert len(new_params_known['out_layouts']) == len(params_known['jaxpr'].out_avals)
 
-  # added num_res new inputs to jaxpr_staged, and pruning according to inst_in
+  # 给 jaxpr_staged 增加了 num_res 个新输入，并根据 inst_in 进行剪除
   _, donated_invars_staged = pe.partition_list(inst_in, params_staged['donated_invars'])
   donated_invars_staged = [False] * num_res_in + donated_invars_staged
   _, in_shardings_staged = pe.partition_list(inst_in, params_staged['in_shardings'])
@@ -1893,10 +1898,10 @@ def _pjit_transpose_fancy(
     try:
       ad.backward_pass3(jaxpr, False, jaxpr.consts, args, cts_in)
     except (FloatingPointError, ZeroDivisionError) as e2:
-      raise e2 from None  # great
+      raise e2 from None  # 很好
     else:
-      # If control reaches this line, we got a NaN on the output of `compiled`
-      # but not `fun.call_wrapped` on the same arguments. Let's tell the user.
+      # 如果控制流到达这一行，说明在同一组参数上 `compiled` 的输出出现了 NaN，
+      # 而 `fun.call_wrapped` 没有。这里就告知用户。
       api_util._raise_no_nan_in_deoptimized(e)
 
   # pyrefly: ignore[unbound-name]  # pyrefly#2219
@@ -1925,7 +1930,7 @@ ad.fancy_transposes[jit_p] = _pjit_transpose_fancy
 def _dce_jaxpr_pjit(
     jaxpr: core.Jaxpr, used_outputs: tuple[bool, ...]
 ) -> tuple[core.Jaxpr, list[bool]]:
-  # dce_jaxpr preserves attached consts (constvars are never pruned).
+  # dce_jaxpr 会保留附加的常量（constvar 永远不会被剪除）。
   return pe.dce_jaxpr(jaxpr, used_outputs)
 
 
@@ -1990,7 +1995,7 @@ def _pjit_pp_rule(eqn: core.JaxprEqn,
     context.suggest_same_var_names(params['jaxpr'].invars, eqn.invars)
     context.suggest_same_var_names(params['jaxpr'].outvars, eqn.outvars)
 
-  # Move name= to the front to make the resulting equation easier to scan.
+  # 把 name= 移到最前面，使生成的方程更易扫读。
   del params["name"]
   return core._pp_eqn(eqn, context, settings, params=["name"] + sorted(params))
 
@@ -2031,22 +2036,22 @@ def assert_shardings_equal(x_aval, user_sharding: NamedSharding):
 
 
 def with_sharding_constraint(x, shardings):
-  """Mechanism to constrain the sharding of an Array inside a jitted computation
+  """在 jit 计算内部约束 Array 分片的机制
 
-  This is a strict constraint for the GSPMD partitioner and not a hint. For examples
-  of how to use this function, see `Distributed arrays and automatic parallelization`_.
+  对 GSPMD 划分器来说这是严格约束，而不是提示。关于该函数的用法示例，
+  参见 `Distributed arrays and automatic parallelization`_。
 
-  Inside of a jitted computation, with_sharding_constraint makes it possible to
-  constrain intermediate values to an uneven sharding. However, if such an
-  unevenly sharded value is output by the jitted computation, it will come out
-  as fully replicated, no matter the sharding annotation given.
+  在 jit 计算内部，with_sharding_constraint 可以把中间值约束到不均匀的
+  分片上。不过，如果这样的不均匀分片值被该 jit 计算输出，
+  那么无论给出的分片标注是什么，
+  它都会以完全复制的方式返回。
 
   Args:
-    x: PyTree of jax.Arrays which will have their shardings constrained
-    shardings: PyTree of sharding specifications. Valid values are the same as for
-      the ``in_shardings`` argument of :func:`jax.experimental.pjit`.
+    x: 将被约束分片的 jax.Array 组成的 PyTree
+    shardings: 分片规格组成的 PyTree。合法取值与 :func:`jax.experimental.pjit`
+      的 ``in_shardings`` 参数相同。
   Returns:
-    x_with_shardings: PyTree of jax.Arrays with specified sharding constraints.
+    x_with_shardings: 带指定分片约束的 jax.Array 组成的 PyTree。
 
   .. _Distributed arrays and automatic parallelization: https://docs.jax.dev/en/latest/parallel.html
   """
@@ -2083,8 +2088,8 @@ def with_sharding_constraint(x, shardings):
           ' not allowed. Please only pass `jax.sharding.Sharding` instances.')
   del user_shardings_flat
 
-  # TODO(bartchr): remove `unconstrained_dims` after migrating to Shardy. It's
-  # already part of the shardings.
+  # TODO(bartchr): 迁移到 Shardy 之后删除 `unconstrained_dims`。它已经
+  # 是分片的一部分了。
   unconstrained_dims = [get_unconstrained_dims(s)
                         if isinstance(s, NamedSharding) else frozenset()
                         for s in shardings_flat]
@@ -2143,8 +2148,8 @@ def _sharding_constraint_impl(x, sharding, layout, context_mesh,
 
   if layout is None:
     if mlir.contains_unconstrained(sharding):
-      # Can't do identity_jit because UNCONSTRAINED in out_shardings parameter
-      # of jit is not supported.
+      # 不能用 identity_jit：jit 的 out_shardings 参数不支持
+      # UNCONSTRAINED 这种取值。
       return dispatch.apply_primitive(
           sharding_constraint_p, x,  sharding=sharding, layout=layout,
           context_mesh=context_mesh, unconstrained_dims=unconstrained_dims)
@@ -2279,8 +2284,8 @@ reshard_p = core.Primitive('reshard')
 reshard_p.skip_canonicalization = True
 
 def _check_unreduced_reshard(aval, dst_sharding):
-  # dst_sharding can't be more unreduced than src_sharding in case of
-  # UnreducedKind.{max,min}.
+  # 在 UnreducedKind.{max,min} 的情形下，dst_sharding 的未归约程度
+  # 不能超过 src_sharding。
   if (dst_sharding.spec.unreduced and
       dst_sharding.spec.unreduced_kind != UnreducedKind.sum and
       dst_sharding.spec.unreduced - aval.sharding.spec.unreduced):
@@ -2373,7 +2378,7 @@ def _pp_reshard(eqn, ctx, settings):
   return core._pp_eqn(eqn.replace(params={}), ctx, settings)
 core.pp_eqn_rules[reshard_p] = _pp_reshard
 
-# -------------------- Auto and Explicit mode -------------------------
+# -------------------- Auto 与 Explicit 模式 -------------------------
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class MeshInfo:
@@ -2591,7 +2596,7 @@ def eval_jaxpr_program_order(jaxpr, consts, *args) -> list[Any]:
       cur_inps = map(read, eqn.invars)
       if prev_eqn is not None:
         prev_outs = map(read, prev_eqn.outvars)
-        # TODO(yashkatariya): Maybe dedup prev_outs and cur_inps.
+        # TODO(yashkatariya): 也许可以对 prev_outs 和 cur_inps 去重。
         prev_outs, cur_inps = optimization_barrier((prev_outs, cur_inps))
         eqn_write(prev_eqn, prev_outs)
       ans = eqn.primitive.bind(*cur_inps, **bind_params)
@@ -2601,7 +2606,7 @@ def eval_jaxpr_program_order(jaxpr, consts, *args) -> list[Any]:
   outvals = map(read, jaxpr.outvars)
   return outvals
 
-# ----------------------------- explicit layout --------------------------------
+# ----------------------------- 显式布局 --------------------------------
 
 def explicit_layout(f=None, /, *, in_layouts=None):
   kwargs = dict(in_layouts=in_layouts)
@@ -2647,7 +2652,7 @@ def _relayout_hlo_lowering(ctx, x_node, *, dst_layout):
   raise NotImplementedError
 mlir.register_lowering(relayout_p, _relayout_hlo_lowering)
 
-# ------------------------------- helpers --------------------------------------
+# ------------------------------- 辅助函数 --------------------------------------
 
 def get_unconstrained_dims(sharding: NamedSharding):
   assert sharding.spec is not None

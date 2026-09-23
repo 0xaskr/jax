@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Implements SdyShardingRule."""
+# 文件职责：实现 Shardy 的自定义分片规则表示及其与 MLIR 属性的互转。
+# 该模块是 `jax.experimental.custom_partitioning` 中 `infer_sharding_from_operands`
+# 等回调（用户用类 Einsum 记号字符串 `"a b -> a"` 描述分片规则）的底层支撑，
+# 负责把这类字符串解析校验成 `SdyShardingRule`，再结合操作数/结果的类型
+# 构建出 `sdy.OpShardingRuleAttr`，供 Shardy 分区器使用。
+
+"""实现 SdyShardingRule。"""
 
 from collections import OrderedDict
 
@@ -20,19 +26,17 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import sdy
 
 
-# A single character replacement for ... to simplify parsing.
+# 用一个字符替换 ... 以简化解析。
 BATCHING: str = "…"
 
-# A prefix for names of batching dimension factors, used for expanding the
-# leading ... into factors.
+# 批处理维度因子名的前缀，用于把开头的 ... 展开成若干因子。
 _BATCHING_DIM_FACTOR_PREFIX = "?"
 
 
 def _check_factor(factor:str):
-  """Validates a factor.
+  """校验一个因子。
 
-  A factor is a string starting with a letter and containing only letters,
-  digits, or underscores.
+  因子是以字母开头、且只包含字母、数字或下划线的字符串。
   """
   if not factor[0].isalpha():
     raise ValueError(f"Factor names have to start with a letter, but got '{factor[0]}'")
@@ -41,24 +45,24 @@ def _check_factor(factor:str):
       raise ValueError(f"Unknown character '{char}'")
 
 def _is_batching(factor: str) -> bool:
-  """Checks if a factor is a representation for leading batching dimensions.
+  """检查一个因子是否表示开头的批处理维度。
 
-  Leading batching dimensions is represented by a factor containing ... and
-     optionally followed by a digit, and ... is equivalent to ...0.
+  开头的批处理维度由含 ... 的因子表示，其后可选地跟一个数字，
+  并且 ... 等价于 ...0。
   """
   if len(factor) < 1 or factor[0] != BATCHING:
     return False
   return len(factor) == 1 or factor[1:].isdigit()
 
 def _get_batching_group(factor: str) -> str:
-  """Extracts the batching group from a factor for leading batching dimensions."""
+  """从表示开头批处理维度的因子中取出批处理组。"""
   return factor[1:] if len(factor) > 1 else "0"
 
 class CompoundFactor(tuple):
-  """Describes the factors for a compound factor.
+  """描述一个复合因子的各个因子。
 
-  A compound factor should contain at least two factors, e.g.
-  * CompoundFactor('b', 'c').
+  复合因子至少要包含两个因子，例如
+  * CompoundFactor('b', 'c')。
   """
   def __init__(self, *factors):
     if len(factors) < 2:
@@ -76,10 +80,10 @@ class CompoundFactor(tuple):
 
 
 class ArrayMapping(tuple):
-  """Describes the factors for an operand or result.
+  """描述一个操作数或结果的各个因子。
 
-  Each element is either a factor or a CompoundFactor. A leading element can
-  also be BATCHING, which represents batching dimensions. examples:
+  每个元素要么是一个因子，要么是一个 CompoundFactor。开头的元素也可以是
+  BATCHING，它表示批处理维度。示例：
   * ArrayMapping('a')
   * ArrayMapping('b', 'c')
   * ArrayMapping(CompoundFactor('b', 'c'), 'd')
@@ -103,16 +107,15 @@ class ArrayMapping(tuple):
 
 
 class SdyShardingRule:
-  """Represents a Shardy sharding rule.
+  """表示一条 Shardy 分片规则。
 
-  An SdyShardingRule contains the ArrayMappings for operands and results,
-  optional special factors and optional factor sizes. A factor is a name used in
-  the ArrayMappings. If a factor is only used in CompoundFactors, its size must
-  be specified.
+  SdyShardingRule 包含各操作数与结果的 ArrayMapping、可选的
+  特殊因子以及可选的因子大小。因子是 ArrayMapping 中使用的名字。
+  若某个因子只用在 CompoundFactor 中，则必须指定它的大小。
 
-  By default, a factor is a passthrough factor. Keyword arguments can be used to
-  specify other factor kinds including reduction_factors, need_replication_factors,
-  and permutation_factors.
+  默认情况下，因子是直通（passthrough）因子。可以用关键字参数指定
+  其他因子种类，包括 reduction_factors、need_replication_factors
+  和 permutation_factors。
   """
   operand_mappings: tuple[ArrayMapping, ...]
   result_mappings: tuple[ArrayMapping, ...]
@@ -127,7 +130,7 @@ class SdyShardingRule:
                need_replication_factors: tuple[str, ...] = (),
                permutation_factors: tuple[str, ...] = (),
                **factor_sizes: int):
-    # Find all factors and mark whether their size can be inferred.
+    # 找出所有因子，并标记它们的大小能否被推断出来。
     factors_inferrable = {}
     for value in operand_mappings + result_mappings:
       for dim in value:
@@ -138,15 +141,14 @@ class SdyShardingRule:
             if factor not in factors_inferrable.keys():
               factors_inferrable[factor] = False
 
-    # Check that factors in factor_sizes are used in the rule.
+    # 检查 factor_sizes 中的因子确实被这条规则用到。
     for factor in factor_sizes:
       if factor not in factors_inferrable:
         raise ValueError(
           f"Factor {factor} is not used in the rule, but size is provided")
 
-    # Check that factors that are used for a whole dimension aren't in
-    # factor_sizes and factors that are never used for a whole dimension are
-    # in factor_sizes.
+    # 检查用于整个维度的因子不在 factor_sizes 中，而从未用于整个维度的因子
+    # 都在 factor_sizes 中。
     for factor, inferable in factors_inferrable.items():
       if factor not in factor_sizes and not inferable:
         raise ValueError(
@@ -200,50 +202,47 @@ class SdyShardingRule:
 
 
 def _get_batching_dim_factor_name(batch_group: str,batch_dim_order : int):
-  """Constructs a factor name for a batching dimension.
+  """为一个批处理维度构造因子名。
 
-  We expand the leading ... into factors representing the batching dimensions
-  to support building the MLIR representation for the sharding rule. For this
-  reason, we construct a factor name that won't be used by users for the
-  batching dimensions.
+  为了支持构建该分片规则的 MLIR 表示，我们会把开头的 ... 展开为表示各
+  批处理维度的因子。因此，需要为这些批处理维度构造一个用户不会用到的
+  因子名。
   """
   return f"{_BATCHING_DIM_FACTOR_PREFIX}{batch_group}_{batch_dim_order}"
 
 def _parse_values(
     rule: str,
 ) -> tuple[ArrayMapping, ...]:
-  """Parses the LHS or RHS of an Einsum notation like string.
+  """解析类 Einsum 记号字符串的左侧或右侧。
 
-  Converts each operand or result in the Einsum notation like string to a tuple
-  of ArrayMapping. This very closely follows how einops parses their rules in
-  einops/parsing.py.
+  把类 Einsum 记号字符串中的每个操作数或结果转换为一个 ArrayMapping 元组。
+  这与 einops 在 einops/parsing.py 中解析其规则的方式非常接近。
 
   Args:
-    rule: The Einsum notation for the operands or results of an operation.
+    rule: 某个运算各操作数或结果的类 Einsum 记号。
 
   Returns:
-    The tuple of ArrayMapping.
+    ArrayMapping 构成的元组。
 
   Raises:
-    ValueError: If the rule is not balanced or contains unknown characters.
+    ValueError: 若规则不对称或包含未知字符。
   """
 
-  # Remove unnecessary spaces in the rule to simplify the parsing process.
+  # 去掉规则中不必要的空格，以简化解析过程。
   words = rule.split()
   rule = " ".join(words)
 
-  # Similar to einops rules, an empty LHS/RHS has a single scalar value.
+  # 与 einops 的规则类似，空的左侧/右侧表示一个标量值。
   if not rule:
     return (ArrayMapping(),)
 
   all_values = []
-  # Represent all dimensions of an value. When an value[0]==BATCHING, the
-  # value may have 0 or more leading dimensions.
+  # 表示某个值的所有维度。当 value[0]==BATCHING 时，该值可能有 0 个或
+  # 更多个开头维度。
   value = []
   current_factor: str | None = None
-  # A value of None indicates the current dimension is not a compound dimension,
-  # while a value of [] indicates that we have just started parsing a compound
-  # dimension.
+  # 值为 None 表示当前维度不是复合维度，而值为 [] 表示我们刚开始解析
+  # 一个复合维度。
   current_compound_dim: list[str] | None = None
 
   def add_factor(x):
@@ -316,21 +315,21 @@ def str_to_sdy_sharding_rule(rule: str, *,
                              need_replication_factors: tuple[str, ...] = (),
                              permutation_factors: tuple[str, ...] = (),
                              **factor_sizes: int) -> SdyShardingRule:
-  """Constructs a SdyShardingRule object from the Einsum notation like string.
+  """由类 Einsum 记号字符串构造一个 SdyShardingRule 对象。
 
-  This is done by verifying that the input Einsum notation like string and
-  with optional special factors and factor sizes represents a valid sharding
-  rule and converting it to an internal representation.
+  做法是：验证输入的类 Einsum 记号字符串以及可选的
+  特殊因子和因子大小确实构成一条合法的分片规则，并把它转换为
+  内部表示。
 
   Args:
-    rule: The Einsum notation like string for an operation.
-    reduction_factors: A tuple of factors that are reduction factors.
-    need_replication_factors: A tuple of factors that are need_replication factors.
-    permutation_factors: A tuple of factors that are permutation factors.
-    **factor_sizes: The optional factor sizes.
+    rule: 某个运算的类 Einsum 记号字符串。
+    reduction_factors: 由约简因子构成的元组。
+    need_replication_factors: 由需要复制的因子构成的元组。
+    permutation_factors: 由置换因子构成的元组。
+    **factor_sizes: 可选的因子大小。
 
   Raises:
-    ValueError: If there is any problem with the rule or factor_sizes.
+    ValueError: 若规则或 factor_sizes 存在任何问题。
   """
   if not isinstance(rule, str):
     raise TypeError(f"rule must be a str, but got {type(rule)}")
@@ -338,7 +337,7 @@ def str_to_sdy_sharding_rule(rule: str, *,
     raise TypeError(
         f"factor_sizes must be a dict of str to int, but got {factor_sizes}")
 
-  # Replace ... with a single char to simplify parsing.
+  # 把 ... 替换成单个字符以简化解析。
   if BATCHING in rule:
     raise ValueError(f"Unknown character '{BATCHING}'")
   if "." in rule:
@@ -364,11 +363,10 @@ def sdy_sharding_rule_to_mlir(
   rule: SdyShardingRule,
   operand_types: list[ir.Type],
   result_types: list[ir.Type],) -> ir.Attribute:
-  """Builds the MLIR representation for the sharding rule.
+  """构建该分片规则的 MLIR 表示。
 
-  This is done by verifying that the rule is consistent with the types of
-  the operation and converting the Einsum notation like string to
-  OpShardingRuleAttr.
+  做法是：验证规则与该运算的各类型一致，并把类 Einsum 记号字符串
+  转换为 OpShardingRuleAttr。
   """
   if len(rule.operand_mappings) != len(operand_types):
     raise ValueError(
@@ -385,7 +383,7 @@ def sdy_sharding_rule_to_mlir(
 
   factors_to_indices_sizes: OrderedDict[str, list[int]] = OrderedDict()
   types = operand_types + result_types
-  UNKNOWN = -1  # Representation for unknown factor size or factor index.
+  UNKNOWN = -1  # 未知因子大小或因子索引的表示。
 
   def get_message_for_value(i):
     if i >= len(operand_types):
@@ -400,28 +398,27 @@ def sdy_sharding_rule_to_mlir(
     return ir.ShapedType(types[i]).shape[j]
 
   def add_factor(factor, size):
-    """Adds a factor to factors_to_indices_sizes.
+    """把一个因子加入 factors_to_indices_sizes。
 
-    `size` may be a dimensions size, a user specified factor size, or UNKNOWN
-    if a factor is first used as in a compound factor and then used for a
-    whole dimension. If a factor is not for a leading batching dimension and
-    it corresponds to multiple sizes, the smallest size is used.
+    `size` 可以是一个维度的大小、用户指定的因子大小，或者当某个因子
+    先出现在复合因子中、之后又用于整个维度时的 UNKNOWN。若某个因子不是
+    用于开头的批处理维度，且它对应多个大小，则取其中最小的大小。
     """
     factor_index, factor_size = factors_to_indices_sizes.get(factor, [UNKNOWN, UNKNOWN])
     if factor_index != UNKNOWN:
-      # Not the first time seeing the factor.
+      # 不是第一次见到这个因子。
       if size != UNKNOWN and factor_size != UNKNOWN and factor_size != size:
         if _BATCHING_DIM_FACTOR_PREFIX in factor:
           raise ValueError(f"Batching dimension {factor[1:]} corresponds to "
                            f"two sizes: {factor_size} and {size}")
         else:
           if size < factor_size:
-            # Use the smaller size to update the factor size.
+            # 用较小的大小更新该因子的大小。
             factor_size = UNKNOWN
       if size != UNKNOWN and factor_size == UNKNOWN:
         factors_to_indices_sizes[factor] = [factor_index, size]
     else:
-      # First time seeing the factor.
+      # 第一次见到这个因子。
       factor_index = len(factors_to_indices_sizes)
       factors_to_indices_sizes[factor] = [factor_index, size]
 
@@ -448,8 +445,8 @@ def sdy_sharding_rule_to_mlir(
   def factors_to_indices(factors):
     return [factors_to_indices_sizes[factor][0] for factor in factors]
 
-  # Add factors and their sizes in the order they appear in the rule,
-  # including the batching dimensions represented by ellipsis.
+  # 按因子在规则中出现的顺序加入它们及其大小，
+  # 其中也包括由省略号表示的批处理维度。
   batching_group_to_rank: dict[str, int] = {}
   for i, mapping in enumerate(rule.operand_mappings + rule.result_mappings):
     value = tuple(mapping)
@@ -460,7 +457,7 @@ def sdy_sharding_rule_to_mlir(
       batching_group = None
     rule_rank = len(value)
     op_rank = get_rank_for_value(i)
-    # The number of dimensions represented by ellipsis.
+    # 省略号所表示的维度个数。
     current_batching_rank = 0
     if batching_group is not None and op_rank >= rule_rank:
       current_batching_rank = op_rank - rule_rank
@@ -490,7 +487,7 @@ def sdy_sharding_rule_to_mlir(
         for factor in dim:
           add_factor(factor, rule.factor_sizes.get(factor, UNKNOWN))
 
-  # Build the tensor mappings for each operand and result.
+  # 为每个操作数和结果构建张量映射。
   tensor_mappings = []
   for i, mapping in enumerate(rule.operand_mappings + rule.result_mappings):
     value = tuple(mapping)

@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 `jax.custom_batching` 公开 API，让用户为函数自定义 `vmap` 批处理行为。
+# 核心是 `custom_vmap` 装饰器：被装饰函数照常执行，但批量调用时会改走用户通过
+# `def_vmap` 注册的规则；该规则接收轴大小、输入是否带批维的 pytree 以及已搬运到前排的
+# 批维参数，并返回输出及其批处理说明。模块用原语 `custom_vmap_call` 把被追踪函数与规则
+# 一同绑定，并注册实现、抽象值求值、批处理与 `jvp` 规则（不支持反向模式自动微分），
+# 另提供基于循环的 `sequential_vmap` 特例，用于原生不支持批维的函数。
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -47,16 +54,14 @@ zip, unsafe_zip = util.safe_zip, zip
 
 @custom_api_util.register_custom_decorator_type
 class custom_vmap:
-  """Customize the vmap behavior of a JAX-transformable function.
+  """自定义可被 JAX 变换的函数的 vmap 行为。
 
-  This decorator is used to customize the behavior of a JAX function under the
-  :func:`jax.vmap` transformation. A ``custom_vmap``-decorated function will
-  mostly (see below for caveats) have the same behavior as the underlying
-  function, except when batched using :py:func:`jax.vmap`. When batched, the
-  rule defined using :py:func:`~jax.custom_batching.custom_vmap.def_vmap` will
-  be used.
+  该装饰器用于自定义 JAX 函数在 :func:`jax.vmap` 变换下的行为。被
+  ``custom_vmap`` 装饰的函数大多（注意事项见下文）与底层函数行为一致，
+  唯一的区别出现在用 :py:func:`jax.vmap` 进行批量处理时。批量处理时，
+  会使用通过 :py:func:`~jax.custom_batching.custom_vmap.def_vmap` 定义的规则。
 
-  For example:
+  例如：
 
     >>> @jax.custom_batching.custom_vmap
     ... def f(x, y):
@@ -75,9 +80,9 @@ class custom_vmap:
     >>> jax.vmap(f)(xs, ys)  # prints xs * ys instead of xs + ys
     Array([0, 2, 6], dtype=int32)
 
-  Of note, ``custom_vmap`` functions do not support reverse-mode autodiff. To
-  customize both vmap and reverse-mode autodiff, combine ``custom_vmap`` with
-  :py:class:`jax.custom_vjp`. For example:
+  值得注意的是，``custom_vmap`` 函数不支持反向模式自动微分。若要同时自定义
+  vmap 与反向模式自动微分，请把 ``custom_vmap`` 与
+  :py:class:`jax.custom_vjp` 结合使用。例如：
 
     >>> @jax.custom_vjp
     ... @jax.custom_batching.custom_vmap
@@ -101,8 +106,8 @@ class custom_vmap:
     >>> jax.grad(f)(jnp.zeros(()), jnp.ones(()))
     Array(1., dtype=float32)
 
-  Note that the :py:class:`jax.custom_vjp` must be on the outside, wrapping the
-  ``custom_vmap``-decorated function.
+  注意 :py:class:`jax.custom_vjp` 必须位于外层，包裹被 ``custom_vmap``
+  装饰的函数。
   """
 
   fun: Callable[..., Any]
@@ -119,20 +124,18 @@ class custom_vmap:
       self,
       vmap_rule: Callable[..., tuple[Any, Any]],
   ) -> Callable[..., tuple[Any, Any]]:
-    """Define the vmap rule for this custom_vmap function.
+    """为该 custom_vmap 函数定义 vmap 规则。
 
     Args:
-      vmap_rule: A function that implements the vmap rule. This function should
-        accept the following arguments: (1) an integer ``axis_size`` as its
-        first argument, (2) a pytree of booleans with the same structure as the
-        inputs to the function, specifying whether each argument is batched,
-        and (3) the batched arguments. It should return a tuple of the batched
-        output and a pytree of booleans with the same structure as the output,
-        specifying whether each output element is batched. See the documentation
-        for :py:func:`jax.custom_batching.custom_vmap` for some examples.
+      vmap_rule: 实现 vmap 规则的函数。该函数应接受以下参数：(1) 整数
+        ``axis_size`` 作为第一个参数，(2) 一个布尔值 pytree，其结构与函数
+        输入的结构相同，用于指明每个参数是否被批量处理，(3) 被批量处理的
+        参数。它应返回一个元组，包含批量处理后的输出，以及一个结构与输出
+        相同的布尔值 pytree，用于指明每个输出元素是否被批量处理。示例见
+        :py:func:`jax.custom_batching.custom_vmap` 的文档。
 
     Returns:
-      This method passes the rule through, returning ``vmap_rule`` unchanged.
+      该方法原样透传规则，返回未做改动的 ``vmap_rule``。
     """
     self.vmap_rule = vmap_rule
     return vmap_rule
@@ -176,8 +179,7 @@ class custom_vmap:
 
 ### utils
 
-# Define a class, instead of making a function closing over `rule`, so
-# that we can override __str__
+# 定义一个类而不是定义一个闭包捕获 `rule` 的函数，这样我们可以覆写 __str__
 class ClosedRule:
   def __init__(self, rule: Callable, debug: core.DebugInfo):
     functools.update_wrapper(self, rule)
@@ -216,16 +218,15 @@ def check_vmap_rule_trees(rule, original_out_tree, out_tree, out_batched_tree):
         f'Original output: {original_out_tree}\n'
         f'Rule output: {out_tree}')
 
-# Like batching.bdim_at_front, but doesn't broadcast if not mapped
+# 类似 batching.bdim_at_front，但在未映射时不进行广播
 def maybe_bdim_at_front(x, bdim):
   if bdim is None:
     return x
   else:
     return util.moveaxis(x, bdim, 0)
 
-# Like batching.batch except (a) not curried and (b) returns inferred output
-# axes instead of accepting and matching a given spec of output axes. Assumes
-# `f` is pytree-flattened
+# 类似 batching.batch，但 (a) 未柯里化，(b) 返回推断出的输出轴，
+# 而不是接受并匹配给定的输出轴规格。假定 `f` 已按 pytree 展平
 def vmap_unrestricted(f: lu.WrappedFun, *args, in_axes, axis_name, axis_size):
   axis_data = batching.AxisData(axis_name, axis_size, None, None)
   tag = core.TraceTag()
@@ -282,9 +283,9 @@ def custom_vmap_jvp(primals, tangents, *,
         (extra_batched_ps, extra_batched_ts),
         is_leaf=lambda x: x is None)
 
-    # TODO(frostig): assert these also equal:
+    # TODO(frostig): 断言这些也相等：
     #   treedef_tuple((in_tree, in_tree))
-    # once https://github.com/jax-ml/jax/issues/9066 is fixed
+    # 待 https://github.com/jax-ml/jax/issues/9066 修复之后
     assert tree_ps_ts == tree_ps_ts2
     del tree_ps_ts2
 
@@ -301,7 +302,7 @@ def custom_vmap_jvp(primals, tangents, *,
 
     to_vmap_over_extra_batched_dims_flat, out_tree2 = api_util.flatten_fun_nokwargs(
         lu.wrap_init(to_vmap_over_extra_batched_dims,
-                     # TODO(necula): fix the debug_info calling convention
+                     # TODO(necula): 修复 debug_info 的调用约定
                      debug_info=call.debug_info),
         tree_ps_ts)
 
@@ -355,7 +356,7 @@ mlir.register_lowering(custom_vmap_p, mlir.lower_fun(
 custom_vmap_p.to_lojax = custom_vmap_impl
 
 
-# -- custom vmap applications
+# -- custom vmap 的应用
 
 
 def tree_split(mask, tree):
@@ -368,13 +369,12 @@ def tree_merge(mask, lhs_tree, rhs_tree):
                   mask, lhs_tree, rhs_tree)
 
 def sequential_vmap(f):
-  """A special case of ``custom_vmap`` that uses a loop.
+  """``custom_vmap`` 的一个使用循环的特例。
 
-  A function decorated with ``sequential_vmap`` will be called sequentially
-  within a loop when batched. This is useful for functions that don't natively
-  support batch dimensions.
+  用 ``sequential_vmap`` 装饰的函数在被批量处理时，会在循环中被顺序调用。
+  这对于原生不支持批维的函数很有用。
 
-  For example:
+  例如：
 
     >>> @jax.custom_batching.sequential_vmap
     ... def f(x):
@@ -387,11 +387,9 @@ def sequential_vmap(f):
     2
     Array([1, 2, 3], dtype=int32)
 
-  Where the print statements demonstrate that this :py:func:`~jax.vmap` is being
-  generated using a loop.
+  其中打印语句表明这个 :py:func:`~jax.vmap` 是用循环生成的。
 
-  See the documentation for :py:class:`~jax.custom_batching.custom_vmap` for
-  more details.
+  更多细节见 :py:class:`~jax.custom_batching.custom_vmap` 的文档。
   """
   from jax._src.lax import control_flow  # pyrefly: ignore[missing-import]
 

@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现把 XLA 元数据（如 scheduling_group 等）附加到编译产物的内部机制。
+# 本模块为 JAX 内部模块 `jax._src.xla_metadata`，对外由
+# `jax.experimental.xla_metadata` 暴露 `set_xla_metadata`、`xla_metadata_call`、
+# `xla_metadata_call2` 等接口。核心思路是：元数据先随追踪上下文
+# （`XlaMetadataContextManager`）传播，或在降级时由原语 `xla_metadata_value`、
+# `xla_metadata_call` 写成被调用计算与算子上的 `mhlo.frontend_attributes`，供 XLA 在后续优化中使用。
+
 from collections.abc import Mapping
 import contextlib
 from functools import partial, wraps
@@ -39,15 +46,14 @@ zip, unsafe_zip = safe_zip, zip
 
 
 class _XlaMetadataWrapper:
-  """A wrapper class to allow XlaMetadataContextManager to be used as a decorator.
+  """包装器类，让 XlaMetadataContextManager 可以当作装饰器使用。
 
-  When XlaMetadataContextManager is used as a decorator on a function `f`, it
-  returns an instance of this class. This wrapper ensures that when `f` is
-  called, it runs within the metadata context. It also forwards attribute
-  access to `f` via `__getattr__`, and if an attribute of `f` is callable (e.g.,
-  the `.lower()` method of a jitted function), it wraps that attribute so it
-  too runs within the metadata context when called. This allows decorated
-  functions to be used seamlessly with JAX transformations like `jax.jit`.
+  当 XlaMetadataContextManager 被用作函数 `f` 的装饰器时，它会返回本类的
+  一个实例。该包装器保证调用 `f` 时运行在元数据上下文内。它还通过
+  `__getattr__` 转发对 `f` 的属性访问；若 `f` 的某个属性可调用（例如
+  已 jit 函数的 `.lower()` 方法），它也会包装该属性，使其被调用时同样
+  运行在元数据上下文内。这样被装饰的函数就能与 `jax.jit` 等 JAX 变换
+  无缝配合使用。
   """
 
   def __init__(self, f, ctx):
@@ -98,7 +104,7 @@ class XlaMetadataContextManager:
 
 @contextlib.contextmanager
 def clear_xla_metadata():
-  """Internal context manager to temporarily clear ambient XLA metadata."""
+  """内部上下文管理器，用于临时清除环境中的 XLA 元数据。"""
   prev = config.xla_metadata_context_manager.swap_local(None)
   try:
     yield
@@ -119,15 +125,15 @@ def set_xla_metadata(x=None, **kwargs):
     )
 
 
-# `xla_metadata_value_p` is an identity primitive for attaching frontend_attributes
-# to the primitive's producing (parent/owner) op.
+# `xla_metadata_value_p` 是一个恒等原语，用于把 frontend_attributes
+# 附加到产生该值的（父/属主）算子上。
 xla_metadata_value_p = core.Primitive("xla_metadata_value")
 xla_metadata_value_p.def_impl(
     partial(dispatch.apply_primitive, xla_metadata_value_p)
 )
 xla_metadata_value_p.def_abstract_eval(lambda aval, *, xla_metadata_kvs: aval)
 batching.defvectorized(xla_metadata_value_p)
-# TODO(nbasile): Implement tagging gradient ops with metadata.
+# TODO(nbasile): 实现用元数据标记梯度算子。
 ad.deflinear2(xla_metadata_value_p, lambda ct, _, **kwargs: (ct,))
 
 
@@ -141,8 +147,8 @@ def _xla_metadata_value_lowering_rule(
   return [val]
 
 
-# If we leave `cacheable=True`, when we are in the lowering rule, the `val.owner`
-# becomes a cached `FuncOp`. FuncOp.owners are Blocks, which we can't tag.
+# 若保留 `cacheable=True`，在降级规则中 `val.owner` 会变成被缓存的 `FuncOp`。
+# 而 `FuncOp` 的 owner 是 Block，无法给 Block 打标签。
 mlir.register_lowering(
     xla_metadata_value_p, _xla_metadata_value_lowering_rule, cacheable=False
 )
@@ -163,7 +169,7 @@ def _attach_xla_metadata_to_op(
     for k, v in xla_metadata.items():
       v_str = str(v).lower() if isinstance(v, bool) else str(v)
       ctx_attributes[k] = ir.StringAttr.get(v_str)
-    # Combine with existing mhlo.frontend_attributes
+    # 与已有的 mhlo.frontend_attributes 合并
     for attr in op.attributes:
       if attr == "mhlo.frontend_attributes":
         for a in ir.DictAttr(op.attributes[attr]):
@@ -174,30 +180,30 @@ def _attach_xla_metadata_to_op(
 
 
 def xla_metadata_call(f=None, /, **meta):
-  """Wraps a function so it lowers to a call op tagged with XLA metadata.
+  """包装一个函数，使其降级为带有 XLA 元数据标记的 call 算子。
 
-  Sugar for :func:`xla_metadata_call2` with the metadata passed as keyword
-  arguments and default options. The wrapped function is staged out as a
-  separate computation, invoked via a call op annotated with the given
-  metadata as ``frontend_attributes``. XLA propagates the attributes to the
-  ops inside the call when it inlines it.
+  这是 :func:`xla_metadata_call2` 的语法糖，元数据以关键字参数传入并使用
+  默认选项。被包装的函数会被暂存为一份独立的计算，并通过调用一个 call
+  算子来调用，该 call 算子带有以 ``frontend_attributes`` 形式给出的
+  元数据。XLA 在将该 call 内联时，会把这些属性传播到 call 内部的各个
+  算子上。
 
-  Unlike the ``set_xla_metadata`` context manager, this does not perturb the
-  tracing context, so it doesn't cause retracing or recompilation of jitted
-  functions. The metadata also follows the computation through
-  transformations: under ``jax.grad``, both the forward- and backward-pass
-  computations derived from the function carry the metadata. To leave the
-  backward pass untagged, or tag it differently, use
-  :func:`xla_metadata_call2` and its ``ad_metadata`` option.
+  与 ``set_xla_metadata`` 上下文管理器不同，本函数不会扰动追踪上下文，
+  因此不会导致已 jit 的函数被重新追踪或重新编译。元数据也会随计算一起
+  穿过各种变换：在 ``jax.grad`` 下，由该函数导出的前向计算与反向计算
+  都会携带该元数据。若希望让反向计算不带标记，
+  或给它打上与其他计算不同的标记，请使用
+  :func:`xla_metadata_call2`，并通过它的 ``ad_metadata``
+  选项来控制具体做法。
 
   Args:
-    f: the function to wrap. If not given, returns a decorator.
-    **meta: metadata to attach, as keyword arguments. Values may be strings,
-      bools, ints, or floats; they are attached as strings (with bools
-      rendered as ``"true"``/``"false"``).
+    f: 要包装的函数。若未提供，则返回一个装饰器。
+    **meta: 要附加的元数据，以关键字参数给出。取值可以是字符串、
+      布尔、整数或浮点数；它们会以字符串形式附加（布尔值渲染为
+      ``"true"``/``"false"``）。
 
   Returns:
-    A wrapped version of ``f`` with the metadata applied, or a decorator.
+    已应用元数据的 ``f`` 的包装版本，或者一个装饰器。
 
   Example:
 
@@ -213,24 +219,24 @@ def xla_metadata_call(f=None, /, **meta):
 
 
 def xla_metadata_call2(f=None, /, metadata=None, *, ad_metadata='same'):
-  """Like :func:`xla_metadata_call`, with the metadata as a dict plus options.
+  """与 :func:`xla_metadata_call` 类似，但元数据以字典给出，并多了若干选项。
 
   Args:
-    f: the function to wrap. If not given, returns a decorator.
-    metadata: a dict of metadata to attach to the call op as
-      ``frontend_attributes``. Values may be strings, bools, ints, or floats;
-      they are attached as strings (with bools rendered as
-      ``"true"``/``"false"``).
-    ad_metadata: metadata for the computations that autodiff derives from the
-      function, beyond the forward pass: the linearized (tangent) and
-      transposed (backward-pass) computations. The default ``'same'`` attaches
-      ``metadata`` to them too; ``'drop'`` leaves them untagged; a dict
-      attaches that metadata instead. Under forward-mode ``jax.jvp``, the
-      primal and tangent computations are staged out fused, so they keep
-      ``metadata`` regardless.
+    f: 要包装的函数。若未提供，则返回一个装饰器。
+    metadata: 要作为 ``frontend_attributes`` 附加到 call 算子上的元数据
+      字典。取值可以是字符串、布尔、整数或浮点数；这些值都会以字符串
+      形式附加到算子上（其中布尔值渲染为
+      ``"true"``/``"false"``）。
+    ad_metadata: 自动微分在该函数前向计算之外导出的计算所用的元数据，
+      这里的计算指的是线性化（切向量）计算，
+      以及转置（反向）计算。
+      默认值 ``'same'`` 表示也给它们附加 ``metadata``；``'drop'``
+      表示不给它们打标记；传入字典则改为附加该字典。在前向模式
+      ``jax.jvp`` 下，原始计算与切向量计算被融合暂存，
+      因此它们无论如何都会保留 ``metadata``。
 
   Returns:
-    A wrapped version of ``f`` with the metadata applied, or a decorator.
+    已应用元数据的 ``f`` 的包装版本，或者一个装饰器。
 
   Example:
 
@@ -275,7 +281,7 @@ def _canonicalize_ad_metadata(ad_metadata):
         "ad_metadata must be 'same', 'drop', or a dict of metadata, got "
         f"{ad_metadata!r}")
 
-# TODO(yashkatariya): Figure out a way to reuse code with compute_on_p, fused_p
+# TODO(yashkatariya): 想办法与 compute_on_p、fused_p 复用代码
 def _xla_metadata_call(fun, metadata, ad_metadata):
   if metadata is not None and not isinstance(metadata, Mapping):
     raise TypeError(f"metadata must be a dict, got {metadata!r}")
@@ -355,8 +361,8 @@ batching.fancy_primitive_batchers[xla_metadata_call_p] = _xla_metadata_call_batc
 
 def _xla_metadata_call_jvp(primals, tangents, *, jaxpr, xla_metadata,
                            ad_metadata):
-  # The jvp jaxpr fuses primal and tangent ops, so it keeps the primal
-  # metadata; ad_metadata still governs any later linearization/transposition.
+  # jvp 的 jaxpr 融合了原始算子与切向量算子，因此保留原始计算的元数据；
+  # ad_metadata 仍然决定后续的线性化/转置行为。
   nzs = [not isinstance(t, ad.Zero) for t in tangents]
   jaxpr_jvp, out_nzs = ad.jvp_jaxpr(jaxpr, nzs, False)
   nz_tangents = [t for t in tangents if not isinstance(t, ad.Zero)]

@@ -11,43 +11,44 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""JAX effects.
+# 文件职责：定义 JAX 的效果（effect）机制，用于描述带有副作用、不能被优化的计算。
+# 效果依附于 JAX 原语实例与 jaxpr，带有效果的原语即使结果未被使用也不会被死代码消除。
+# 其中“有序效果”会在降级后的计算里各引入一个 i1[0] 类型的 token 输入与输出，
+# 并串接在各条指令之间，以保证编译器不会删除、复制或重排这些指令。
+# 本模块还维护各效果类型集合（可分片、可降级、允许控制流等）与跨分派的当前 token，
+# 供核心追踪、降级与 barrier 实现使用。
+"""JAX 效果。
 
-JAX uses effects to describe computations that may have side-effects. Effects
-are associated with JAX primitive instances and Jaxprs.
+JAX 用效果来描述可能带有副作用的计算。效果与 JAX 原语实例以及
+Jaxpr 相关联。
 
-A primitive instance with an effect will be protected from dead-code elimination
-even if its result is unused.
+带有效果的原语实例会被保护起来，不会因为结果未被使用而被死代码消除。
 
-A special class of effects are the **ordered** effects
-(members of `effects.ordered_effects`).
-The lowering of a computation with ordered effects will have one additional
-input and one additional output for each ordered effect. These appear before
-the regular inputs/outputs, and are of type `i1[0]`. These tokens
-are threaded through the instructions with ordered effects to ensure that the
-compiler will not eliminate, replicate, or reordered the corresponding
-instructions.
+一类特殊的效果是**有序**效果（`effects.ordered_effects` 的成员）。
+带有序效果的计算在降级后会为每个有序效果额外增加一个输入和一个输出。
+它们出现在常规输入/输出之前，类型为 `i1[0]`。这些 token
+会在带有序效果的指令之间串接，以确保编译器不会消除、复制或重排
+相应的指令。
 
-To ensure the ordering across multiple computations we maintain a
-per-thread set of the tokens returned by the last dispatched computation. There
-is one token per ordered effect, and it may be sharded over the devices
-used by the last dispatched computation. Upon dispatching a
-new computation with ordered effects we take the current token, we shard it
-on the devices for the computation to be dispatched and we pass it as an input.
-Then we update the current token to refer to the token output of
-the dispatched computation.
+为了确保跨多个计算的顺序，我们为每个线程维护一个集合，记录最近一次
+分派的计算所返回的 token。每个有序效果对应一个 token，并且它可能被分片到
+最近一次分派的计算所使用的设备上。在分派一个
+带有序效果的新计算时，我们取出当前 token，把它分片到
+将要分派的计算所在的设备上，并作为输入传入。
+随后我们更新当前 token，使其指向该次
+分派计算输出的 token。
 
-When we have ordered effects, we also use the current token to implement
-`jax.barrier` which waits until the current tokens are ready.
+在存在有序效果时，我们还用当前 token 实现
+`jax.barrier`，它会等待当前 token 就绪。
 
-The implementation of `jax.barrier` for unordered effects is a bit different,
-because for these effects we do not thread tokens in and out of dispatched
-computation. Instead, we use a `RuntimeToken`, which is an object returned when
-dispatching a computation and on which we can block until is ready. We store
-for each thread the `RuntimeToken` returned by the last dispatched computation.
+对于无序效果，`jax.barrier` 的实现略有不同，
+因为这类效果不会在分派计算的输入输出之间串接 token。取而代之的是
+使用 `RuntimeToken`，它是分派计算时返回的对象，我们可以
+在其上阻塞直到就绪。我们为每个线程保存最近一次
+分派计算所返回的 `RuntimeToken`。
 
-For more details, see the design note:
-https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html.
+更多细节请参见设计说明：
+https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html。
 """
 
 from __future__ import annotations
@@ -57,21 +58,19 @@ from typing import Any
 
 
 class Effect:
-  """A generic side-effect."""
+  """一种通用副作用。"""
 
 Effects = Set[Effect]
 
 class JaxprInputEffect(Effect):
-  """A side-effect associated with an input of a `JaxprEqn` or a `Jaxpr`.
+  """与 `JaxprEqn` 或 `Jaxpr` 的某个输入相关的副作用。
 
-  This is used as a base class for effects associated with inputs, e.g.,
-  reading/writing from mutable inputs.
+  它被用作与输入相关的效果的基类，例如对可变输入的读/写。
 
-  In a `JaxprEqn` or a `Jaxpr`, `input` is the `core.Var` for the input the
-  effect is associated with. An abstract eval rule has no variables in scope,
-  so there `input` is instead an int, the position of the corresponding
-  primitive input. The tracing machinery resolves positions into variables
-  when it forms an equation (see `core.resolve_input_effects`).
+  在 `JaxprEqn` 或 `Jaxpr` 中，`input` 是该效果所关联输入的 `core.Var`。
+  抽象求值规则的作用域中没有变量，因此在那里 `input` 是一个 int，
+  即对应原语输入的位置。追踪机制在构造方程时会把位置解析为
+  变量（参见 `core.resolve_input_effects`）。
   """
 
   def __init__(self, input: Any):
@@ -115,11 +114,11 @@ class EffectTypeSet:
 no_effects: Effects = frozenset()
 ordered_effects: EffectTypeSet = EffectTypeSet()
 
-# By default, ordered effects are not allowed in multi-device computations,
-# because we cannot ensure a total order. Optionally, an effect can be
-# declared as shardable, which means that effects will appear in program order
-# but for a given program point we may see several side effects on the
-# participating devices, and there is no guarantee of their relative ordering.
+# 默认情况下，有序效果不允许出现在多设备计算中，
+# 因为我们无法保证全序。效果可以选择性地被
+# 声明为可分片，这意味着效果会按程序顺序出现，
+# 但在某个程序点上我们可能会看到参与设备上的多个副作用，
+# 且它们的相对顺序没有任何保证。
 shardable_ordered_effects: EffectTypeSet = EffectTypeSet()
 
 lowerable_effects: EffectTypeSet = EffectTypeSet()

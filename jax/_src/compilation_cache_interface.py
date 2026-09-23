@@ -19,6 +19,11 @@ import pathlib
 
 from jax._src import util
 
+# 文件职责：定义 JAX 编译缓存（compilation cache）的抽象接口。
+# `CacheInterface` 声明了按字符串键读写编译产物的最小组约：`get` 取回缓存项、
+# `put` 写入缓存项，并约定实现方以 `_path` 暴露缓存所在路径。
+# 具体的持久化/淘汰策略由后端实现类提供，JAX 的编译流程只依赖这个接口，
+# 从而可以在磁盘缓存、内存缓存等不同实现之间切换。
 
 class CacheInterface(util.StrictABC):
   _path: pathlib.Path

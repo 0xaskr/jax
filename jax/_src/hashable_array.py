@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the
 
+# 文件职责：定义 `HashableArray`，一个把 NumPy 数组包装成可哈希、可比较对象的轻量包装器。
+# NumPy 数组本身不可哈希，且 `==` 返回的是逐元素布尔数组，因此无法直接用作
+# jaxpr 参数或缓存键；本模块保存一份只读副本，并以形状、数据类型和原始字节定义哈希，
+# 以形状、数据类型和逐元素相等定义判等。它被 `lax.py`（原语参数）、`ffi.py`（FFI 调用
+# 绑定参数）、`experimental/key_reuse` 以及 MLIR 解释器的属性处理器用来支持缓存与序列化。
+
 import numpy as np
 
 

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 JAX 的自定义导数机制（custom_jvp、custom_vjp、
+# custom_gradient），让用户用自己提供的 JVP/VJP 规则替换自动微分。
+# 这里定义了这些装饰器类及其原语（custom_jvp_call、custom_vjp_call），
+# 以及它们在抽象求值、MLIR 降级、转置、部分求值/死代码消除、
+# 打印等解释器中的规则；此外还提供 closure_convert、linear_call 等辅助 API。
+
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -53,7 +59,7 @@ map = safe_map
 zip = safe_zip
 
 
-### util
+### 工具函数
 
 def _sum_tangents(_, x, *xs):
   return reduce(ad.add_tangents, xs, x)
@@ -67,7 +73,7 @@ _stop_gradient = partial(
 )
 
 
-# like the api_util.py function, but also grabs output avals for error checking
+# 与 api_util.py 中的同名函数类似，但这里还会抓取输出的 aval 以便做错误检查
 @lu.transformation_with_aux2
 def _flatten_fun_nokwargs(f: Callable,
                           store: lu.Store, in_tree: PyTreeDef,
@@ -80,29 +86,24 @@ def _flatten_fun_nokwargs(f: Callable,
   return ans_flat
 
 
-### JVPs
+### JVP
 
 @custom_api_util.register_custom_decorator_type
 class custom_jvp[ReturnValue]:
-  """Set up a JAX-transformable function for a custom JVP rule definition.
+  """注册一个可被 JAX 变换的函数，以便为它定义自定义 JVP 规则。
 
-  This class is meant to be used as a function decorator. Instances are
-  callables that behave similarly to the underlying function to which the
-  decorator was applied, except when a differentiation transformation (like
-  :py:func:`jax.jvp` or :py:func:`jax.grad`) is applied, in which case a custom
-  user-supplied JVP rule function is used instead of tracing into and
-  performing automatic differentiation of the underlying function's
-  implementation.
+  该类用作函数装饰器。其实例是可调用对象，行为与被装饰的底层函数相似，
+  区别在于：当施加微分变换（如 :py:func:`jax.jvp` 或 :py:func:`jax.grad`）时，
+  会改用用户提供的自定义 JVP 规则函数，而不是追踪进底层函数的实现体
+  并对其执行自动微分。
 
-  There are two instance methods available for defining the custom JVP rule:
-  :py:func:`~jax.custom_jvp.defjvp` for defining a *single* custom JVP rule for
-  all the function's inputs, and for convenience
-  :py:func:`~jax.custom_jvp.defjvps`, which wraps
-  :py:func:`~jax.custom_jvp.defjvp`, and allows you to provide separate
-  definitions for the partial derivatives of the function w.r.t. each of its
-  arguments.
+  定义自定义 JVP 规则有两个实例方法可用：
+  :py:func:`~jax.custom_jvp.defjvp` 为函数的所有输入定义*单个*自定义 JVP 规则；
+  为方便起见还有 :py:func:`~jax.custom_jvp.defjvps`，它包装了
+  :py:func:`~jax.custom_jvp.defjvp`，并允许你为函数关于各个参数的偏导数
+  分别给出定义。
 
-  For example::
+  例如::
 
     @jax.custom_jvp
     def f(x, y):
@@ -116,7 +117,7 @@ class custom_jvp[ReturnValue]:
       tangent_out = jnp.cos(x) * x_dot * y + jnp.sin(x) * y_dot
       return primal_out, tangent_out
 
-  For a more detailed introduction, see the tutorial_.
+  更详细的介绍参见教程 tutorial_。
 
   .. _tutorial: https://docs.jax.dev/en/latest/notebooks/Custom_derivative_rules_for_Python_code.html
   """
@@ -161,29 +162,23 @@ class custom_jvp[ReturnValue]:
              jvp: Callable[..., tuple[ReturnValue, ReturnValue]],
              symbolic_zeros: bool = False,
              ) -> Callable[..., tuple[ReturnValue, ReturnValue]]:
-    """Define a custom JVP rule for the function represented by this instance.
+    """为本实例所表示的函数定义一条自定义 JVP 规则。
 
     Args:
-      jvp: a Python callable representing the custom JVP rule. When there are no
-        ``nondiff_argnums``, the ``jvp`` function should accept two arguments,
-        where the first is a tuple of primal inputs and the second is a tuple of
-        tangent inputs. The lengths of both tuples are equal to the number of
-        parameters of the :class:`~jax.custom_jvp` function. The ``jvp`` function
-        should produce as output a pair where the first element is the primal
-        output and the second element is the tangent output. Elements of the
-        input and output tuples may be arrays or any nested tuples/lists/dicts
-        thereof.
-      symbolic_zeros: boolean, indicating whether the rule should be passed
-        objects representing static symbolic zeros in its tangent argument in
-        correspondence with unperturbed values; otherwise, only standard JAX
-        types (e.g. array-likes) are passed. Setting this option to ``True``
-        allows a JVP rule to detect whether certain inputs are not involved in
-        differentiation, but at the cost of needing special handling for these
-        objects (which e.g. can't be passed into jax.numpy functions). Default
-        ``False``.
+      jvp: 表示自定义 JVP 规则的 Python 可调用对象。当没有 ``nondiff_argnums``
+        时，``jvp`` 函数应接受两个参数：第一个是原始输入（primal）的元组，
+        第二个是切向量输入（tangent）的元组。两个元组的长度都等于
+        :class:`~jax.custom_jvp` 函数的参数个数。``jvp`` 函数应输出一个二元组，
+        其中第一个元素是原始输出，第二个元素是切向量输出。输入和输出元组的
+        元素可以是数组，也可以是它们任意嵌套的 tuple/list/dict。
+      symbolic_zeros: 布尔值，表示是否在切向量参数中传入代表静态符号零的对象，
+        以与未被扰动的值相对应；否则只传入标准 JAX 类型（例如类数组对象）。
+        将该选项设为 ``True`` 可让 JVP 规则检测某些输入是否不参与微分，
+        代价是必须对这类对象做特殊处理（例如它们无法传入 jax.numpy 函数）。
+        默认为 ``False``。
 
     Returns:
-      Returns ``jvp`` so that ``defjvp`` can be used as a decorator.
+      返回 ``jvp``，以便 ``defjvp`` 可用作装饰器。
 
     Examples:
 
@@ -210,18 +205,17 @@ class custom_jvp[ReturnValue]:
     return jvp
 
   def defjvps(self, *jvps: Callable[..., ReturnValue] | None) -> None:
-    """Convenience wrapper for defining JVPs for each argument separately.
+    """用于为每个参数分别定义 JVP 的便捷包装器。
 
-    This convenience wrapper cannot be used together with ``nondiff_argnums``.
+    该便捷包装器不能与 ``nondiff_argnums`` 一起使用。
 
     Args:
-      *jvps: a sequence of functions, one for each positional argument of the
-        :class:`~jax.custom_jvp` function. Each function takes as arguments
-        the tangent value for the corresponding primal input, the primal
-        output, and the primal inputs. See the example below.
+      *jvps: 一个函数序列，为 :class:`~jax.custom_jvp` 函数的每个位置参数各
+        提供一个函数。每个函数接受的参数依次是：对应原始输入的切向量值、
+        原始输出以及各个原始输入。参见下面的例子。
 
     Returns:
-      None.
+      None。
 
     Examples:
 
@@ -320,7 +314,7 @@ def _flatten_jvp(f, store, primal_name, jvp_name, in_tree, maybe_out_type, *args
            "produce primal and tangent outputs with equal container (pytree) "
            f"structures, but got {out_tree} and {out_tree2} respectively.")
     raise TypeError(msg)
-  # If the primal function already ran, check out_tree agreement.
+  # 如果原始函数已经运行过，则检查 out_tree 是否一致。
   try: out_type_ = maybe_out_type()
   except lu.StoreException: out_type_ = None
   if out_type_ is not None:
@@ -429,7 +423,7 @@ custom_jvp_call_p = CustomJVPCallPrimitive('custom_jvp_call')
 
 def _custom_jvp_call_typecheck(_, *in_avals, call_jaxpr, jvp_jaxpr_fun,
                                num_consts, symbolic_zeros):
-  # TODO(mattjj): could do more checking here...
+  # TODO(mattjj): 这里还可以做更多检查...
   del in_avals, jvp_jaxpr_fun, num_consts
   disallowed_effects = effects.custom_derivatives_allowed_effects.filter_not_in(call_jaxpr.effects)
   if disallowed_effects:
@@ -460,7 +454,7 @@ ad.fancy_transposes[custom_jvp_call_p] = _custom_jvp_call_transpose_fancy
 def _cached_closed_call_dce_instantiate(jaxpr_: core.Jaxpr,
                                         used_outputs: tuple[bool, ...]
                                         ) -> tuple[core.Jaxpr, list[bool]]:
-  # dce_jaxpr and replace preserve attached consts.
+  # dce_jaxpr 与 replace 都会保留挂载的常量。
   return pe.dce_jaxpr(
       jaxpr_.replace(debug_info=jaxpr_.debug_info.with_unknown_names()),
       used_outputs, True)
@@ -473,8 +467,8 @@ def _custom_jvp_call_dce(
 
   call_jaxpr = eqn.params["call_jaxpr"]
   jvp_jaxpr_fun = eqn.params["jvp_jaxpr_fun"]
-  # We must set instantiate=True because some inputs that are unused by the
-  # DCE'ed primal might be used in the JVP rule.
+  # 必须设置 instantiate=True，因为经 DCE 后的原始函数未使用的某些输入
+  # 仍可能在 JVP 规则中被用到。
   dce_call_jaxpr, used_ins = _cached_closed_call_dce_instantiate(
       call_jaxpr, tuple(used_outs))
   assert all(used_ins)
@@ -518,24 +512,21 @@ def _custom_jvp_call_pp_rule(eqn: core.JaxprEqn,
 
 core.pp_eqn_rules[custom_jvp_call_p] = _custom_jvp_call_pp_rule
 
-### VJPs
+### VJP
 
 @custom_api_util.register_custom_decorator_type
 class custom_vjp[ReturnValue]:
-  """Set up a JAX-transformable function for a custom VJP rule definition.
+  """注册一个可被 JAX 变换的函数，以便为它定义自定义 VJP 规则。
 
-  This class is meant to be used as a function decorator. Instances are
-  callables that behave similarly to the underlying function to which the
-  decorator was applied, except when a reverse-mode differentiation
-  transformation (like :py:func:`jax.grad`) is applied, in which case a custom
-  user-supplied VJP rule function is used instead of tracing into and performing
-  automatic differentiation of the underlying function's implementation. There
-  is a single instance method, :py:func:`~jax.custom_vjp.defvjp`, which may be
-  used to define the custom VJP rule.
+  该类用作函数装饰器。其实例是可调用对象，行为与被装饰的底层函数相似，
+  区别在于：当施加反向模式微分变换（如 :py:func:`jax.grad`）时，
+  会改用用户提供的自定义 VJP 规则函数，而不是追踪进底层函数的实现体
+  并对其执行自动微分。该类只有一个实例方法
+  :py:func:`~jax.custom_vjp.defvjp`，可用于定义自定义 VJP 规则。
 
-  This decorator precludes the use of forward-mode automatic differentiation.
+  该装饰器会禁止使用正向模式自动微分。
 
-  For example::
+  例如::
 
     @jax.custom_vjp
     def f(x, y):
@@ -550,7 +541,7 @@ class custom_vjp[ReturnValue]:
 
     f.defvjp(f_fwd, f_bwd)
 
-  For a more detailed introduction, see the tutorial_.
+  更详细的介绍参见教程 tutorial_。
 
   .. _tutorial: https://docs.jax.dev/en/latest/notebooks/Custom_derivative_rules_for_Python_code.html
   """
@@ -596,68 +587,52 @@ class custom_vjp[ReturnValue]:
              symbolic_zeros: bool = False,
              optimize_remat: bool = False,
              ) -> None:
-    """Define a custom VJP rule for the function represented by this instance.
+    """为本实例所表示的函数定义一条自定义 VJP 规则。
 
     Args:
-      fwd: a Python callable representing the forward pass of the custom VJP
-        rule. When there are no ``nondiff_argnums``, the ``fwd`` function has
-        the same input signature as the underlying primal function. It should
-        return as output a pair, where the first element represents the primal
-        output and the second element represents any "residual" values to store
-        from the forward pass for use on the backward pass by the function
-        ``bwd``. Input arguments and elements of the output pair may be arrays
-        or nested tuples/lists/dicts thereof.
-      bwd: a Python callable representing the backward pass of the custom VJP
-        rule. When there are no ``nondiff_argnums``, the ``bwd`` function takes
-        two arguments, where the first is the "residual" values produced on the
-        forward pass by ``fwd``, and the second is the output cotangent with the
-        same structure as the primal function output. The output of ``bwd`` must
-        be a tuple of length equal to the number of arguments of the primal
-        function, and the tuple elements may be arrays or nested
-        tuples/lists/dicts thereof so as to match the structure of the primal
-        input arguments.
-      symbolic_zeros: boolean, determining whether to indicate symbolic zeros
-        to the ``fwd`` and ``bwd`` rules. Enabling this option allows custom
-        derivative rules to detect when certain inputs, and when certain
-        output cotangents, are not involved in differentiation. If ``True``:
+      fwd: 表示自定义 VJP 规则前向传播的 Python 可调用对象。当没有
+        ``nondiff_argnums`` 时，``fwd`` 函数与底层原始函数具有相同的输入签名。
+        它应输出一个二元组，其中第一个元素表示原始输出，第二个元素表示前向传播中
+        需要保存、供 ``bwd`` 函数在反向传播时使用的任意“残差”值。输入参数以及
+        输出二元组的元素可以是数组，也可以是它们任意嵌套的 tuple/list/dict。
+      bwd: 表示自定义 VJP 规则反向传播的 Python 可调用对象。当没有
+        ``nondiff_argnums`` 时，``bwd`` 函数接受两个参数：第一个是 ``fwd``
+        在前向传播中产生的“残差”值，第二个是与原始函数输出结构相同的输出余切。
+        ``bwd`` 的输出必须是一个元组，其长度等于原始函数的参数个数；元组元素
+        可以是数组，也可以是它们任意嵌套的 tuple/list/dict，以便与原始输入
+        参数的结构相匹配。
+      symbolic_zeros: 布尔值，决定是否向 ``fwd`` 和 ``bwd`` 规则指示符号零。
+        启用该选项可让自定义导数规则检测某些输入以及某些输出余切是否不参与微分。
+        若为 ``True``：
 
-        * ``fwd`` must accept, in place of each leaf value ``x`` in
-          the pytree comprising an argument to the original function,
-          an object (of type
-          ``jax.custom_derivatives.CustomVJPPrimal``) with two
-          attributes instead: ``value`` and ``perturbed``. The
-          ``value`` field is the original primal argument, and
-          ``perturbed`` is a boolean.  The ``perturbed`` bit indicates
-          whether the argument is involved in differentiation (i.e.,
-          if it is ``False``, then the corresponding Jacobian "column"
-          is zero).
+        * ``fwd`` 必须改为接受一个对象（类型为
+          ``jax.custom_derivatives.CustomVJPPrimal``）来代替构成原始函数某个
+          参数的 pytree 中的每个叶值 ``x``；该对象带有两个属性：``value`` 和
+          ``perturbed``。``value`` 字段就是原始的 primal 参数，``perturbed``
+          是一个布尔值。该 ``perturbed`` 位表示此参数是否参与微分
+          （即若为 ``False``，则对应的 Jacobian “列”为零）。
 
-        * ``bwd`` will be passed objects representing static symbolic zeros in
-          its cotangent argument in correspondence with unperturbed values;
-          otherwise, only standard JAX types (e.g. array-likes) are passed.
+        * ``bwd`` 会在其余切参数中收到代表静态符号零的对象，以与未被扰动的值
+          相对应；否则只传入标准 JAX 类型（例如类数组对象）。
 
-        Setting this option to ``True`` allows these rules to detect whether
-        certain inputs and outputs are not involved in differentiation, but at
-        the cost of special handling. For instance:
+        将该选项设为 ``True`` 可让这些规则检测某些输入和输出是否不参与微分，
+        代价是需要特殊处理。例如：
 
-        * The signature of ``fwd`` changes, and the objects it is passed cannot
-          be output from the rule directly.
+        * ``fwd`` 的签名会改变，并且传给它的对象不能由该规则直接输出。
 
-        * The ``bwd`` rule is passed objects that are not entirely array-like,
-          and that cannot be passed to most ``jax.numpy`` functions.
+        * 传给 ``bwd`` 规则的对象并非完全是类数组的，无法传给大多数
+          ``jax.numpy`` 函数。
 
-        * Any custom pytree nodes involved in the primal function's arguments
-          must accept, in their unflattening functions, the two-field record
-          objects that are given as input leaves to the ``fwd`` rule.
+        * 原始函数参数中涉及的任何自定义 pytree 节点，其反扁平化函数必须能接受
+          作为输入叶值传给 ``fwd`` 规则的双字段记录对象。
 
-        Default ``False``.
-      optimize_remat: boolean, an experimental flag to enable an automatic
-        optimization when this function is used under :func:`jax.remat`. This
-        will be most useful when the ``fwd`` rule is an opaque call such as a
-        Pallas kernel or a custom call. Default ``False``.
+        默认为 ``False``。
+      optimize_remat: 布尔值，一个实验性开关：当该函数在 :func:`jax.remat` 下
+        使用时启用自动优化。当 ``fwd`` 规则是不透明的调用（例如 Pallas kernel
+        或自定义调用）时，这一优化最为有用。默认为 ``False``。
 
     Returns:
-      None.
+      None。
 
     Examples:
 
@@ -694,17 +669,15 @@ class custom_vjp[ReturnValue]:
                        symbolic_zeros: bool = False,
                        optimize_remat: bool = False,
                        ) -> None:
-    """Like :py:func:`~jax.custom_vjp.defvjp`, but ``bwd`` can also log.
+    """类似于 :py:func:`~jax.custom_vjp.defvjp`，但 ``bwd`` 还可以记录日志。
 
-    The only difference from ``defvjp`` is the return convention of ``bwd``:
-    it must return a pair ``(in_cts, logs)``, where ``in_cts`` is the usual
-    tuple of cotangents (one entry per primal argument), and ``logs`` is a
-    dict of named pytrees to log out of the backward pass, or ``None`` to log
-    nothing. To receive the logs, apply the VJP function via its
-    ``with_logs`` method: ``f_vjp.with_logs(out_ct)`` returns a pair
-    ``(arg_cts, logs)``. Logging is drop-by-default: a plain ``f_vjp(out_ct)``
-    call ignores the logs, and under ``jit`` the logging computation is
-    dead-code-eliminated.
+    与 ``defvjp`` 的唯一区别在于 ``bwd`` 的返回约定：它必须返回一个二元组
+    ``(in_cts, logs)``，其中 ``in_cts`` 是通常的余切元组（每个原始参数一项），
+    ``logs`` 是一个把命名 pytree 记录到反向传播之外的 dict，若什么都不记录则为
+    ``None``。要接收这些日志，请通过调用 VJP 函数的 ``with_logs`` 方法：
+    ``f_vjp.with_logs(out_ct)`` 返回一个二元组 ``(arg_cts, logs)``。
+    日志默认被丢弃：直接调用 ``f_vjp(out_ct)`` 会忽略日志，而在 ``jit`` 下
+    记录日志的计算会被死代码消除。
     """
     self.defvjp(fwd, bwd, symbolic_zeros=symbolic_zeros,
                 optimize_remat=optimize_remat)
@@ -730,7 +703,7 @@ class custom_vjp[ReturnValue]:
 
     debug_fwd = debug_info("custom_vjp fwd", self.fwd, args, kwargs,
                            static_argnums=self.nondiff_argnums)
-    # TODO(necula): figure out how to construct the debug_bwd args
+    # TODO(necula): 需要弄清如何构造 debug_bwd 的参数
     debug_bwd = debug_info("custom_vjp bwd", self.bwd, args, {})
     if self.optimize_remat:
       fwd = optimize_remat_of_custom_vjp_fwd(
@@ -770,7 +743,6 @@ class custom_vjp[ReturnValue]:
                                       symbolic_zeros=self.symbolic_zeros)
     _, (out_tree, _, _) = lu.merge_linear_aux(out_type, out_trees)
     return tree_unflatten(out_tree, out_flat)
-
 @lu.transformation2
 def _check_primal_refs(
     f: Callable, nondiff_argnums: Sequence[int], debug: core.DebugInfo, *args):
@@ -815,21 +787,19 @@ def _check_for_returned_refs(f, out, kind, args, after_idx):
 
 @dataclasses.dataclass(slots=True)
 class CustomVJPPrimal:
-  """Primal to a ``custom_vjp``'s forward rule when ``symbolic_zeros`` is set"""
+  """设置了 ``symbolic_zeros`` 时 ``custom_vjp`` 前向规则的原始值"""
   value: Any
   perturbed: bool
 
 def custom_vjp_primal_tree_values(tree):
-  """Strips away perturbation information from forward rule arguments.
+  """从正向规则的参数中剥离扰动信息。
 
-  This is a helper function for user with the ``symbolic_zeros`` option to
-  the ``defvjp`` method of a ``custom_vjp``-decorated function.
+  这是一个辅助函数，供使用 ``custom_vjp`` 装饰函数的 ``defvjp`` 方法中
+  ``symbolic_zeros`` 选项的用户使用。
 
-  In ``symbolic_zeros`` mode, the custom forward rule receives arguments
-  whose pytree leaves are records with a ``value`` attribute that carries
-  the primal argument. This is a way to convert such argument trees back to
-  their original form, replacing each such record with its carried value at
-  each leaf.
+  在 ``symbolic_zeros`` 模式下，自定义正向规则收到的参数，其 pytree
+  叶子是带有 ``value`` 属性的记录，该属性承载原始值参数。此函数把这类
+  参数树还原为原始形式，即在每个叶子上把这类记录替换为其承载的值。
   """
   def value(leaf):
     if type(leaf) is not CustomVJPPrimal:
@@ -881,7 +851,7 @@ def _flatten_fwd(f: Callable, store: lu.EqualStore,
   if config.mutable_array_checks.value:
     _check_for_returned_refs(f, pair_out, "fwd", args, out_tree.num_leaves)
   primal_avals = [core.typeof(x) for x in primals_out]
-  # If the primal function already ran, check out_tree agreement.
+  # 如果原始函数已经运行过，则检查 out_tree 是否一致。
   try: out_type_ = maybe_out_type()
   except lu.StoreException: out_type_ = None
   if out_type_ is not None:
@@ -917,7 +887,7 @@ def _flatten_fwd(f: Callable, store: lu.EqualStore,
            "shapes/dtypes of:\n"
            f"""    {str(ty_tree_).replace("'", "")}""")
       raise TypeError(m)
-  pruned_res, input_forwards = _filter_forwarded_inputs(res, args)  # prune
+  pruned_res, input_forwards = _filter_forwarded_inputs(res, args)  # 剪枝
   store.store((out_tree, res_tree, input_forwards))
   return (*pruned_res, *primals_out)
 
@@ -928,7 +898,7 @@ def _filter_forwarded_inputs(outs, ins):
 @lu.transformation2
 def _flatten_bwd(f: Callable,
                  in_tree: PyTreeDef,
-                 in_avals: Sequence[core.AbstractValue],  # primal avals
+                 in_avals: Sequence[core.AbstractValue],  # 输入原始值的抽象值(aval)
                  out_trees: Callable[[], tuple[PyTreeDef, PyTreeDef, list[int | None]]],
                  primal_fun, with_logs: bool, *args):
   out_tree, res_tree, _ = out_trees()
@@ -952,11 +922,11 @@ def _flatten_bwd(f: Callable,
     logs = None
   if isinstance(py_cts_in, list) and len(py_cts_in) == len(treedef_children(in_tree)):
     py_cts_in = tuple(py_cts_in)
-  # For each None in py_cts_in, indicating an argument for which the rule
-  # produces no cotangent, we replace it with a pytree with the structure of the
-  # corresponding subtree of in_tree and with leaves of a non-pytree sentinel
-  # object, to be replaced with Nones in the final returned result.
-  zero = object()  # non-pytree sentinel to replace Nones in py_cts_in
+  # 对于 py_cts_in 中每个 None（表示规则不为其产生切向量的参数），
+  # 我们把它替换为一个 pytree，其结构与 in_tree 的对应子树相同，
+  # 其叶子是非 pytree 的哨兵值对象；这些哨兵值会在最终返回的
+  # 结果中被替换回 None。
+  zero = object()  # 非 pytree 哨兵值，用于替换 py_cts_in 中的 None
   dummy = tree_unflatten(in_tree, [object()] * in_tree.num_leaves)
   keypaths, _ = unzip2(tree_flatten_with_path(dummy)[0])
   cts_in_flat = []
@@ -1015,7 +985,7 @@ def _ref_typecompat(a, a_):
   return (isinstance(a, AbstractRef) and
           core.typecompat(a.to_ct_aval().inner_aval, a_))
 
-# TODO(mattjj): remove both these exceptions to cotangent compatibility check
+# TODO(mattjj): 移除切向量兼容性检查中的这两个例外
 def _temporary_dtype_exception(a, a_) -> bool:
   if isinstance(a, core.ShapedArray) and isinstance(a_, core.ShapedArray):
     return (a.shape == a_.shape and
@@ -1073,7 +1043,7 @@ def _handle_consts_in_bwd(f, const_avals, *args):
   return [Zero(a) for a in const_avals] + list(cts), logs
 
 custom_vjp_call_p = CustomVJPCallPrimitive('custom_vjp_call')
-# TODO(phawkins,mattjj): make this primitive cacheable.
+# TODO(phawkins,mattjj): 让这个原语可缓存。
 mlir.register_lowering(custom_vjp_call_p, _custom_jvp_vjp_call_lowering,
                        cacheable=False)
 
@@ -1165,55 +1135,49 @@ def _custom_vjp_call_pp_rule(eqn: core.JaxprEqn,
 core.pp_eqn_rules[custom_vjp_call_p] = _custom_vjp_call_pp_rule
 
 batching.primitive_batchers[ad.custom_lin_p] = ad.raise_custom_vjp_error_on_jvp
-# TODO(phawkins,mattjj): make this primitive cacheable.
+# TODO(phawkins,mattjj): 让这个原语可缓存。
 mlir.register_lowering(ad.custom_lin_p, ad.raise_custom_vjp_error_on_jvp,
                        cacheable=False)
 
 
 def custom_gradient(fun=None, *, with_logs: bool = False):
-  """Convenience function for defining custom VJP rules (aka custom gradients).
+  """用于定义自定义 VJP 规则（即自定义梯度）的便捷函数。
 
-  While the canonical way to define custom VJP rules is via ``jax.custom_vjp``,
-  the ``custom_gradient`` convenience wrapper follows TensorFlow's
-  ``tf.custom_gradient`` API. The difference here is that ``custom_gradient``
-  can be used as a decorator on one function that returns both the primal value
-  (representing the output of the mathematical function to be differentiated)
-  and the VJP (gradient) function. See
-  https://www.tensorflow.org/api_docs/python/tf/custom_gradient.
+  虽然定义自定义 VJP 规则的规范方式是通过 ``jax.custom_vjp``，但
+  ``custom_gradient`` 这个便捷包装器遵循 TensorFlow 的
+  ``tf.custom_gradient`` API。区别在于，``custom_gradient`` 可以用作
+  单个函数的装饰器，该函数同时返回原始值（表示待微分数学函数的输出）
+  和 VJP（梯度）函数。参见
+  https://www.tensorflow.org/api_docs/python/tf/custom_gradient。
 
-  If the mathematical function to be differentiated has Haskell-like signature
-  ``a -> b``, then the Python callable ``fun`` should have the signature
-  ``a -> (b, CT b --o CT a)`` where we use ``CT x`` to denote a cotangent type
-  for ``x`` and the ``--o`` arrow to denote a linear function. See the example
-  below. That is, ``fun`` should return a pair where the first element
-  represents the value of the mathematical function to be differentiated and the
-  second element is a function to be called on the backward pass of reverse-mode
-  automatic differentiation (i.e. the "custom gradient" function).
+  若待微分的数学函数具有 Haskell 风格的签名 ``a -> b``，那么 Python
+  可调用对象 ``fun`` 的签名应为 ``a -> (b, CT b --o CT a)``，其中用
+  ``CT x`` 表示 ``x`` 的切向量类型，用 ``--o`` 箭头表示线性函数。参见
+  下面的示例。也就是说，``fun`` 应返回一个 pair，其第一个元素表示待
+  微分数学函数的值，第二个元素是在反向模式自动微分的反向传播中调用的
+  函数（即“自定义梯度”函数）。
 
-  The function returned as the second element of the output of ``fun`` can close
-  over intermediate values computed when evaluating the function to be
-  differentiated. That is, use lexical closure to share work between the forward
-  pass and the backward pass of reverse-mode automatic differentiation. However,
-  it cannot perform Python control flow which depends on the values of the
-  closed-over intermediate values or its cotangent arguments; if the function
-  includes such control flow, an error is raised.
+  作为 ``fun`` 输出第二个元素返回的函数，可以闭包捕获求值待微分函数时
+  计算出的中间值。也就是说，使用词法闭包在反向模式自动微分的前向传播
+  与反向传播之间共享计算。然而，它不能执行依赖于被闭包捕获的中间值或
+  其切向量参数取值的 Python 控制流；如果该函数包含这类控制流，就会
+  抛出错误。
 
   Args:
-    fun: a Python callable specifying both the mathematical function to be
-      differentiated and its reverse-mode differentiation rule. It should return
-      a pair consisting of an output value and a Python callable that represents
-      the custom gradient function.
-    with_logs: optional bool, default ``False``. If ``True``, the custom
-      gradient function must return a pair ``(in_cts, logs)`` rather than just
-      the cotangents, where ``logs`` is a dict of named pytrees to log out of
-      the backward pass, or ``None`` to log nothing, as with
-      :py:meth:`jax.custom_vjp.defvjp_with_logs`.
+    fun: 一个 Python 可调用对象，同时指定待微分的数学函数及其反向模式
+      微分规则。它应返回一个 pair，由输出值和一个表示自定义梯度函数的
+      Python 可调用对象组成。
+    with_logs: 可选 bool，默认 ``False``。若为 ``True``，自定义梯度函数
+      必须返回一个 pair ``(in_cts, logs)`` 而不只是切向量；其中 ``logs``
+      是一个从名字到 pytree 的字典，用于从反向传播中记录日志，若为
+      ``None`` 则不记录任何内容，与
+      :py:meth:`jax.custom_vjp.defvjp_with_logs` 一致。
 
   Returns:
-    A Python callable that accepts the same arguments as ``fun`` and returns the
-    output value specified by the first element of ``fun``'s output pair.
+    一个 Python 可调用对象，它接受与 ``fun`` 相同的参数，并返回由
+    ``fun`` 输出 pair 的第一个元素所指定的输出值。
 
-  For example:
+  例如：
 
   >>> @jax.custom_gradient
   ... def f(x):
@@ -1224,8 +1188,7 @@ def custom_gradient(fun=None, *, with_logs: bool = False):
   >>> print(jax.grad(f)(3.))
   3.0
 
-  An example with a function on two arguments, so that the VJP function must
-  return a tuple of length two:
+  下面是双参数函数的示例，此时 VJP 函数必须返回长度为二的元组：
 
   >>> @jax.custom_gradient
   ... def f(x, y):
@@ -1236,9 +1199,9 @@ def custom_gradient(fun=None, *, with_logs: bool = False):
   >>> print(jax.grad(f, argnums=(0, 1))(3., 4.))
   (Array(4., dtype=float32, weak_type=True), Array(3., dtype=float32, weak_type=True))
 
-  With ``with_logs=True``, the VJP function returns a pair of the cotangents
-  and a dict of backward-pass logs, received via the ``with_logs`` method of
-  the VJP function that :py:func:`jax.vjp` returns:
+  使用 ``with_logs=True`` 时，VJP 函数返回一个 pair，包含切向量和一个
+  反向传播日志字典，该字典通过 :py:func:`jax.vjp` 返回的 VJP 函数的
+  ``with_logs`` 方法获得：
 
   >>> @jax.custom_gradient(with_logs=True)
   ... def f(x):
@@ -1332,30 +1295,25 @@ class Residuals:
 
 
 def closure_convert(fun: Callable, *example_args) -> tuple[Callable, list[Any]]:
-  """Closure conversion utility, for use with higher-order custom derivatives.
+  """闭包转换工具，用于高阶自定义导数。
 
-  To define custom derivatives such as with ``jax.custom_vjp(f)``, the target
-  function ``f`` must take, as formal arguments, all values involved in
-  differentiation. If ``f`` is a higher-order function, in that it accepts as an
-  argument a Python function ``g``, then values stored away in ``g``'s closure
-  will not be visible to the custom derivative rules, and attempts at AD
-  involving these values will fail. One way around this is to convert the
-  closure by extracting these values, and to pass them as explicit formal
-  arguments across the custom derivative boundary. This utility carries out that
-  conversion. More precisely, it closure-converts the function ``fun``
-  specialized to the types of the arguments given in ``example_args``.
+  要用 ``jax.custom_vjp(f)`` 这类方式定义自定义导数，目标函数 ``f`` 必须
+  把所有参与微分的值都作为形式参数接收。如果 ``f`` 是高阶函数，即它接受
+  一个 Python 函数 ``g`` 作为参数，那么存储在 ``g`` 闭包中的值对自定义
+  导数规则不可见，涉及这些值的 AD 尝试将会失败。绕过这一点的一种办法是
+  做闭包转换，把这些值提取出来，并作为显式形式参数跨越自定义导数边界传递。
+  本工具执行该转换。更准确地说，它把特化到 ``example_args`` 中所给参数
+  类型的函数 ``fun`` 做闭包转换。
 
-  When we refer here to "values in the closure" of ``fun``, we do not mean the
-  values that are captured by Python directly when ``fun`` is defined (e.g. the
-  Python objects in ``fun.__closure__``, if the attribute exists). Rather, we
-  mean values encountered during the execution of ``fun`` on ``example_args``
-  that determine its output. This may include, for instance, arrays captured
-  transitively in Python closures, i.e. in the Python closure of functions
-  called by ``fun``, the closures of the functions that they call, and so forth.
+  这里所说的 ``fun`` “闭包中的值”，并不是指定义 ``fun`` 时 Python 直接
+  捕获的值（例如 ``fun.__closure__`` 中的 Python 对象，若该属性存在）。
+  我们指的是在 ``example_args`` 上执行 ``fun`` 期间遇到、并决定其输出的
+  值。例如，这可能包括在 Python 闭包中被传递性捕获的数组，即在 ``fun``
+  所调用函数的 Python 闭包、这些函数所调用函数的闭包等之中捕获的数组。
 
-  The function ``fun`` must be a pure function.
+  函数 ``fun`` 必须是纯函数。
 
-  Example usage::
+  用法示例::
 
     def minimize(objective_fn, x0):
       converted_fn, aux_args = closure_convert(objective_fn, x0)
@@ -1364,7 +1322,7 @@ def closure_convert(fun: Callable, *example_args) -> tuple[Callable, list[Any]]:
     @partial(custom_vjp, nondiff_argnums=(0,))
     def _minimize(objective_fn, x0, *args):
       z = objective_fn(x0, *args)
-      # ... find minimizer x_opt ...
+      # ... 求最小化点 x_opt ...
       return x_opt
 
     def fwd(objective_fn, x0, *args):
@@ -1374,24 +1332,22 @@ def closure_convert(fun: Callable, *example_args) -> tuple[Callable, list[Any]]:
     def rev(objective_fn, res, g):
       y, args = res
       y_bar = g
-      # ... custom reverse-mode AD ...
+      # ... 自定义反向模式 AD ...
       return x0_bar, *args_bars
 
     _minimize.defvjp(fwd, rev)
 
   Args:
-    fun: Python callable to be converted. Must be a pure function.
-    example_args: Arrays, scalars, or (nested) standard Python
-      containers (tuples, lists, dicts, namedtuples, i.e., pytrees)
-      thereof, used to determine the types of the formal arguments to
-      ``fun``. This type-specialized form of ``fun`` is the function
-      that will be closure converted.
+    fun: 要转换的 Python 可调用对象。必须是纯函数。
+    example_args: 数组、标量或其（嵌套的）标准 Python 容器
+      （元组、列表、字典、namedtuple，即 pytree），用于确定 ``fun``
+      各形式参数的类型。``fun`` 按类型特化后的这种形式，就是要被
+      闭包转换的函数。
 
   Returns:
-    A pair comprising (i) a Python callable, accepting the same
-    arguments as ``fun`` followed by arguments corresponding to the
-    values hoisted from its closure, and (ii) a list of values hoisted
-    from the closure.
+    一个 pair，由 (i) 一个 Python 可调用对象（它接受与 ``fun`` 相同的
+    参数，其后跟与从闭包中提升出来的值对应的参数）和 (ii) 一个从闭包
+    中提升出来的值组成的列表构成。
   """
   flat_args, in_tree = tree_flatten((example_args, {}))
   in_avals = tuple(map(core.typeof, flat_args))
@@ -1402,25 +1358,25 @@ def closure_convert(fun: Callable, *example_args) -> tuple[Callable, list[Any]]:
     return _closure_convert_for_avals(fun, in_tree, in_avals, debug)
 
 def _maybe_perturbed(x: Any) -> bool:
-  # False if x can't represent an AD-perturbed value (i.e. a value
-  # with a nontrivial tangent attached), up to heuristics, and True otherwise.
-  # See https://github.com/jax-ml/jax/issues/6415 for motivation.
+  # 若 x 无法表示被 AD 扰动过的值（即带有非平凡切向量的值），
+  # 按启发式判断返回 False，否则返回 True。
+  # 动机参见 https://github.com/jax-ml/jax/issues/6415。
   if not isinstance(x, core.Tracer):
-    # If x is not a Tracer, it can't be perturbed.
+    # 若 x 不是 Tracer，它就不可能被扰动。
     return False
   elif isinstance(x, ad.JVPTracer) and isinstance(x.tangent, ad.Zero):
     return _maybe_perturbed(x.primal)
   elif isinstance(x, pe.DynamicJaxprTracer):
-    # If x is a DynamicJaxprTracer then we're staging out; differentiation could
-    # happen later, but some types always have trivial tangents.
+    # 若 x 是 DynamicJaxprTracer，说明我们正在暂存输出；微分可能稍后
+    # 才发生，但某些类型的切向量总是平凡的。
     vspace = x.aval.to_tangent_aval()
     return not (vspace is core.abstract_token or
                 getattr(vspace, 'dtype', None) == dtypes.float0)
   elif not isinstance(x, ad.JVPTracer):
-    # If x is not a JVPTracer, recursively check its contents.
+    # 若 x 不是 JVPTracer，则递归检查其内容。
     return any(_maybe_perturbed(attr) for name, attr in x._contents())
   else:
-    return True  # We can't be sure!
+    return True  # 我们无法确定！
 
 @cache()
 def _closure_convert_for_avals(fun, in_tree, in_avals,
@@ -1458,29 +1414,27 @@ def partition_list(choice, lst):
   return out, merge
 
 
-### Custom transposition
+### 自定义转置
 
 def linear_call(fun: Callable,
                 fun_transpose: Callable, residual_args,
                 linear_args):
-  """Call a linear function, with a custom implementation for its transpose.
+  """调用一个线性函数，并为其转置提供自定义实现。
 
-  The `Haskell-like type signatures`_ of ``fun`` and ``fun_transpose`` are:
+  ``fun`` 和 ``fun_transpose`` 的 `Haskell-like type signatures`_ 为：
 
   .. code-block:: haskell
 
     fun           :: r -> a -o b
     fun_transpose :: r -> b -o a
 
-  where the ``-o`` arrow indicates a linear function, ``r`` is the
-  residual input type and ``a`` is the linear input type.
+  其中 ``-o`` 箭头表示线性函数，``r`` 是残差输入类型，``a`` 是线性输入类型。
 
-  The functions ``fun`` and ``fun_transpose`` are coupled as
-  transposes of one another. Specifically, the transpose of a
-  ``linear_call`` primitive is another ``linear_call`` to
-  ``fun_transpose``, with ``fun`` as its custom transposition.
+  ``fun`` 和 ``fun_transpose`` 彼此互为转置。具体来说，
+  ``linear_call`` 原语的转置是另一个针对 ``fun_transpose`` 的
+  ``linear_call``，并把 ``fun`` 作为其自定义转置。
 
-  For example:
+  例如：
 
   >>> def f(r, x):
   ...   return x / r
@@ -1506,11 +1460,10 @@ def linear_call(fun: Callable,
   >>> transpose(lambda x: x + x / 3., 1.)(18.)  # reference
   Array(24., dtype=float32, weak_type=True)
 
-  The above definition of ``f`` illustrates the purpose of a residual
-  argument: division is linear in one of its inputs (the dividend
-  ``x``) but not the other (the divisor ``r``).
+  上面 ``f`` 的定义说明了残差参数的用途：除法对其中一个输入（被除数
+  ``x``）是线性的，但对另一个输入（除数 ``r``）不是。
 
-  As another example:
+  再举一个例子：
 
   >>> def custom_id(x):
   ...   def f(_, x): return x
@@ -1526,24 +1479,22 @@ def linear_call(fun: Callable,
   TypedFloat(7.0, dtype=float32)
 
   Args:
-    fun: a Python callable specifying a linear function. It should
-      take two arguments: one of "residual" inputs (type ``r``),
-      i.e. inputs in which the function is not necessarily linear, and
-      one of "linear" inputs (type ``a``).  It should return output
-      whose components are linear in the linear input (type ``b``).
-    fun_transpose: a Python callable specifying a structurally linear
-      function that is the transpose of ``fun`` with respect to its
-      linear inputs. Its first argument is the same residual inputs
-      (``r``) as ``fun``. Its second argument is of type
-      ``b``. Finally, its output is of type ``a`` and each of its
-      component are linear in its second argument (the ``b`` inputs).
-    residual_args: Argument in which ``fun`` and ``fun_transpose`` are
-      not necessarily linear. Not involved in transposition.
-    linear_args: Argument in which ``fun`` and ``fun_transpose`` are
-      linear and with respect to which the two are transposes.
+    fun: 一个 Python 可调用对象，指定一个线性函数。它应接受两个参数：
+      一个是“残差”输入（类型 ``r``），即函数对其不一定线性的输入；
+      另一个是“线性”输入（类型 ``a``）。它应返回各分量关于线性输入
+      为线性的输出（类型 ``b``）。
+    fun_transpose: 一个 Python 可调用对象，指定一个结构上线性的函数，
+      它是 ``fun`` 关于其线性输入的转置。它的第一个参数是与 ``fun``
+      相同的残差输入（``r``）。它的第二个参数类型为 ``b``。最后，
+      它的输出类型为 ``a``，且其每个分量关于其第二个参数（``b`` 输入）
+      是线性的。
+    residual_args: ``fun`` 和 ``fun_transpose`` 对其不一定线性的参数。
+      不参与转置。
+    linear_args: ``fun`` 和 ``fun_transpose`` 对其均为线性、且两者
+      关于它互为转置的参数。
 
   Returns:
-    The call result, i.e. ``fun(residual_args, linear_args)``.
+    调用结果，即 ``fun(residual_args, linear_args)``。
 
   .. _Haskell-like type signatures: https://wiki.haskell.org/Type_signature
   """
@@ -1567,7 +1518,7 @@ def linear_call(fun: Callable,
         fun_transpose,
         ft.pack(((ft.FTPyTree(res_avals, res_tree),
                   ft.FTPyTree(list(out_avals), out_tree)), {})),
-        # TODO(necula): the fun_transpose takes residual and output of fun!
+        # TODO(necula): fun_transpose 接收的是 fun 的残差和输出！
         debug_info("linear_call fun_transpose", fun_transpose,
                    (residual_args, linear_args), {}).with_unknown_names())
     if t_out_avals.tree != lin_tree:
@@ -1584,7 +1535,6 @@ def linear_call(fun: Callable,
                            num_res=len(operands_res))
 
   return tree_unflatten(out_tree, out)
-
 def _linear_call_impl(*args, callee, transpose_thunk, num_callee_consts,
                       num_res):
   del transpose_thunk, num_callee_consts, num_res
@@ -1640,7 +1590,7 @@ mlir.register_lowering(linear_call_p, mlir.lower_fun(
     _linear_call_impl, multiple_results=True))
 
 
-# A stageable primitive that fails when evaluated
+# 一个可暂存的原语，在求值时失败
 unreachable_p: core.Primitive = core.Primitive('unreachable')
 unreachable_p.multiple_results = True
 
@@ -1648,36 +1598,34 @@ def unreachable_impl(*_, out_avals, exc_type, message):
   del out_avals
   raise exc_type(message)
 
-# Evaluation raises an exception
+# 求值会抛出异常
 unreachable_p.def_impl(unreachable_impl)
 
-# Translation raises an exception
-# TODO(frostig,mattjj): We have no good way to translate a function
-# that errs. Since MLIR lowering over-approximates concrete evaluation,
-# we err on MLIR lowering for the time being.
+# 转换（lowering）会抛出异常
+# TODO(frostig,mattjj): 对于一个会出错的函数，我们还没有好的转换办法。
+# 由于 MLIR 降级是对具体求值的过近似，我们暂时选择在 MLIR 降级阶段报错。
 mlir.register_lowering(unreachable_p, unreachable_impl)
 
-# Abstract evaluation proceeds without issue, to allow for staging
+# 抽象求值可以正常进行，以便支持暂存
 unreachable_p.def_abstract_eval(lambda *_, out_avals, **__: out_avals)
 
 def unreachable(*args, out_avals=None, exc_type=TypeError,
                 message='unreachable'):
-  """Fail when evaluated concretely (but allow for staging).
+  """在具体求值时失败（但允许暂存）。
 
-  This function allows one to assert an impossibility of
-  evaluation. It can be used to guarantee that evaluation does not
-  "reach" a certain point in the sense that it does not execute, but
-  it can nonetheless be staged out by JAX without error.
+  该函数允许断言某种求值不可能发生。可以用它来保证求值不会
+  “到达”某个点：也就是说它不会被执行，但 JAX 仍然可以
+  在不报错的情况下把它暂存出去。
 
   Args:
-    *args: The arbitrary pytree of arguments to the function.
-    out_avals: Optional specification of the output types of this
-     function invocation from the point of view of staging. If
-     ``None``, these are chosen as equal to types of input arguments.
-    exc_type: Optional constructor for the Python exception raised if
-      evaluated.
-    message: Optional string message for the Python exception raised
-      if evaluated.
+    *args: 传给该函数的任意 pytree 参数。
+    out_avals: 可选参数，从暂存的角度说明这次函数调用的
+     输出类型。若为 ``None``，则这些类型取为与输入
+     参数类型相同。
+    exc_type: 可选参数，为求值时抛出的 Python 异常提供
+      构造函数。
+    message: 可选参数，为求值时抛出的 Python 异常提供
+      字符串消息。
 
   """
   if out_avals is None:
@@ -1696,19 +1644,17 @@ disallow_jvp = partial(
     message="can't apply forward-mode autodiff (jvp) to a custom_vjp function.")
 
 
-# TODO(mattjj): remove these stubs, which exist to avoid breaking internal users
+# TODO(mattjj): 删除这些桩（stub），它们的存在是为了避免破坏内部使用者
 custom_jvp_call_jaxpr_p = core.Primitive("custom_jvp_call_jaxpr")
 
-# The following is a helper for optimizing the behavior of custom_vjp when used
-# under remat. This is really only useful when the `fwd` function to custom_vjp
-# executes a black box kernel. Otherwise, DCE will perform this optimization
-# automatically.
+# 下面是一个辅助函数，用于优化 custom_vjp 在 remat 之下使用时的
+# 行为。它真正有用的场景，是 custom_vjp 的 `fwd` 函数执行一个黑盒
+# kernel 的时候；否则，DCE 会自动完成这项优化。
 #
-# TODO(dfm): Eventually this should probably be the default behavior for
-# custom_vjp, if we can make it so that it is a no-op for most cases. Right now,
-# it is written in "initial-style" so it doesn't support eager mode. This was
-# a reasonable compromise when written because it made the implementation
-# simpler, but it would be worth revisiting this.
+# TODO(dfm): 如果能让它在大多数情况下都是无操作，最终这大概应该成为
+# custom_vjp 的默认行为。目前它以 "initial-style" 方式编写，因此不支持
+# 即时（eager）模式。当初这么写时，由于能让实现更简单，这是一个合理
+# 的折中，但值得重新审视。
 def optimize_remat_of_custom_vjp_fwd[ReturnValue](
     fun: Callable[..., ReturnValue],
     debug_fun: core.DebugInfo,
@@ -1718,16 +1664,16 @@ def optimize_remat_of_custom_vjp_fwd[ReturnValue](
     symbolic_zeros: bool = False,
 ) -> Callable[..., tuple[ReturnValue, Any]]:
   if symbolic_zeros:
-    # TODO(dfm): This probably shouldn't be too hard to support.
+    # TODO(dfm): 支持它大概不会太难。
     raise NotImplementedError(
         "remat optimization for custom_vjp does not support symbolic zeros")
 
   @wraps(fwd)
   def wrapped_fwd(*args, **kwargs) -> tuple[ReturnValue, Any]:
-    # TODO(dfm): This initial logic is duplicated from custom_vjp.__call__
-    # above and it would be good to consolidate it.
-    # Note: we use `fun` instead of `fwd` here for consistency with
-    # custom_vjp.__call__ above.
+    # TODO(dfm): 这里开头的逻辑与上面 custom_vjp.__call__ 中的
+    # 逻辑重复，最好把它们合并起来。
+    # 注意：这里使用 `fun` 而不是 `fwd`，是为了与上面的
+    # custom_vjp.__call__ 保持一致。
     args = resolve_kwargs(fun, args, kwargs)
     if nondiff_argnums:
       for i in nondiff_argnums: _check_for_tracers(args[i])
@@ -1791,7 +1737,7 @@ def _remat_opt_impl(
     fwd_jaxpr: core.Jaxpr,
     fun_jaxpr_thunk: Callable[[], tuple[core.Jaxpr, Sequence[Any]]],
 ):
-  del num_consts, num_res, fun_jaxpr_thunk  # unused
+  del num_consts, num_res, fun_jaxpr_thunk  # 未使用
   return core.jaxpr_as_fun(fwd_jaxpr)(*args)
 
 def _remat_opt_abstract_eval(*args, fwd_jaxpr: core.Jaxpr, **_):
@@ -1844,7 +1790,7 @@ def _remat_opt_jvp(
 ):
   consts, primals = split_list(primals, [num_consts])
   consts_dot, tangents = split_list(tangents, [num_consts])
-  # Tangents must be instantated in case we end up DCEing later.
+  # 切向量必须被实例化，以防之后被死代码消除（DCE）。
   tangents = map(ad.instantiate_zeros, tangents)
   consts_nz = [not isinstance(t, Zero) for t in consts_dot]
   consts_dot = [c for nz, c in zip(consts_nz, consts_dot) if nz]
@@ -1879,8 +1825,7 @@ def _remat_opt_transpose(
     fwd_jaxpr: core.Jaxpr,
     fun_jaxpr_thunk: Callable[[], tuple[core.Jaxpr, Sequence[Any]]],
 ):
-  # TODO(dfm): It shouldn't be too hard to implement this as needed in the
-  # future.
+  # TODO(dfm): 将来如有需要，实现它应该不会太难。
   raise NotImplementedError(
       "remat optimization for custom_vjp does not support higher-order AD")
 
@@ -1890,9 +1835,8 @@ def _remat_opt_dce(used_outs: list[bool], eqn: core.JaxprEqn):
   used_res, used_prims = split_list(used_outs, [eqn.params["num_res"]])
   outvars = [v for used, v in zip(used_outs, eqn.outvars) if used]
   if any(used_res):
-    # If any of the residuals are used, we still need to run fwd at this point,
-    # but we may end up DCEing again in the future, so we must instantiate all
-    # the input primals.
+    # 如果任何一个残差被使用，此时我们仍然需要运行 fwd，但之后
+    # 可能还会再次进行死代码消除，因此必须实例化所有的输入原始值。
     instantiate = [False] * eqn.params["num_consts"]
     instantiate += [True] * (len(eqn.invars) - eqn.params["num_consts"])
     new_jaxpr, used_ins = pe.dce_jaxpr(eqn.params["fwd_jaxpr"], used_outs,
@@ -1911,10 +1855,9 @@ def _remat_opt_dce(used_outs: list[bool], eqn: core.JaxprEqn):
         eqn.source_info, eqn.ctx)
     return used_ins, new_eqn
   else:
-    # If none of the residuals are used, we run the primal computation instead.
-    # At this point we drop this custom DCE behavior, but since the primal might
-    # have different consts than fwd, we build a new JaxprEqn with a closed_call
-    # primitive.
+    # 如果没有任何残差被使用，我们就改为运行原始值计算。此时我们放弃
+    # 这一自定义 DCE 行为；但由于原始值计算可能与 fwd 拥有不同的常量，
+    # 因此我们用一个 `closed_call` 原语构造新的 `JaxprEqn`。
     fun_jaxpr, consts = eqn.params["fun_jaxpr_thunk"]()
     closed_jaxpr, _, used_ins = pe.dce_jaxpr_consts(
         fun_jaxpr.with_consts(consts), used_prims)

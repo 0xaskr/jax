@@ -65,21 +65,21 @@ logger = logging.getLogger(__name__)
 TracebackScope = _jax.TracebackScope
 
 class PartialVal(tuple):
-  """Partial value: either a known value or an unknown (abstract) value.
+  """部分值：要么是已知值，要么是未知（抽象）值。
 
-  Represented as a pair `(aval_opt, const)` of one of two kinds:
-  * `(None, <Constant>)` indicates a known value, where the constant satisfies
-    `core.valid_jaxtype(const)`;
-  * `(<AbstractValue>, None)` indicates an unknown value characterized by an
-    abstract value.
+  表示为 `(aval_opt, const)` 二元组，属于以下两种之一：
+  * `(None, <Constant>)` 表示已知值，其中该常量满足
+    `core.valid_jaxtype(const)`；
+  * `(<AbstractValue>, None)` 表示未知值，其特征由
+    一个抽象值刻画。
   """
   def __new__(cls, xs: tuple[AbstractValue | None, core.Value]):
     pv, const = xs
     if config.enable_checks.value:
-      # type checks
+      # 类型检查
       assert isinstance(pv, (AbstractValue, type(None))), xs
       assert (const is None or core.valid_jaxtype(const)), const
-      # invariant checks
+      # 不变量检查
       assert (pv is None) ^ (const is None)
     return tuple.__new__(cls, xs)
 
@@ -95,11 +95,11 @@ class PartialVal(tuple):
     return self[0] is None
 
   def get_known(self) -> core.Value | None:
-    """Get the known value, if known, else None."""
+    """获取已知值，若已知则返回值，否则返回 None。"""
     return self[1] if self[0] is None else None
 
   def get_aval(self) -> AbstractValue:
-    """Get AbstractValue directly (if unknown) or from the constant (known)."""
+    """直接获取 AbstractValue（若未知），或从常量获取（若已知）。"""
     known = self.get_known()
     if known is not None:
       return typeof(known)
@@ -147,10 +147,10 @@ class JaxprTrace(Trace):
 
   def new_arg(self, pval: PartialVal) -> JaxprTracer:
     const = pval.get_known()
-    # XXX: Think twice before changing this constant argument pruning!
-    # This has really important consequences for partial_eval_jaxpr.
-    # Most importantly, this guarantees that the unknown jaxpr never uses
-    # known inputs (if it needs them, then they get passed through residuals).
+    # XXX: 在修改这个常量参数剪枝之前请三思！
+    # 这对 partial_eval_jaxpr 有着极其重要的影响。
+    # 最重要的是，这保证了未知 jaxpr 绝不会使用
+    # 已知输入（如果它需要这些输入，它们会作为残差传递过去）。
     if const is None:
       aval = pval.get_aval()
       return JaxprTracer(self, PartialVal.unknown(aval), LambdaBinding())
@@ -176,9 +176,9 @@ class JaxprTrace(Trace):
         return self.default_process_primitive(primitive, tracers, params)
 
   def default_process_primitive(self, primitive, tracers, params):
-    # By default, if all the input tracers are known, then bind the primitive
-    # and consider all outputs known. Otherwise, stage the application into the
-    # jaxpr and consider all outputs unknown.
+    # 默认情况下，如果所有输入追踪器都是已知的，就绑定该原语
+    # 并认为所有输出都是已知的。否则，把该应用暂存到
+    # jaxpr 中，并认为所有输出都是未知的。
     tracers = map(self.to_jaxpr_tracer, tracers)
     consts = [t.pval.get_known() for t in tracers]
     if all(c is not None for c in consts):
@@ -216,8 +216,8 @@ class JaxprTrace(Trace):
       with core.set_current_trace(self.parent_trace):
         vals = [t.pval[1] for t in tracers]
         return prim.bind(*vals, subfuns=(fun, jvp), symbolic_zeros=symbolic_zeros)
-    # We assume non-trivial partial evaluation is only performed to build linear
-    # functions, and hence we don't need to keep the custom JVP rule around.
+    # 我们假定非平凡的部分求值只是为了构建线性
+    # 函数，因此不需要保留自定义 JVP 规则。
     del jvp, symbolic_zeros
     with core.set_current_trace(self):
       return fun.call_wrapped(*tracers)
@@ -323,7 +323,7 @@ class JaxprTracer(Tracer[JaxprTrace]):
   @property
   def parents(self) -> Sequence[JaxprTracer]:
     if isinstance(self.recipe, JaxprEqnRecipe):
-      # TODO broadcast_in_dim can create a new tracer...
+      # TODO broadcast_in_dim 可能会创建一个新的追踪器……
       return self.recipe.in_tracers
     else:
       return []
@@ -363,7 +363,7 @@ def trace_to_jaxpr_nounits(
       del trace, fun
       return jaxpr, out_pvals, consts
 
-# TODO(mattjj): superfluous wrapper...?
+# TODO(mattjj): 多余的包装器……？
 @lu.transformation2
 def trace_to_subjaxpr_nounits(
     f: Callable,
@@ -446,9 +446,9 @@ def _trace_to_subjaxpr_nounits(f: Callable, trace: JaxprTrace,
       debug_info.with_unknown_names())
   return out_tracers, jaxpr, out_consts, env
 
-# The below variant implements an optimization where residuals which are also
-# inputs are indicated in auxiliary data rather than passed as outputs.
-# TODO(mattjj): update all callers to use this version, delete other version.
+# 下面这个变体实现了一项优化：同时作为输入的残差
+# 在辅助数据中指明，而不是作为输出传递出去。
+# TODO(mattjj): 更新所有调用方以使用这个版本，并删除另一个版本。
 @lu.transformation2
 def trace_to_subjaxpr_nounits_fwd(
     f: Callable,
@@ -465,7 +465,7 @@ def trace_to_subjaxpr_nounits_fwd(
           f, trace, instantiate, in_pvals, debug_info)
     out_pvals = [t.pval for t in out_tracers]
 
-    # Which out_consts (aka residuals) are just forwarded inputs? Check obj id.
+    # 哪些 out_consts（即残差）只是被转发的输入？检查对象 id。
     in_consts  = [pval.get_known()    for pval in in_pvals if     pval.is_known()]
     id_map = {id(c): i for i, c in enumerate(in_consts)}
     fwds: list[int | None] = [id_map.get(id(c)) for c in out_consts]
@@ -474,11 +474,11 @@ def trace_to_subjaxpr_nounits_fwd(
     del out_tracers
   return jaxpr, (fwds, out_pvals, pruned_consts, env)
 
-# The below variant implements two optimizations:
-#  1. residuals that are also primal inputs are indicated in aux data rather
-#     than passed as outputs;
-#  2. residuals that are also primal outputs are indicated in aux data rather
-#     than passed as redundant outputs.
+# 下面这个变体实现了两项优化：
+#  1. 同时也是原始输入的残差在辅助数据中标出，而不是
+#     作为输出传递；
+#  2. 同时也是原始输出的残差在辅助数据中标出，而不是
+#     作为冗余输出传递。
 def trace_to_subjaxpr_nounits_fwd2(
     f: Callable,
     tag: TraceTag,
@@ -493,12 +493,12 @@ def trace_to_subjaxpr_nounits_fwd2(
         f, trace, instantiate, in_pvals, debug_info)
     out_pvals = out_tracers.map(lambda t: t.pval)
 
-  # Which consts (aka residuals) are just forwarded inputs? Check obj id.
+  # 哪些 consts（即残差）只是被转发的输入？检查对象 id。
   in_consts  = [pval.get_known()    for pval in  in_pvals if    pval.is_known()]
   id_map = {id(c): i for i, c in enumerate(in_consts)}
   input_fwds: list[int | None] = [id_map.get(id(c)) for c in consts]
 
-  # Which consts (aka residuals) are already primal outputs? Check obj id.
+  # 哪些 consts（即残差）已经是原始输出？检查对象 id。
   out_consts = [pval.get_known()    for pval in out_pvals if    pval.is_known()]
   id_map = {id(c): i for i, c in enumerate(out_consts)}
   output_fwds: list[int | None] = [id_map.get(id(c)) for c in consts]
@@ -548,24 +548,24 @@ def tracers_to_jaxpr(
   effect_handles: Sequence[Any],
   debug_info: core.DebugInfo,
   ) -> tuple[Jaxpr, tuple[Any, ...], tuple[Any, ...]]:
-  """Constructs Jaxpr given tracers for inputs and outputs.
+  """根据输入和输出的追踪器构造 Jaxpr。
 
   Params:
-    in_tracers: the tracers that were created for the function inputs
-    out_tracers: the tracers that were output by the function.
-    debug_info: the debug info for the function.
+    in_tracers: 为函数输入创建的追踪器
+    out_tracers: 函数输出的追踪器。
+    debug_info: 函数的调试信息。
 
-  Returns: a triple of a `Jaxpr`, a list of constant values corresponding to
-    the `constvars` in the returned Jaxps, and a list of environment values.
-    The vars for the environment values have been prepended to the Jaxpr's
-    `invars`.
+  Returns: 一个三元组，包含一个 `Jaxpr`、一个对应于返回的 Jaxpr 中
+    `constvars` 的常量值列表，以及一个环境值列表。
+    环境值的变量已被前置到该
+    Jaxpr 的 `invars` 中。
   """
   gensym = core.gensym()
 
   t_to_var: dict[TracerId, Var] = {}
   consts: dict[Var, Any] = {}
   env: dict[Var, JaxprTracer] = {}
-  constid_to_var: dict[ConstId, Var] = {}  # for deduplication
+  constid_to_var: dict[ConstId, Var] = {}  # 用于去重
 
   def get_atom(t: JaxprTracer) -> Atom:
     return t.recipe if type(t.recipe) is Literal else t_to_var[id(t)]
@@ -591,7 +591,7 @@ def tracers_to_jaxpr(
   for t in tracers:
     r = t.recipe
     if isinstance(r, JaxprEqnRecipe):
-      # TODO broadcast_in_dim can create a new tracer, not present in parents
+      # TODO broadcast_in_dim 可能创建一个新追踪器，它不在父节点中
       if r.eqn_id not in processed_eqn_ids:
         in_atoms = map(get_atom, r.in_tracers)
         outvars = [DropVar(a) if rf() is None else newvar(rf())
@@ -629,22 +629,22 @@ def tracers_to_jaxpr(
   jaxpr = Jaxpr(const_vars, invars,  # pyrefly: ignore[bad-argument-type]
                 outvars, eqns, jaxpr_effects, debug_info, is_high)
   config.enable_checks.value and core.check_jaxpr(jaxpr)
-  # del getvar  # needed to avoid cyclic-reference closure, apparently!
+  # del getvar  # 显然需要这样来避免循环引用的闭包！
   return jaxpr, const_vals, env_vals
 
 @weakref_lru_cache
 def move_envvars(jaxpr: Jaxpr, which: tuple[bool, ...]) -> Jaxpr:
-  """Move the leading invars selected by `which` after the unselected ones."""
+  """把由 `which` 选中的开头若干 invars 移到未被选中的 invars 之后。"""
   assert not jaxpr.consts
   keep, env = partition_list(which, jaxpr.invars[:len(which)])
   return jaxpr.replace(invars=[*keep, *env, *jaxpr.invars[len(which):]])
 
 def separate_consts(jaxpr: Jaxpr) -> tuple[Jaxpr, list[Any]]:
-  """Detaches the consts and returns them explicitly."""
+  """分离出常量并将它们显式返回。"""
   return convert_constvars_jaxpr(jaxpr), jaxpr.consts
 
 def convert_constvars_jaxpr(jaxpr: Jaxpr) -> Jaxpr:
-  """Detaches the consts, exposing the constant inputs as leading invars."""
+  """分离出常量，把常量输入暴露为开头的 invars。"""
   return _detach_consts(jaxpr) if jaxpr.consts else jaxpr
 
 @weakref_lru_cache
@@ -656,25 +656,25 @@ def partial_eval_jaxpr_nounits(
     jaxpr: Jaxpr, unknowns: Sequence[bool],
     instantiate: bool | Sequence[bool],
   ) -> tuple[Jaxpr, Jaxpr, list[bool], list[AbstractValue]]:
-  """Unzip a jaxpr in two by data dependence into 'known' and 'unknown' parts.
+  """按数据依赖把一个 jaxpr 一分为二，拆成“已知”和“未知”两部分。
 
-  That is, given a jaxpr and a sequence of booleans indicating which jaxpr
-  inputs (i.e. invars) are considered unknown, produce two jaxprs, a list of
-  booleans representing which of the original jaxpr's outputs are unknown (i.e.
-  have a data dependence on an unknown input), and a list of abstract values
-  representing residuals (part of the first jaxpr's output and the second
-  jaxpr's input). The two jaxprs result from partitioning the original jaxpr's
-  first-order primitive applications based on whether all the inputs to the
-  application are known (in which case the application is represented in the
-  'known' jaxpr and its result is considered known) or whether any inputs to the
-  application are unknown (in which case the application is represented in the
-  'unknown' jaxpr and its result is considered unknown). Higher-order primitives
-  are recursively unzipped in two.
+  也就是说，给定一个 jaxpr 和一个布尔序列，指明哪些 jaxpr
+  输入（即 invars）被视为未知，则产出两个 jaxpr、一个
+  布尔列表，表示原 jaxpr 的哪些输出是未知的（即
+  对某个未知输入存在数据依赖），以及一个抽象值列表，
+  这些抽象值代表残差（是第一个 jaxpr 输出的一部分，也是第二个
+  jaxpr 的输入）。这两个 jaxpr 来自对原 jaxpr 的
+  一阶原语应用所做的划分：依据某个应用的全部输入
+  是否都已知（此时该应用被表示在
+  “已知”jaxpr 中，其结果也被视为已知），还是其任一输入
+  未知（此时该应用被表示在
+  “未知”jaxpr 中，其结果也被视为未知）。高阶原语
+  会被递归地一分为二。
 
-  The `instantiate` argument can be used to ensure some outputs are lifted into
-  the 'unknown' jaxpr.
+  `instantiate` 参数可用于确保某些输出被提升到
+  “未知”jaxpr 中。
 
-  For example, give an input jaxpr:
+  例如，给定如下输入 jaxpr：
 
     { lambda ; a:f32[] b:f32[]. let
         c:f32[] = cos a
@@ -683,8 +683,8 @@ def partial_eval_jaxpr_nounits(
         f:f32[] = mul e b
       in (c, f) }
 
-  then applying this function with `unknowns=[False, True]` and
-  `instantiate=False` produces as an output triple:
+  那么以 `unknowns=[False, True]` 和
+  `instantiate=False` 应用该函数，会产出如下三元组：
 
     # jaxpr_known
     { lambda ; a:f32[]. let
@@ -699,18 +699,18 @@ def partial_eval_jaxpr_nounits(
     # out_unknowns
     [False, True]
 
-  Notice in particular that the first output (jaxpr_known) contains all the
-  primitive applications which do not have a data dependence on an unknown
-  input. Also notice the input and output types: the input type of the first
-  jaxpr produced represents the type of the known inputs of the original jaxpr,
-  and the output type of the second jaxpr produced represents the type of the
-  unknown outputs of the original jaxpr.
+  特别要注意，第一个输出（jaxpr_known）包含所有
+  不与未知输入存在数据依赖的
+  原语应用。还要注意输入与输出类型：第一个
+  jaxpr 产出的输入类型表示原 jaxpr 中已知输入的类型，
+  而第二个 jaxpr 产出的输出类型表示原 jaxpr 中
+  未知输出的类型。
 
-  In the above example, the output of jaxpr_known named `d` is a _residual_
-  output, and corresponds to the input named `a` in jaxpr_unknown. In general,
-  jaxpr_known will produce extra outputs (at the end of its output list)
-  corresponding to intermediate values of the original jaxpr which must be
-  passed to jaxpr_unknown (as leading inputs).
+  在上例中，jaxpr_known 名为 `d` 的输出是一个_残差_
+  输出，它对应 jaxpr_unknown 中名为 `a` 的输入。一般来说，
+  jaxpr_known 会产生额外的输出（位于其输出列表末尾），
+  这些输出对应原 jaxpr 的中间值，它们必须
+  被传给 jaxpr_unknown（作为开头的输入）。
   """
   instantiate = tuple(instantiate) if isinstance(instantiate, list) else instantiate
   return _partial_eval_jaxpr_nounits(jaxpr, tuple(unknowns), instantiate, False)[:-1]
@@ -877,13 +877,13 @@ def _partial_eval_jaxpr_custom_cached(
       foreach(partial(write, True, True), eqn.outvars)
     else:
       known_eqns.append(eqn)
-      # If it's an effectful primitive, we always to run and avoid staging it.
+      # 如果它是有副作用的原语，我们总是执行它并避免将它暂存。
       policy = ensure_enum(saveable(
           eqn.primitive, *[x.aval for x in eqn.invars], **eqn.params))
       if has_effects(eqn.effects) or isinstance(policy, SaveableType):
         foreach(partial(write, False, False), eqn.outvars)
       elif isinstance(policy, Offloadable):
-        # TODO(slebedev): This is a legit error which requires a BUILD fix.
+        # TODO(slebedev): 这是一个真实的（类型检查）报错，需要修改 BUILD 才能解决。
         from jax._src.dispatch import device_put_p, ArrayCopySemantics  # pyrefly: ignore[missing-import]
         resvars = [Var(v.aval.update(memory_space=core.mem_kind_to_space(policy.dst)))
                    for v in eqn.outvars]
@@ -896,7 +896,7 @@ def _partial_eval_jaxpr_custom_cached(
             ),
             set(), source_info_util.new_source_info(), core.current_jaxpr_eqn_context())
         known_eqns.append(offload_eqn)
-        # resvars are known and available in the backward jaxpr.
+        # resvars 是已知的，并且在反向 jaxpr 中可用。
         foreach(partial(write, False, True), resvars)
         assert all(o.aval.memory_space == core.mem_kind_to_space(policy.src)  # pyrefly: ignore[missing-attribute]
                    for o in eqn.outvars)
@@ -910,7 +910,7 @@ def _partial_eval_jaxpr_custom_cached(
             ),
             set(), source_info_util.new_source_info(), core.current_jaxpr_eqn_context())
         staged_eqns.append(reload_eqn)
-        # outvars are known and available in the backward jaxpr.
+        # outvars 是已知的，并且在反向 jaxpr 中可用。
         foreach(partial(write, False, True), eqn.outvars)
       else:
         assert isinstance(policy, RecomputeType)
@@ -935,7 +935,7 @@ def _partial_eval_jaxpr_custom_cached(
   known_effects = make_jaxpr_effects(jaxpr.constvars, ins_known_and_ref_res,
                                      known_outvars, known_eqns)
 
-  # TODO(mattjj,necula): debug info should be updated here
+  # TODO(mattjj,necula): 这里应更新调试信息
   jaxpr_known = jaxpr.replace(
       invars=ins_known_and_ref_res, outvars=known_outvars,
       eqns=known_eqns, effects=known_effects,
@@ -947,7 +947,7 @@ def _partial_eval_jaxpr_custom_cached(
   staged_invars = [*residuals, *non_input_res_refs, *ins_staged]
   staged_effects = make_jaxpr_effects(jaxpr.constvars, staged_invars,
                                       outs_staged, staged_eqns)
-  # TODO(mattjj,necula): debug info should be updated here
+  # TODO(mattjj,necula): 这里应更新调试信息
   jaxpr_staged = jaxpr.replace(
       invars=staged_invars, outvars=outs_staged, eqns=staged_eqns,
       effects=staged_effects,
@@ -987,16 +987,16 @@ def ensure_enum(case: bool | RematCases) -> RematCases:
     raise TypeError(msg)
   return case
 
-# A primitive rule for policy-driven partial evaluation returns a 5-tuple
-# with the components representing, respectively:
-#  * the JaxprEqn for the 'known' side (or None if there is no known component),
-#  * the JaxprEqn for the 'unknown' side (or None),
-#  * a list of booleans indicating which of the original outputs are unknown,
-#  * a list of booleans indicating which of the original outputs are
-#    instantiated (i.e. available) in the 'unknown' side,
-#  * a list of Var instances representing residuals to be added (i.e. to be
-#    plumbed as outputs of the 'known' side jaxpr and added as input binders to
-#    the 'unknown' jaxpr).
+# 用于策略驱动的部分求值的原语规则返回一个 5 元组，
+# 其中各分量分别表示：
+#  * 表示 'known'（已知）一侧的 JaxprEqn（若没有已知分量则为 None），
+#  * 表示 'unknown'（未知）一侧的 JaxprEqn（或 None），
+#  * 一个布尔列表，指示哪些原始输出是未知的，
+#  * 一个布尔列表，指示哪些原始输出在 'unknown' 一侧
+#    已被实例化（即可用），
+#  * 一个 Var 实例列表，表示要添加的残差（即要作为
+#    'known' 一侧 jaxpr 的输出引出，并作为输入绑定变量（input binder）加入
+#    'unknown' 一侧的 jaxpr）。
 PartialEvalCustomResult = tuple[JaxprEqn | None, JaxprEqn | None,
                                 Sequence[bool], Sequence[bool], list[Var]]
 PartialEvalCustomRule = Callable[
@@ -1047,7 +1047,7 @@ def call_partial_eval_custom_rule(
               if type(x) is Var and not inst]
   return eqn_known, eqn_staged, unks_out, inst_out, new_inst + residuals
 
-# TODO(mattjj): unify with ParamsUpdater (this one takes an extra int)
+# TODO(mattjj): 与 ParamsUpdater 统一（这个多接收一个 int）
 ParamsUpdater2 = Callable[[Sequence[bool], Sequence[bool], Sequence[bool],
                            Sequence[bool], int, int, dict, dict],
                           tuple[dict, dict]]
@@ -1057,9 +1057,9 @@ def closed_call_partial_eval_custom_rule(
     saveable: Callable[..., RematCases_], unks_in: list[bool], inst_in: list[bool],
     eqn: JaxprEqn, *, res_aval: ResAvalUpdater = _default_res_aval_updater,
   ) -> tuple[JaxprEqn, JaxprEqn, Sequence[bool], Sequence[bool], list[Var]]:
-  # TODO(sharadmv,mattjj): dedup this rule with call_partial_eval_custom_rule.
+  # TODO(sharadmv,mattjj): 将这条规则与 call_partial_eval_custom_rule 去重。
   disallow_output_fwds = tuple(isinstance(v, DropVar) for v in eqn.outvars)
-  # TODO(mattjj): this is just for pjit... but let's delete all this code
+  # TODO(mattjj): 这只是为了 pjit……但我们还是把这段代码全删掉吧
   from jax._src.sharding_impls import UNSPECIFIED  # pyrefly: ignore[missing-import]
   in_shardings, in_layouts = eqn.params.get('in_shardings'), eqn.params.get('in_layouts')
   if in_shardings is not None:
@@ -1127,19 +1127,19 @@ def _closed_jaxpr_partial_eval_custom_cached(
   num_out_primals = len(jaxpr_known_.outvars) - num_res_val
   out_vars, res_vars = split_list(jaxpr_known_.outvars, [num_out_primals])
 
-  # Compute which residual value outputs are also primal inputs.
+  # 计算哪些残差值输出同时也是原始输入。
   disallowed, _ = partition_list(unks_in, disallowed_input_forwards)
   idx_map = {id(v): i for i, (v, b) in enumerate(zip(jaxpr_known_.invars, disallowed))
              if not b}
   in_fwd = [idx_map.get(id(v)) for v in res_vars]
 
-  # Compute which residual value outputs are also *undropped* primal outputs.
+  # 计算哪些残差值输出同时也是*未被丢弃的*原始输出。
   disallowed, _ = partition_list(unks_out, disallowed_output_forwards)
   idx_map = {id(v): i for i, (v, b) in enumerate(zip(out_vars, disallowed))
              if not b}
   out_fwd = [idx_map.get(id(v)) for v in res_vars]
 
-  # Prune jaxpr_known_ outputs by removing forwards.
+  # 通过移除被转发的输出（forwards）来精简 jaxpr_known_ 的输出。
   keep = [f1 is f2 is None for f1, f2 in zip(in_fwd, out_fwd)]
   jaxpr_known_ = prune_jaxpr_outputs(jaxpr_known_, [True] * num_out_primals + keep)
 
@@ -1148,7 +1148,7 @@ def _closed_jaxpr_partial_eval_custom_cached(
 
 
 def _jaxpr_forwarding(jaxpr: Jaxpr) -> list[int | None]:
-  # Compute which inputs are just forwarded to outputs.
+  # 计算哪些输入只是被转发（forward）到输出。
   fwds: dict[Var, Atom] = dict(zip(jaxpr.invars, jaxpr.invars))
   for eqn in jaxpr.eqns:
     if eqn.primitive in forwarding_rules:
@@ -1177,14 +1177,14 @@ def _prune_jaxpr_outputs(jaxpr: Jaxpr, used_outputs: tuple[bool, ...]) -> Jaxpr:
   return new_jaxpr
 _prune_jaxpr_outputs_cached = weakref_lru_cache(_prune_jaxpr_outputs)
 
-# Since the Jaxpr/Jaxpr merge this is the same as prune_jaxpr_outputs
-# (attached consts are preserved by Jaxpr.replace).
+# 自从 Jaxpr/Jaxpr 合并之后，这与 prune_jaxpr_outputs 相同
+# （附带常量由 Jaxpr.replace 保留）。
 prune_closed_jaxpr_outputs = prune_jaxpr_outputs
 
 def dedup_jaxpr_outputs(jaxpr: Jaxpr, num_kept_prefix: int,
                         fwdable_prefix: Sequence[bool] | None = None,
                         ) -> tuple[Jaxpr, list[int | None]]:
-  """Prune duplicated outputs, for callers to restore after evaluation."""
+  """精简重复的输出，供调用方在求值后恢复。"""
   prefix_vars, rest_vars = split_list(jaxpr.outvars, [num_kept_prefix])
   fwdable = ([True] * num_kept_prefix if fwdable_prefix is None
              else fwdable_prefix)
@@ -1204,17 +1204,17 @@ def dedup_jaxpr_outputs(jaxpr: Jaxpr, num_kept_prefix: int,
 def dce_jaxpr(jaxpr: Jaxpr, used_outputs: bool | Sequence[bool],
               instantiate: bool | Sequence[bool] = False,
               ) -> tuple[Jaxpr, list[bool]]:
-  """Runs dead-code elementation on a given jaxpr.
+  """对给定的 jaxpr 执行死代码消除。
 
   Args:
-    jaxpr: The jaxpr to DCE.
-    used_outputs: A list of bools indicating which outputs are used.
-    instantiate: A bool or a list of bools indicating which inputs should be
-      considered used, regardless of whether they are actually used in a jaxpr.
-      If a bool, the same value is used for all inputs.
+    jaxpr: 要进行 DCE 的 jaxpr。
+    used_outputs: 一个布尔列表，指示哪些输出被使用。
+    instantiate: 一个布尔值或布尔列表，指示哪些输入应被视为已使用，
+      无论它们是否真的在 jaxpr 中被使用。
+      若是布尔值，则对所有输入使用相同的值。
 
   Returns:
-    A tuple of ``(new_jaxpr, used_inputs)``.
+    一个 ``(new_jaxpr, used_inputs)`` 元组。
   """
   if type(used_outputs) is bool:
     used_outputs = (used_outputs,) * len(jaxpr.outvars)
@@ -1253,7 +1253,7 @@ dceable_effects.add_type(core.InternalMutableArrayEffect)
 def _free_ref_dce_rule(
     used_outs: list[bool], eqn: JaxprEqn
 ) -> tuple[list[bool], JaxprEqn | None]:
-  # Never gonna DCE free_ref.
+  # 绝不会对 free_ref 做 DCE。
   del used_outs
   return [True] * len(eqn.invars), eqn
 dce_rules[core.free_ref_p] = _free_ref_dce_rule
@@ -1311,12 +1311,12 @@ DCERule = Callable[[list[bool], JaxprEqn],
 @weakref_lru_cache
 def _cached_closed_call_dce(jaxpr_, used_outputs: tuple[bool, ...]
                             ) -> tuple[Jaxpr, list[bool]]:
-  # dce_jaxpr preserves attached consts (constvars are never pruned).
+  # dce_jaxpr 会保留附带常量（constvars 永远不会被精简）。
   return dce_jaxpr(jaxpr_, used_outputs)
 
 def dce_jaxpr_closed_call_rule(used_outputs: list[bool], eqn: JaxprEqn
                                ) -> tuple[list[bool], JaxprEqn | None]:
-  # TODO(mattjj): de-duplicate with above rule?
+  # TODO(mattjj): 是否与上面的规则去重？
   if not any(used_outputs) and not has_effects(eqn):
     return [False] * len(eqn.invars), None
   jaxpr_ = eqn.params['call_jaxpr']
@@ -1331,8 +1331,8 @@ def dce_jaxpr_closed_call_rule(used_outputs: list[bool], eqn: JaxprEqn
   return used_inputs, new_eqn
 
 def close_jaxpr(jaxpr: Jaxpr) -> Jaxpr:
-  # Now that Jaxpr and ClosedJaxpr are merged, every jaxpr is closed: the
-  # constvars are exactly the inputs with attached const values.
+  # 现在 Jaxpr 和 ClosedJaxpr 已合并，每个 jaxpr 都是封闭的：
+  # constvars 正是附带常量值的那些输入。
   return jaxpr
 
 def move_binders_to_front(closed_jaxpr: Jaxpr, to_move: Sequence[bool]
@@ -1372,10 +1372,10 @@ class DynamicJaxprTracer(Tracer['DynamicJaxprTrace']):
                val : Atom,
                line_info: source_info_util.SourceInfo | None = None,
                parent : TracingEqn | None = None):
-    # TODO(dougalm): Remove aval. It's redundant now that we have val.
-    Tracer.__init__(self, trace, aval)  # slightly faster than super()
+    # TODO(dougalm): 移除 aval。既然有了 val，它就是多余的。
+    Tracer.__init__(self, trace, aval)  # 比 super() 稍快一些
     self._line_info = line_info
-    self._debug_info = self._trace.frame.debug_info  # for UnexpectedTracerError
+    self._debug_info = self._trace.frame.debug_info  # 用于 UnexpectedTracerError
     self.val = val
     self.parent = parent
 
@@ -1409,7 +1409,7 @@ class DynamicJaxprTracer(Tracer['DynamicJaxprTrace']):
         arg_names = [(dbg.arg_names[i] if dbg.arg_names is not None else "unknown")
                      for i in invar_pos]
       except IndexError:
-        return ""  # TODO(mattjj): figure out when not (invar_pos < len(arg_info))
+        return ""  # TODO(mattjj): 弄清楚何时不满足 (invar_pos < len(arg_info))
       if len(arg_names) == 1:
         arg_info_str = f"the argument {arg_names[0]}"
       elif len(arg_names) == 2:
@@ -1424,7 +1424,7 @@ class DynamicJaxprTracer(Tracer['DynamicJaxprTrace']):
       msts = ["  operation "
               f"{core.pp_eqn(eqn, core.JaxprPpContext(), core.JaxprPpSettings(print_shapes=True))}\n"
               f"    from line {source_info_util.summarize(eqn.source_info)}"
-              for eqn in progenitor_eqns[:5]]  # show at most 5
+              for eqn in progenitor_eqns[:5]]  # 最多显示 5 条
       origin += ("This value became a tracer due to JAX operations on these lines:"
                  "\n\n" + "\n\n".join(msts))
       if len(progenitor_eqns) > 5:
@@ -1455,7 +1455,7 @@ def make_jaxpr_effects(constvars, invars, outvars, eqns) -> effects.Effects:
         if eff.input in mut_arrays:
           continue
         if eff.input not in input_vars:
-          # TODO(mattjj): ask for forgiveness
+          # TODO(mattjj): 请求宽恕（ask for forgiveness）
           dbg = type('Fake', (), {'resolve_result_paths': lambda self_: self_,
                                   'assert_arg_names': lambda _, __: None,
                                   'assert_result_paths': lambda _, __: None,
@@ -1490,7 +1490,7 @@ class JaxprStackFrame:
     self.gensym = core.gensym()
     self.constid_to_tracer = WeakValueDictionary()
     self.constvar_to_val = {}
-    self.tracing_eqns = []      # cleared when we pop frame from main
+    self.tracing_eqns = []      # 当我们从 main 弹出栈帧时清空
     self.invars = []
     self.effects = set()
     self.debug_info = debug_info
@@ -1520,13 +1520,13 @@ class JaxprStackFrame:
       debug_info: core.DebugInfo,
       source_info: SourceInfo,
     ) -> tuple[Jaxpr, list[Any]]:
-    # We are careful to snapshot constvar_to_val before we call get_eqns(),
-    # to avoid the following scenario:
-    # * we call get_eqns(), snapshotting the equations.
-    # * garbage collection runs, deleting some TracingEqns, which may
-    #   transitively free constant Vars.
-    # * we now have equations with dangling Var references.
-    # If we snapshot the Vars first we won't have this problem.
+    # 我们特意在调用 get_eqns() 之前对 constvar_to_val 做快照，
+    # 以避免以下情形：
+    # * 我们调用 get_eqns()，对各个方程做快照。
+    # * 垃圾回收运行，删除了一些 TracingEqn，这可能传递性地
+    #   释放常量 Var。
+    # * 此时我们的方程中就带有悬空的 Var 引用。
+    # 如果先对 Var 做快照，就不会有这个问题。
     constvars, constvals = unzip2(self.constvar_to_val.copy().items())
     eqns = self.get_eqns()
     outvars = [t.val for t in out_tracers]
@@ -1589,10 +1589,10 @@ def _verify_params_are_hashable(
         f"__eq__ methods. In a call to primitive {primitive}, the value of "
         f"parameter {k} was not hashable: {v}") from e
 
-# We use TracingEqn instead JaxprEqn during tracing to allow automatic
-# on-the-fly DCE based on Python refcounting. DynamicJaxprTracers point to
-# TracingEqns which point to DynamicJaxprTracers and unreachable constants can
-# be freed.
+# 在追踪期间我们使用 TracingEqn 而非 JaxprEqn，以便基于 Python
+# 引用计数实现自动的即时死代码消除（DCE）。DynamicJaxprTracer 指向
+# TracingEqn，TracingEqn 又指向 DynamicJaxprTracer，因此不可达的常量
+# 可以被释放。
 
 @dataclass(slots=True, weakref_slot=True)
 class TracingEqn:
@@ -1613,9 +1613,9 @@ class TracingEqn:
     self.source_info = source_info
     self.ctx = ctx
 
-  # Allow TracingEqn to duck-type JaxpeEqn because some of the forwarding
-  # rules need to work with both. TODO(dougalm): remove this once we fix
-  # forwarding.
+  # 允许 TracingEqn 对 JaxpeEqn 做鸭子类型（duck-type），因为某些转发
+  # 规则需要同时兼容两者。TODO(dougalm): 等我们修好转发后，
+  # 就移除这一点。
   @property
   def invars(self):
     return self.in_tracers
@@ -1623,8 +1623,8 @@ class TracingEqn:
 class DynamicJaxprTrace(core.Trace):
   __slots__ = ("frame", "tag", "parent_trace")
 
-  # Note that tag is only used when DynamicJaxprTrace is associated with a LinearizeTrace;
-  # otherwise it will be undefined.
+  # 注意，只有当 DynamicJaxprTrace 与 LinearizeTrace 关联时才会使用
+  # tag；否则 tag 将处于未定义状态。
   tag: core.TraceTag
   frame: JaxprStackFrame
   parent_trace: core.Trace | None
@@ -1639,14 +1639,14 @@ class DynamicJaxprTrace(core.Trace):
     self.parent_trace = parent_trace
 
   def invalidate(self):
-    # TODO(mattjj): exposed existing tracer leaks; fix them and re-enable!
+    # TODO(mattjj): 暴露了已存在的追踪器泄漏；修复它们并重新启用！
     # super().invalidate()
 
-    # avoid cyclic refs
+    # 避免循环引用
     self.frame.tracing_eqns = []  # thunk -> eqn -> in_tracers -> trace ->
     # -> frame -> tracing_eqns -> thunk
 
-    # TODO(dougalm): we might be able to remove these given refcounting dce
+    # TODO(dougalm): 考虑到基于引用计数的 DCE，我们或许可以移除这些
     self.frame.constid_to_tracer = {}  # pyrefly: ignore[bad-assignment]
     self.frame.constvar_to_val = {}
 
@@ -1692,7 +1692,7 @@ class DynamicJaxprTrace(core.Trace):
 
   def new_const(self, c, source_info: SourceInfo,
                 aval: AbstractValue | None = None):
-    # TODO(mattjj): for ints, or hashable consts, don't rely on id
+    # TODO(mattjj): 对于 int 或可哈希的常量，不要依赖 id
     tracer = self.frame.constid_to_tracer.get(id(c))
     if tracer is None:
       if aval is None:
@@ -1750,9 +1750,9 @@ class DynamicJaxprTrace(core.Trace):
   def default_process_primitive(self, primitive, tracers, params,
                                 source_info=None):
     avals = [t.aval for t in tracers]
-    # TODO(mattjj): make custom_lin have hashable params.
-    # TODO(dougalm): add an attribute to primitives to mark primitives with
-    # effectful abstract_eval rules.
+    # TODO(mattjj): 让 custom_lin 拥有可哈希的 params。
+    # TODO(dougalm): 给原语添加一个属性，用来标记那些其 abstract_eval
+    # 规则有副作用的原语。
     if (primitive.ref_allocating or
         primitive.name in ("custom_lin", "call_hi_primitive_linearized",
                            "call_hi_primitive")):
@@ -1761,7 +1761,7 @@ class DynamicJaxprTrace(core.Trace):
       try:
         out_avals, effs = _cached_abstract_eval(primitive, *avals, **params)
       except Exception:
-        # TODO(phawkins): remove this 3 months after the release of JAX v0.7.
+        # TODO(phawkins): 在 JAX v0.7 发布 3 个月后移除此段代码。
         _verify_params_are_hashable(primitive, params)
         raise
 
@@ -1779,7 +1779,7 @@ class DynamicJaxprTrace(core.Trace):
     else:
       eqn, out_tracers = self.make_eqn(tracers, out_avals, primitive, params,
                                        effs, source_info=source_info)
-    # Input-to-output tracer forwarding
+    # 输入到输出的追踪器转发
     no_input_effects = not any(isinstance(e, effects.JaxprInputEffect) for e in effs)
     if eqn is not None and no_input_effects and primitive in forwarding_rules:
       in_fwd, eqn = forwarding_rules[primitive](eqn)
@@ -1893,7 +1893,7 @@ def _interleave_fun(f, every_others, *args, **kwargs):
   args_ = [x for pair in zip(args, every_others) for x in pair]
   return f(*args_, **kwargs)
 
-# TODO: consider renaming to "lazy_thunk"
+# TODO: 考虑改名为 "lazy_thunk"
 def _memoize(fn):
   cells = {}
   sentinel = object()
@@ -1939,7 +1939,7 @@ def explain(keys, fun, in_avals, debug_info, *context, **_):
     src_info += f":{func_lineno}"
   func_name = debug_info.func_name
 
-  # have we seen this function before at all?
+  # 我们之前究竟是否见过这个函数？
   keys = [key for fun_ref, *key in keys if fun_ref() is fun]
   if not keys:
     p(f"  never seen function:\n    {func_name} id={id(fun)}{src_info}")
@@ -1959,10 +1959,10 @@ def explain(keys, fun, in_avals, debug_info, *context, **_):
   return logger.log(logging.WARNING, "\n".join(msg))
 
 def diff_tracing_cache_keys(new_key, old_key) -> tuple[int, int, str]:
-  """Explain the diff between two tracing cache keys.
+  """解释两个追踪缓存键之间的差异。
   Returns:
-    A tuple of (severity, num_diffs, explanation) for the diff between the two
-    keys. Severity is an int, where lower is better.
+    一个元组 (severity, num_diffs, explanation)，描述两个键之间的差异。
+    severity 是一个整数，越小越好。
   """
   new_ctx, (new_tree, new_dbg, *_), () = new_key
   old_ctx, (old_tree, old_dbg, *_), () = old_key
@@ -2047,9 +2047,9 @@ def _lower_debug_info(hi_jaxpr):
 
 def trace_to_jaxpr_nocache(
     fun: Callable,
-    in_avals: ft.FlatTree,  # (args, kwargs) pair
+    in_avals: ft.FlatTree,  # (args, kwargs) 对
     debug_info: core.DebugInfo,
-    # TODO: let's just make a `trace_to_jaxpr_ft` function for this
+    # TODO: 我们干脆为此写一个 `trace_to_jaxpr_ft` 函数吧
     fun_takes_flat_tree_arg=False,
     fun_returns_flat_tree=False,
     requires_low=False,
@@ -2062,10 +2062,10 @@ def trace_to_jaxpr_nocache(
   parent_trace = core.trace_ctx.trace
   trace = DynamicJaxprTrace(debug_info, parent_trace=parent_trace,
                             lower=requires_low)
-  # Name stack and the traceback scope are reset because the metadata on jaxpr
-  # equations should be rooted at the enclosing jaxpr and not contain any
-  # context from the callsite. Otherwise metadata from one caller would bleed
-  # into metadata from a different caller if we, e.g., inline.
+  # 名称栈与回溯作用域被重置，因为 jaxpr 方程上的元数据应当以
+  # 外层 jaxpr 为根，而不应包含任何来自调用点的上下文。否则当
+  # 我们（例如）进行内联时，一个调用者的元数据会渗透进
+  # 另一个调用者的元数据中。
   with (core.ensure_no_leaks(trace), source_info_util.reset_name_stack(),
         TracebackScope()):
     source_info = source_info_util.current()
@@ -2084,7 +2084,7 @@ def trace_to_jaxpr_nocache(
     with core.set_current_trace(trace):
       if fun_takes_flat_tree_arg:
         args_ft, kwargs_ft = in_tracers.unpack()
-        assert kwargs_ft.unflatten() == {}  # TODO: handle kwargs
+        assert kwargs_ft.unflatten() == {}  # TODO: 处理 kwargs
         kwargs = {}
         args = args_ft.unpack()
         del args_ft
@@ -2092,7 +2092,7 @@ def trace_to_jaxpr_nocache(
         args, kwargs = in_tracers.unflatten()
       ans_pytree = fun(*args, **kwargs)
       if fun_returns_flat_tree:
-        # TODO(dougalm): make result paths optional
+        # TODO(dougalm): 让结果路径变为可选
         ans = ans_pytree
         debug_info = debug_info.set_result_paths([''] * len(ans))
       else:
@@ -2128,7 +2128,7 @@ trace_to_jaxpr = weakref_lru_cache(maxsize=None, explain=explain)(
     trace_to_jaxpr_nocache)
 
 
-# TODO(dougalm): remove in favor of `trace_to_jaxpr`
+# TODO(dougalm): 移除它，改用 `trace_to_jaxpr`
 @profiler.annotate_function
 def trace_to_jaxpr_dynamic(
     fun: lu.WrappedFun, in_avals: Sequence[AbstractValue],
@@ -2139,10 +2139,10 @@ def trace_to_jaxpr_dynamic(
   parent_trace = core.trace_ctx.trace
   trace = DynamicJaxprTrace(fun.debug_info, parent_trace=parent_trace,
                             lower=lower, auto_dce=auto_dce)
-  # Name stack and the traceback scope are reset because the metadata on jaxpr
-  # equations should be rooted at the enclosing jaxpr and not contain any
-  # context from the callsite. Otherwise metadata from one caller would bleed
-  # into metadata from a different caller if we, e.g., inline.
+  # 名称栈与回溯作用域被重置，因为 jaxpr 方程上的元数据应当以
+  # 外层 jaxpr 为根，而不应包含任何来自调用点的上下文。否则当
+  # 我们（例如）进行内联时，一个调用者的元数据会渗透进
+  # 另一个调用者的元数据中。
   with (core.ensure_no_leaks(trace), source_info_util.reset_name_stack(),
         TracebackScope()):
     source_info = source_info_util.current()
@@ -2182,12 +2182,12 @@ def _check_no_returned_refs(
     a = t.aval
     if isinstance(a, AbstractRef):
       result_paths = dbg.resolve_result_paths().safe_result_paths(len(out_tracers))
-      if list(result_paths) == ["result"]: result_paths = [""]  # TODO(mattjj): fix in callee
+      if list(result_paths) == ["result"]: result_paths = [""]  # TODO(mattjj): 在被调用者中修复
       loc = result_paths[i] and f' at output tree path {result_paths[i]}'
       frame = t._trace.frame
       v = t.val
       eqns = frame.get_eqns()
-      # TODO(dougalm): something more efficient
+      # TODO(dougalm): 可以用更高效的方式实现
       eqn = next((e for e in eqns if v in e.outvars), None)
       if eqn:
         assert eqn.primitive in (core.ref_p, core.empty_ref_p)
@@ -2221,7 +2221,7 @@ Val = Any
 def inline_jaxpr_into_trace(
     trace: DynamicJaxprTrace, src: SourceInfo, jaxpr: Jaxpr,
     consts: Sequence[Any], *arg_tracers: DynamicJaxprTracer) -> list[Any]:
-  # This function is conceptually the same thing as just calling eval_jaxpr,
+  # 该函数在概念上等同于直接调用 eval_jaxpr，
   const_tracers = map(partial(trace.new_const, source_info=src), consts)
   env: dict[Var, DynamicJaxprTracer] = dict(
       zip([*jaxpr.constvars, *jaxpr.invars],
@@ -2313,7 +2313,7 @@ def lower_jaxpr(hi_jaxpr: Jaxpr, lo_avals) -> tuple[Jaxpr, ft.FlatTree]:
 
     for v, c in zip(hi_jaxpr.constvars, hi_jaxpr.consts):
       if v.aval.is_high:
-        env[v] = c  # treated as an HTLV
+        env[v] = c  # 视为 HTLV
       else:
         env[v] = lift_lo_const(v, c)
 
@@ -2354,10 +2354,10 @@ def lower_jaxpr(hi_jaxpr: Jaxpr, lo_avals) -> tuple[Jaxpr, ft.FlatTree]:
 
 @weakref_lru_cache
 def lower_jaxpr_reference(hi_jaxpr: Jaxpr, lo_avals) -> tuple[Jaxpr, ft.FlatTree]:
-  """Reference implementation of lower_jaxpr, for testing and debugging.
+  """lower_jaxpr 的参考实现，用于测试与调试。
 
-  Swap it in with `pe.lower_jaxpr = pe.lower_jaxpr_reference`; all call sites
-  look the name up at call time.
+  可通过 `pe.lower_jaxpr = pe.lower_jaxpr_reference` 把它替换进去；所有调用点
+  都会在调用时查找该名字。
   """
   dbg = _lower_debug_info(hi_jaxpr)
   return trace_to_jaxpr(partial(_lower_traceable, hi_jaxpr), lo_avals, dbg,
@@ -2369,7 +2369,7 @@ def _lower_traceable(jaxpr, *lo_args):
   lo_outs = [a.lower_val2(y) for a, y in zip(jaxpr.out_avals, hi_outs)]
   return ft.pack(tuple(lo_outs))
 
-# vestigial hijax helpers
+# 遗留的 hijax 辅助函数
 def raise_lo_outs(hi_avals, lo_outs):
   lo_outs_ = iter(lo_outs)
   hi_outs = [t.raise_val(*it.islice(lo_outs_, len(t.lo_ty()))) for t in hi_avals]
@@ -2380,7 +2380,7 @@ def raise_lo_outs(hi_avals, lo_outs):
 eval_jaxpr_p = core.eval_jaxpr_p
 
 dce_rules[eval_jaxpr_p] = dce_jaxpr_closed_call_rule
-dce_jaxpr_call_rule = dce_jaxpr_closed_call_rule  # alias for downstream users
+dce_jaxpr_call_rule = dce_jaxpr_closed_call_rule  # 供下游用户使用的别名
 
 def _eval_jaxpr_partial_eval(prim, trace, *in_tracers, call_jaxpr, **params):
   in_pvals = [t.pval for t in in_tracers]

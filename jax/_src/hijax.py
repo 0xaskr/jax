@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 JAX 的 hijax（高层 jaxpr）扩展 API：自定义原语用 `HiType`
+# 抽象值参与追踪，由 `HiPrimitive` 提供降级与各变换规则，并统一降级为
+# 既有的 lojax 原语。核心原语 `call_hi_primitive` 注册了类型检查、暂存、
+# 批处理、线性化、转置、死代码消除与重物化规则，从而支持
+# `jit`/`vmap`/`grad`/`remat`/`shard_map`；`VJPHiPrimitive` 是新式基类，
+# `CustomVJPTraced` 等是它在 `custom_vjp3`、`custom_jvp3` 处的内部实现。
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -59,7 +66,7 @@ HiVal = Any
 traceback_util.register_exclusion(__file__)
 
 
-# Hijax extension API
+# Hijax 扩展 API
 
 Ty = core.AbstractValue
 LoType = core.AbstractValue
@@ -75,20 +82,20 @@ class HiPrimitive(core.Primitive):
     return True
 
   def is_effectful(self, params) -> bool:  # pyrefly: ignore[bad-override]
-    return False  # default immutable
+    return False  # 默认不可变
 
-  # type checking and forward type propagation
+  # 类型检查与前向类型传播
   def abstract_eval(self, *arg_avals, **params):
     assert False, "must override"
 
-  # lowering implements the primitive in terms of lojax inputs/outputs/ops
+  # 降级：用 lojax 的输入/输出/算子来实现该原语
   def to_lojax(self, *lotypes_wrapped_in_hitypes, **params):
     assert False, f"must override for {self}"
 
-  # autodiff interface
+  # 自动微分接口
   def jvp(self, primals, tangents, **params):
     assert False, "must override"
-  # transposition is only required if the primitive is linear in some inputs
+  # 仅当原语对某些输入是线性的时候才需要转置
   def transpose(self, *args, **params):
     assert False, "must override"
 
@@ -102,44 +109,44 @@ def _must_override(ty, method: str, needed_for: str) -> NoReturn:
 class HiType(core.AbstractValue):
   is_high = True
 
-  # type equality
+  # 类型相等性
   def __hash__(self):
     _must_override(self, "__hash__", "type equality")
   def __eq__(self, other):
     _must_override(self, "__eq__", "type equality")
 
-  # lowering from hijax type to lojax types
+  # 从 hijax 类型降级到 lojax 类型
   def lo_ty(self) -> list[core.AbstractValue]:
     _must_override(self, "lo_ty", "lowering (e.g. under jit)")
 
-  # define lowering from hijax value to lojax values and back (like pytrees)
-  def lower_val(self, hi_val: HiVal, /) -> list[LoVal]:  # TODO(mattjj): not lovals
+  # 定义 hijax 值与 lojax 值之间的双向降级（类似 pytree）
+  def lower_val(self, hi_val: HiVal, /) -> list[LoVal]:  # TODO(mattjj): 这里不是 lovals
     _must_override(self, "lower_val", "lowering values (e.g. under jit)")
   def raise_val(self, *lo_vals: LoVal) -> HiVal:
     _must_override(self, "raise_val", "raising lowered values (e.g. under jit)")
 
-  # autodiff interface
+  # 自动微分接口
   def to_tangent_aval(self) -> HiType:
     _must_override(self, "to_tangent_aval", "autodiff")
   def to_ct_aval(self) -> HiType:
     return self.to_tangent_aval()
-  # the next two are required if this type is itself a tangent type
+  # 如果该类型本身就是切向量类型，则下面两个方法是必需的
   def vspace_zero(self) -> HiVal:
     _must_override(self, "vspace_zero", "use as a tangent/cotangent type")
   def vspace_add(self, x: HiVal, y: HiVal) -> HiVal:
     _must_override(self, "vspace_add", "use as a tangent/cotangent type")
 
-  # vmap interface (also needed for scan)
+  # vmap 接口（scan 也需要）
   def dec_rank(self, size: int | None, spec: MappingSpec) -> HiType:
     _must_override(self, "dec_rank", "vmap")
   def inc_rank(self, size: int | None, spec: MappingSpec) -> HiType:
     _must_override(self, "inc_rank", "vmap")
 
-  # scan interface
+  # scan 接口
   def leading_axis_spec(self) -> MappingSpec:
     _must_override(self, "leading_axis_spec", "scan")
 
-  # shard_map interface
+  # shard_map 接口
   def shard(self, mesh, manual_axes: frozenset, check_vma: bool, spec: HiPspec
             ) -> HiType:
     _must_override(self, "shard", "shard_map")
@@ -158,7 +165,7 @@ def hijax_method(f):
   return core.aval_method(f)
 
 
-# === new-style hijax primitive implementation ===
+# === 新版 hijax 原语实现 ===
 
 class VJPHiPrimitive:
   in_avals: tuple[PyTreeOfAvals, ...]
@@ -182,11 +189,11 @@ class VJPHiPrimitive:
     self.__dict__.update(self.params)
     self.check(*self.in_avals)
 
-  # Operation implementation in terms of lojax primitives
+  # 用 lojax 原语实现该操作
   def expand(self, *args):
     raise NotImplementedError(f"subclass {type(self)} must implement `expand`")
 
-  # reverse-mode AD interface
+  # 反向模式自动微分接口
   def vjp_fwd(self, nzs_in, /, *args):
     raise NotImplementedError(
         f"for grad support, subclass {type(self)} must implement `vjp_fwd`, "
@@ -206,13 +213,13 @@ class VJPHiPrimitive:
     return logs
 
   def vjp_bwd_retval(self, res, outgrad, /):
-    # Classic API: returns values instead of using accumulators
+    # 经典 API：返回数值，而不使用累加器
     raise NotImplementedError(
         f"for grad support, subclass {type(self)} must implement `vjp_bwd` or "
         "`vjp_bwd_retval`, or derive its reverse-mode rules by setting "
         "`vjp_fwd, vjp_bwd_retval = vjp_from_jvp` (or `= vjp_from_lin`)")
 
-  # optional forward-mode AD interfaces
+  # 可选的前向模式自动微分接口
   def jvp(self, primals, tangents):
     raise NotImplementedError(f"for jvp support, subclass {type(self)} must "
                               "implement `jvp`")
@@ -229,12 +236,12 @@ class VJPHiPrimitive:
         "and `linearized`, or derive them from its `jvp` rule by setting "
         "`lin, linearized = linearize_from_jvp`")
 
-  # optional transpose rule, for primitives that are linear in some inputs
+  # 可选的转置规则，用于对某些输入线性的原语
   def transpose(self, out_ct, *maybe_accums):
     raise NotImplementedError(f"for transpose support, subclass {type(self)} "
                               "must implement `transpose`")
 
-  # vmap interface
+  # vmap 接口
   def batch(self, axis_data, args, dims):
     out_dim = self.batch_dim_rule(axis_data, dims)
     return VmapOf(self, axis_data, dims, out_dim)(*args), out_dim
@@ -243,7 +250,7 @@ class VJPHiPrimitive:
     raise NotImplementedError(f"for vmap support, subclass {type(self)} must "
                               "implement `batch` or `batch_dim_rule`")
 
-  # optional dce control
+  # 可选的死代码消除控制
   def dce(self, used_outs):
     used_outs_flat = tree_leaves_checked(self.out_tree, used_outs)
     if not any(used_outs_flat):
@@ -251,9 +258,9 @@ class VJPHiPrimitive:
     else:
       return True, True, self
 
-  # optional remat control
+  # 可选的重物化控制
   def remat(self, _trace, *args):
-    return self(*args), self  # full remat by default
+    return self(*args), self  # 默认完全重物化
 
   def __call__(self, *args):
     args_flat = tree_leaves_checked(self.in_tree, args)
@@ -261,7 +268,7 @@ class VJPHiPrimitive:
     return tree_unflatten(self.out_tree, ans_flat)
 
   def check(self, *arg_tys):
-    return  # subclass can optionally override this to add checking logic
+    return  # 子类可以选择重写此方法以加入检查逻辑
 
   def staging(self, trace, source_info, *args):
     args_flat = tree_leaves_checked(self.in_tree, args)
@@ -329,7 +336,7 @@ class VmapOf(VJPHiPrimitive):
     return primal_out, (res, Static(res_axes)), *store.out_nzs  # pyrefly: ignore[missing-attribute]
 
   def vjp_bwd_retval(self, res_, g):
-    # TODO probably gonna get non-pytree-prefix errors because of sym zeros...
+    # TODO 因为符号零，这里大概会出现 non-pytree-prefix 错误……
     res, res_axes = res_[0], res_[1].val
     in_dims = tree_map(lambda x: batching.sum_axis if x is None else x, self.in_dims,
                        is_leaf=lambda x: x is None)
@@ -412,9 +419,9 @@ def _call_hi_primitive_to_lojax(*args_flat, _prim):
 call_hi_primitive_p.to_lojax = _call_hi_primitive_to_lojax
 
 def _call_hi_primitive_prettyprint(eqn, context, settings):
-  # print CustomVJPTraced/CustomJVPTraced tersely since their params reprs are
-  # noise (Traced objects, functions), but let prims like RematTraced print in
-  # full since their repr shows the inner jaxpr
+  # 简洁地打印 CustomVJPTraced/CustomJVPTraced，因为它们的 params repr 只是
+  # 噪声（Traced 对象、函数），但让 RematTraced 这类原语完整打印，
+  # 因为其 repr 会显示内部的 jaxpr
   if isinstance(eqn.params['_prim'], (CustomVJPTraced, CustomJVPTraced)):
     params = dict(eqn.params, _prim=eqn.params['_prim'].__class__.__name__)
     eqn = eqn.replace(params=params)
@@ -430,10 +437,10 @@ def _call_hi_primitive_batcher(axis_data, args_flat, dims_flat, _prim):
   return ans_flat, dims_flat
 batching.fancy_primitive_batchers[call_hi_primitive_p] = _call_hi_primitive_batcher
 
-# A `lin` or `vjp_fwd` rule may return (ans, res), (ans, res, nzs_out), or
-# (ans, res, nzs_out, sres). When it returns structured residuals, the paired
-# backward rule receives them explicitly: `linearized(res, sres, *tangents)`,
-# and `vjp_bwd(res, sres, outgrad, *arg_accums)` (which must be overridden).
+# `lin` 或 `vjp_fwd` 规则可以返回 (ans, res)、(ans, res, nzs_out) 或
+# (ans, res, nzs_out, sres)。当它返回结构化残差时，配对的
+# 反向规则会显式收到它们：`linearized(res, sres, *tangents)`，
+# 以及 `vjp_bwd(res, sres, outgrad, *arg_accums)`（后者必须被重写）。
 def _call_hi_primitive_linearize(is_vjp, nz_in_flat, *args_flat, _prim):
   args = tree_unflatten(_prim.in_tree, args_flat)
   nzs_in = tree_unflatten(_prim.in_tree, nz_in_flat)
@@ -457,7 +464,7 @@ def _call_hi_primitive_linearize(is_vjp, nz_in_flat, *args_flat, _prim):
 ad.primitive_linearizations[call_hi_primitive_p] = _call_hi_primitive_linearize
 
 def fake_linear_op(prim, nz_in_flat, nz_out_flat, rs, sres, *tangents):
-  rs = rs if sres is None else (rs, sres)  # unpacked in the transpose rule
+  rs = rs if sres is None else (rs, sres)  # 在转置规则中解包
   residuals_flat, residuals_tree = tree_flatten(rs)
   assert nz_in_flat == [not isinstance(t, ad_util.Zero) for t in tangents]
   nz_tangents = tree_leaves(tangents)
@@ -506,8 +513,8 @@ def _call_hi_primitive_linearized_transpose(
               for a, nz in zip(_prim.out_avals_flat, nz_out_flat)]
   assert next(cts_flat_iter, sentinel := object()) is sentinel
   cts = tree_unflatten(_prim.out_tree, cts_flat)
-  # A vjp_bwd rule may return a dict of pytrees to log out of the backward
-  # pass (see VJP.with_logs), or None (the usual case) to log nothing.
+  # vjp_bwd 规则可以返回一个由 pytree 组成的 dict，用于从反向传播中
+  # 记录日志（参见 VJP.with_logs），或者返回 None（常见情况）表示不记录任何日志。
   if has_sres:
     residuals, sres = residuals
     log = _prim.vjp_bwd(residuals, sres, cts, *accums)
@@ -540,7 +547,7 @@ ad.primitive_jvps[call_hi_primitive_p] = _call_hi_primitive_jvp
 def _call_hi_primitive_transpose(cts_flat, *primals_flat, _prim):
   cts = tree_unflatten(_prim.out_tree, cts_flat)
   primals = tree_unflatten(_prim.in_tree, primals_flat)
-  log = _prim.transpose(cts, *primals)  # a returned dict logs entries
+  log = _prim.transpose(cts, *primals)  # 返回的 dict 用于记录日志条目
   if log is not None and type(log) is not dict:
     raise TypeError(
         f"{type(_prim).__name__}.transpose should return None or a dict of "
@@ -582,10 +589,10 @@ def _call_hi_primitive_remat(trace, *args_flat, _prim):
 remat.rules[call_hi_primitive_p] = _call_hi_primitive_remat
 
 
-# === deriving lin and vjp rules from jvp and lin rules ===
+# === 从 jvp 与 lin 规则派生 lin 与 vjp 规则 ===
 
 class DerivedLinearization:
-  """Residuals of `linearize_from_jvp`, closing over the linear map."""
+  """`linearize_from_jvp` 的残差，闭包持有该线性映射。"""
   __slots__ = ['consts', 'apply']
 
   def __init__(self, consts, apply):
@@ -597,7 +604,7 @@ register_pytree_node(DerivedLinearization,
                      lambda apply, children: DerivedLinearization(children[0], apply))
 
 def _lin_from_jvp(self, nzs_in, *primals):
-  """The `lin` half of the `linearize_from_jvp` pair."""
+  """`linearize_from_jvp` 规则对中的 `lin` 那一半。"""
   primals_flat = tree_leaves_checked(self.in_tree, primals)
   nzs_in_flat = tree_leaves_checked(self.in_tree, nzs_in)
 
@@ -618,7 +625,7 @@ def _lin_from_jvp(self, nzs_in, *primals):
   return out_primals, DerivedLinearization(consts, linearized), nzs_out
 
 def _linearized_from_jvp(self, residuals, *tangents):
-  """The `linearized` half of the `linearize_from_jvp` pair."""
+  """`linearize_from_jvp` 规则对中的 `linearized` 那一半。"""
   tangents_flat = self.in_tree.flatten_up_to(tangents)
   out_tangents_flat = residuals.apply(residuals.consts, None, *tangents_flat)
   return tree_unflatten(self.out_tree, out_tangents_flat)
@@ -638,11 +645,11 @@ def jvp_from_lin(self, primals, tangents):
   return out_primals, out_tangents
 
 def _vjp_fwd_from_jvp(self, nzs_in, *primals):
-  """The `vjp_fwd` half of the `vjp_from_jvp` pair."""
+  """`vjp_from_jvp` 规则对中的 `vjp_fwd` 那一半。"""
   return self(*primals), (primals, nzs_in)
 
 def _transpose_jvp(self, res, out_ct):
-  """The `vjp_bwd_retval` half of the `vjp_from_jvp` pair."""
+  """`vjp_from_jvp` 规则对中的 `vjp_bwd_retval` 那一半。"""
   primals, nzs_in = res
   nzs_flat = tree_leaves_checked(self.in_tree, nzs_in)
   zero = lambda x: isinstance(x, (ad_util.Zero, ad_util.SymbolicZero))
@@ -668,11 +675,11 @@ def _transpose_jvp(self, res, out_ct):
   return tree_unflatten(self.in_tree, in_cts_flat)
 
 def _vjp_fwd_from_lin(self, nzs_in, *primals):
-  """The `vjp_fwd` half of the `vjp_from_lin` pair."""
+  """`vjp_from_lin` 规则对中的 `vjp_fwd` 那一半。"""
   return self.lin(nzs_in, *primals)
 
 def _transpose_linearized(self, residuals, out_ct):
-  """The `vjp_bwd_retval` half of the `vjp_from_lin` pair."""
+  """`vjp_from_lin` 规则对中的 `vjp_bwd_retval` 那一半。"""
   def tangent_map(*tangents):
     return self.linearized(residuals, *tangents)
   zero = lambda x: isinstance(x, ad_util.Zero)
@@ -753,7 +760,7 @@ class CustomVJPTraced(VJPHiPrimitive):
     if any(tree_leaves(in_nzs[0])):
       raise ad.CustomVJPException()
     if self.symbolic_zeros:
-      args = tree_map(CustomVJPPrimal, args, in_nzs)  # tree_map skips Statics
+      args = tree_map(CustomVJPPrimal, args, in_nzs)  # tree_map 会跳过 Static
     args_ = tuple(x.val if isinstance(x, Static) else x for x in args)
     out, res = self.fwd(*args_)
     if config.mutable_array_checks.value:
@@ -801,7 +808,7 @@ class CustomVJPTraced(VJPHiPrimitive):
     if not isinstance(in_cts, tuple):
       raise TypeError(f"Custom VJP bwd rule {self.bwd} must produce a tuple "
                       f"but got {type(in_cts)}.")
-    in_cts = (None, *in_cts)  # zero cotangent for the promoted-consts argument
+    in_cts = (None, *in_cts)  # 为被提升为常量的那个参数补零余切
     if len(in_cts) != len(self.in_tree.children()) - len(self.static_argnums):
       raise ValueError(f"Custom VJP bwd rule {self.bwd} must produce a tuple "
                        "of length equal to the primal args tuple, but got "
@@ -848,7 +855,7 @@ class CustomVJPTraced(VJPHiPrimitive):
     if self.opt_remat:
       return self(*args), self
     if not trace.custom_vjp_rules:
-      return self(*args), self  # see https://github.com/jax-ml/jax/pull/38914
+      return self(*args), self  # 参见 https://github.com/jax-ml/jax/pull/38914
     if not self.static_argnums:
       fwd, dyn_args = self.fwd, args
     else:
@@ -856,8 +863,8 @@ class CustomVJPTraced(VJPHiPrimitive):
       dyn_args, static_args = partition_list(which_static, args)
       static_args = [x.val for x in static_args]
       fwd = lambda *dyn_args: self.fwd(*merge_lists(which_static, dyn_args, static_args))
-    # custom_vjp_rules=False so that custom_vjp applications inside fwd hit
-    # the early return above rather than recursively tracing their fwds.
+    # custom_vjp_rules=False，这样 fwd 内部的 custom_vjp 应用会命中
+    # 上面的提前返回，而不会递归地追踪它们的 fwd。
     (out, _), rem_ = remat.remat_transform(trace.policy, fwd, *dyn_args,
                                            custom_vjp_rules=False)
     rem = lambda *args: rem_(*[x for i, x in enumerate(args) if i not in self.static_argnums])
@@ -946,8 +953,8 @@ class custom_vjp3:
     if all(is_hashable(args[i]) for i in self.static_argnums):
       traced = api.jit(self.f, static_argnums=(*self.static_argnums,)).trace(*args)
     else:
-      # jit requires hashable static_argnums values, but classic custom_vjp
-      # accepted unhashable nondiff_argnums values, so close over them instead
+      # jit 要求 static_argnums 的值可哈希，但经典 custom_vjp
+      # 接受不可哈希的 nondiff_argnums 值，所以改为闭包捕获它们
       which_static = [i in self.static_argnums for i in range(len(args))]
       dyn_args, static_args = partition_list(which_static, args)
       f = dyn_args_fun(self.f, self.static_argnums,
@@ -981,19 +988,19 @@ class OptRemat(VJPHiPrimitive):
   def dce(self, used_outs):
     used_primals, used_res = used_outs
     if any(tree_leaves(used_res)):
-      return True, (True, True), self  # if any res used, no dce at all
+      return True, (True, True), self  # 只要有残差被用到，就完全不做死代码消除
     elif any(tree_leaves(used_primals)):
-      return True, (True, False), self.orig  # if only primals used, undo AD
+      return True, (True, False), self.orig  # 如果只用到原值，就撤销自动微分
     else:
       return False, (False, False), None
 
-  # TODO(mattjj): jvp and transpose? does anyone rely on them?
+  # TODO(mattjj): jvp 和转置呢？有人依赖它们吗？
 
 
 def _set_up_nondiff(f, argnums_, argnames) -> frozenset[int]:
   argnums = set(argnums_)
   if argnames:
-    sig = inspect.signature(f)  # needed for static_argnames
+    sig = inspect.signature(f)  # static_argnames 需要用到它
     argnums |= set(infer_argnums_and_argnames(sig, None, argnames)[0])
   return frozenset(argnums)
 
@@ -1005,7 +1012,7 @@ class Static:
 
 class CustomJVPTraced(VJPHiPrimitive):
   traced: Any
-  jvp_fun: Any  # named to avoid shadowing the jvp method via params
+  jvp_fun: Any  # 这样命名是为了避免通过 params 遮蔽 jvp 方法
   symbolic_zeros: Any
   static_argnums: Any
 
@@ -1058,7 +1065,7 @@ class CustomJVPTraced(VJPHiPrimitive):
   vjp_fwd, vjp_bwd_retval = vjp_from_jvp
 
   def transpose(self, out_ct, *args):
-    # The application must be linear in the accumulated args
+    # 该应用必须对累加的参数是线性的
     args_flat = tree_leaves_checked(self.in_tree, args)
     is_lin = [isinstance(x, ad.GradAccum) for x in args_flat]
     vals = [x for x, l in zip(args_flat, is_lin) if not l]
@@ -1203,8 +1210,8 @@ class custom_jvp3:
     if all(is_hashable(args[i]) for i in self.static_argnums):
       traced = api.jit(self.f, static_argnums=(*self.static_argnums,)).trace(*args)
     else:
-      # jit requires hashable static_argnums values, but classic custom_jvp
-      # accepted unhashable nondiff_argnums values, so close over them instead
+      # jit 要求 static_argnums 的值可哈希，但经典 custom_jvp
+      # 接受不可哈希的 nondiff_argnums 值，所以改为闭包捕获它们
       which_static = [i in self.static_argnums for i in range(len(args))]
       dyn_args, static_args = partition_list(which_static, args)
       f = dyn_args_fun(self.f, self.static_argnums,

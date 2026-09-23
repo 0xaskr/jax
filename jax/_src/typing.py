@@ -13,16 +13,21 @@
 # limitations under the License.
 
 """
-`jax._src.typing`: JAX type annotations
+`jax._src.typing`：JAX 类型注解
 ---------------------------------------
 
-This submodule is a work in progress; when we finalize the contents here, it will be
-exported at `jax.typing`. Until then, the contents here should be considered unstable
-and may change without notice.
+本子模块仍在开发中；当我们最终确定这里的内容后，它会在 `jax.typing` 处导出。
+在此之前，这里的内容应视为不稳定，可能随时变更而不另行通知。
 
-To see the proposal that led to the development of these tools, see
-https://github.com/jax-ml/jax/pull/11859/.
+要查看促成这些工具开发的提案，请见
+https://github.com/jax-ml/jax/pull/11859/。
 """
+
+# 文件职责：定义 JAX 在静态类型检查语境下使用的公共类型注解。
+# 这里给出 `SupportsDType` / `SupportsShape` / `SupportsSize` / `SupportsNdim`
+# 等结构化协议，以及 `DTypeLike`、`Shape`、`Index`、`ArrayLike` 等类型别名，
+# 供类型检查器与用户标注 JAX 数组、dtype、形状和索引相关的接口。
+# 本模块内容尚未稳定，最终会以 `jax.typing` 的形式对外导出。
 
 from __future__ import annotations
 
@@ -41,7 +46,7 @@ import numpy as np
 
 DType = np.dtype
 
-# TODO(jakevdp, froystig): make ExtendedDType a protocol
+# TODO(jakevdp, froystig): 把 ExtendedDType 改为协议
 ExtendedDType = Any
 
 
@@ -62,23 +67,23 @@ class SupportsNdim(Protocol):
   @property
   def ndim(self, /) -> int: ...
 
-# DTypeLike is meant to annotate inputs to np.dtype that return
-# a valid JAX dtype. It's different than numpy.typing.DTypeLike
-# because JAX doesn't support objects or structured dtypes.
-# Unlike np.typing.DTypeLike, we exclude None, and instead require
-# explicit annotations when None is acceptable.
-# TODO(jakevdp): consider whether to add ExtendedDtype to the union.
+# `DTypeLike` 用于标注 `np.dtype` 的输入，这些输入会返回
+# 一个合法的 JAX 数据类型。它与 `numpy.typing.DTypeLike` 不同，
+# 因为 JAX 不支持 object 或结构化数据类型。
+# 与 `np.typing.DTypeLike` 不同，我们排除了 `None`，当允许 `None` 时
+# 要求显式标注。
+# TODO(jakevdp): 考虑是否把 ExtendedDtype 加入联合类型。
 DTypeLike = (
-  str            # like 'float32', 'int32'
-  | type[Any]    # like np.float32, np.int32, float, int
-  | np.dtype     # like np.dtype('float32'), np.dtype('int32')
-  | SupportsDType  # like jnp.float32, jnp.int32
+  str            # 例如 'float32'、'int32'
+  | type[Any]    # 例如 np.float32、np.int32、float、int
+  | np.dtype     # 例如 np.dtype('float32')、np.dtype('int32')
+  | SupportsDType  # 例如 jnp.float32、jnp.int32
 )
 
-# Shapes are tuples of dimension sizes, which are normally integers. We allow
-# modules to extend the set of dimension sizes to contain other types, e.g.,
-# symbolic dimensions in export.DimExpr.
-DimSize = int | Any  # extensible
+# 形状是维度大小的元组，维度大小通常是整数。我们允许
+# 各模块扩展维度大小的集合以包含其他类型，例如
+# `export.DimExpr` 中的符号维度。
+DimSize = int | Any  # 可扩展的
 Shape = Sequence[DimSize]
 
 class DuckTypedArray(Protocol):
@@ -87,22 +92,22 @@ class DuckTypedArray(Protocol):
   @property
   def shape(self) -> Shape: ...
 
-# Array is a type annotation for standard JAX arrays and tracers produced by
-# core functions in jax.lax and jax.numpy; it is not meant to include
-# future non-standard array types like KeyArray and BInt. It is imported above.
+# `Array` 是标准 JAX 数组以及由 `jax.lax`、`jax.numpy` 中核心函数
+# 产生的追踪器的类型注解；它不打算涵盖未来出现的非标准数组类型，
+# 如 `KeyArray` 和 `BInt`。它在上面被导入。
 
-# ArrayLike is a Union of all objects that can be implicitly converted to a standard
-# JAX array (i.e. not including future non-standard array types like KeyArray and BInt).
-# It's different than np.typing.ArrayLike in that it doesn't accept arbitrary sequences,
-# nor does it accept string data.
+# `ArrayLike` 是所有可被隐式转换为标准 JAX 数组的对象的联合类型
+# （即不包括未来出现的非标准数组类型，如 `KeyArray` 和 `BInt`）。
+# 它与 `np.typing.ArrayLike` 不同，因为它既不接受任意序列，
+# 也不接受字符串数据。
 
-# We use a class for deprecated args to avoid using Any/object types which can
-# introduce complications and mistakes in static analysis
+# 我们为已废弃的参数使用一个类，以避免使用 Any/object 类型，
+# 因为那会在静态分析中引入复杂情况与错误
 class DeprecatedArg:
   def __repr__(self):
     return "Deprecated"
 
-# Mirror of dlpack.h enum
+# dlpack.h 枚举的镜像
 class DLDeviceType(enum.IntEnum):
   kDLCPU = 1
   kDLCUDA = 2

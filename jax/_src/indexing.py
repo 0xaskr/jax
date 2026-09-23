@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：为 JAX 提供支持动态起始索引的切片抽象。
+# `Slice` 是一个 pytree，用起始索引、大小和步长描述一次切片，其中起始与大小
+# 既可以是静态已知的，也可以是运行期才确定的数组；`dslice`（别名 `ds`）把它
+# 包装成类似内置 `slice` 的构造接口，于是 `x[jax.ds(i, size)]` 能在 `jit`
+# 内部使用动态下标。该模块是 `jax.numpy` 动态切片语义的底层支撑。
+
 from __future__ import annotations
 
 import dataclasses
@@ -25,10 +31,10 @@ from jax._src.typing import Array
 @tree_util.register_pytree_node_class
 @dataclasses.dataclass(slots=True)
 class Slice:
-  """A slice with a start index and a size.
+  """带有起始索引和大小的切片。
 
-  Both start index and size can either be static, i.e. known at tracing
-  and compilation time, or dynamic.
+  起始索引和大小既可以是静态的，即在追踪
+  与编译期已知，也可以是动态的。
   """
 
   start: int | Array
@@ -48,7 +54,7 @@ class Slice:
     return not core.is_dim(self.size)
 
   def tree_flatten(self):
-    # If `start` is statically known, we treat it as static information
+    # 若 `start` 静态已知，就把它当作静态信息处理
     xs = ()
     data = ()
     xs += (self.start,) if self.is_dynamic_start else (None,)
@@ -100,14 +106,14 @@ def dslice(
     size: int | Array | _NotSpecified = _NotSpecified(),
     stride: int | None = None,
 ) -> slice | Slice:
-  """Constructs a ``Slice`` from a start index and a size.
+  """由起始索引和大小构造一个 ``Slice``。
 
-  The semantics of ``dslice`` mirror those of the builtin ``slice`` type:
+  ``dslice`` 的语义与内置的 ``slice`` 类型一致：
 
-  * ``dslice(None)`` is ``:``
-  * ``dslice(j)`` is ``:j``
-  * ``dslice(i, j)`` is ``i:i+j``
-  * ``dslice(i, j, stride)`` is ``i:i+j:stride``
+  * ``dslice(None)`` 即 ``:``
+  * ``dslice(j)`` 即 ``:j``
+  * ``dslice(i, j)`` 即 ``i:i+j``
+  * ``dslice(i, j, stride)`` 即 ``i:i+j:stride``
 
   Examples:
 
@@ -118,7 +124,7 @@ def dslice(
     >>> x[jax.ds(i, 2)]  # equivalent which allows i to be dynamic
     Array([4, 5], dtype=int32)
 
-    Here is an explicit example of slicing with a dynamic start index:
+    下面是一个使用动态起始索引进行切片的明确示例：
 
     >>> @jax.jit(static_argnames='size')
     ... def f(x, i, size):  # example of when `
@@ -140,4 +146,4 @@ def dslice(
   return Slice(start, size, stride)
 
 
-ds = dslice  # Handy alias.
+ds = dslice  # 便捷别名。

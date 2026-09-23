@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：集中管理 JAX 的日志配置，包括全局日志级别与按模块的调试日志。
+# 它同时设置 Python 侧 `jax`/`jaxlib` logger 的级别与处理器，
+# 并通过 `jax._src.lib.utils.absl_set_min_log_level` 同步 C++ 运行时级别。
+# `update_logging_level_global` 面向全局级别配置项，
+# `update_debug_log_modules` 则为指定模块开启逐模块 debug 输出到 stderr。
+# 这些函数由 JAX 配置项（如 `jax_debug_log_modules`）在值变化时回调调用。
+
 import logging
 import sys
 from jax._src.lib import utils
 
-# Example log message:
+# 日志消息示例：
 # DEBUG:2023-06-07 00:14:40,280:jax._src.xla_bridge:590: Initializing backend 'cpu'
 logging_formatter = logging.Formatter(
     "{levelname}:{asctime}:{name}:{lineno}: {message}", style='{')
@@ -50,17 +57,17 @@ _tf_cpp_map = {
 def _set_cpp_min_log_level(logging_level: str | None = None):
   if logging_level in (None, "NOTSET"):
     return
-  # set cpp runtime logging level if the level is anything but NOTSET
+  # 只要级别不是 NOTSET，就设置 C++ 运行时的日志级别
   if logging_level not in _tf_cpp_map:
     raise ValueError(f"Attempting to set log level \"{logging_level}\" which"
                       f" isn't one of the supported:"
                       f" {list(_tf_cpp_map.keys())}.")
-  # config the CPP logging level 0 - debug, 1 - info, 2 - warning, 3 - error
+  # 配置 C++ 日志级别 0 - debug，1 - info，2 - warning，3 - error
   log_level = _tf_cpp_map[logging_level]
   utils.absl_set_min_log_level(log_level)
 
 def update_logging_level_global(logging_level: str | None) -> None:
-  # remove previous handlers
+  # 移除此前的处理器
   for logger_name, level in _logging_level_set.items():
     logger = logging.getLogger(logger_name)
     logger.removeHandler(_jax_logger_handler)
@@ -73,7 +80,7 @@ def update_logging_level_global(logging_level: str | None) -> None:
 
   logging_level_num = _nameToLevel[logging_level]
 
-  # update jax and jaxlib root loggers for propagation
+  # 更新 jax 与 jaxlib 根 logger 以支持传播
   root_loggers = [logging.getLogger("jax"), logging.getLogger("jaxlib")]
   for logger in root_loggers:
     logger.setLevel(logging_level_num)
@@ -81,13 +88,13 @@ def update_logging_level_global(logging_level: str | None) -> None:
       logger.addHandler(_jax_logger_handler)
     _logging_level_set[logger.name] = logger.level
 
-# per-module debug logging
+# 按模块的调试日志
 
 _jax_logger = logging.getLogger("jax")
 
 class _DebugHandlerFilter(logging.Filter):
   def filter(self, record):
-    del record  # Unused.
+    del record  # 未使用。
     return _jax_logger.level > logging.DEBUG
 
 _debug_handler = logging.StreamHandler(sys.stderr)
@@ -98,12 +105,12 @@ _debug_handler.addFilter(_DebugHandlerFilter())
 _debug_enabled_loggers = []
 
 def _enable_debug_logging(logger_name):
-  """Makes the specified logger log everything to stderr.
+  """让指定的 logger 把所有内容都记录到 stderr。
 
-  Also adds more useful debug information to the log messages, e.g. the time.
+  同时为日志消息添加更有用的调试信息，例如时间。
 
   Args:
-    logger_name: the name of the logger, e.g. "jax._src.xla_bridge".
+    logger_name: logger 的名称，例如 "jax._src.xla_bridge"。
   """
   logger = logging.getLogger(logger_name)
   _debug_enabled_loggers.append((logger, logger.level))
@@ -113,10 +120,10 @@ def _enable_debug_logging(logger_name):
 
 
 def _disable_all_debug_logging():
-  """Disables all debug logging enabled via `enable_debug_logging`.
+  """停用所有通过 `enable_debug_logging` 启用的调试日志。
 
-  The default logging behavior will still be in effect, i.e. WARNING and above
-  will be logged to stderr without extra message formatting.
+  默认的日志行为仍然生效，即 WARNING 及以上级别
+  会以不带额外消息格式的方式记录到 stderr。
   """
   for logger, prev_level in _debug_enabled_loggers:
     logger: logging.Logger

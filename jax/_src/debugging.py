@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Module for JAX debugging primitives and related functionality."""
+
+# 文件职责：实现 JAX 的调试原语（`jax.debug.*`）及其变换规则。
+# 对外提供 `jax.debug.callback`、`jax.debug.print`/`debug_log`，以及
+# `visualize_sharding`、`inspect_array_sharding` 等分片可视化工具。
+# 内部定义 `DebugEffect`/`OrderedDebugEffect` 两种效果和 `debug_callback`、
+# `debug_print`、`inspect_sharding` 原语，并为它们注册批处理、JVP、转置、
+# 部分求值、降级（lowering）与 `shard_map` 即时求值规则。
+
+"""JAX 调试原语及相关功能的模块。"""
 
 from __future__ import annotations
 
@@ -75,7 +83,7 @@ effects.custom_derivatives_allowed_effects.add_type(OrderedDebugEffect)
 effects.partial_eval_kept_effects.add_type(DebugEffect)
 effects.partial_eval_kept_effects.add_type(OrderedDebugEffect)
 
-# `debug_callback_p` is the main primitive for staging out Python callbacks.
+# `debug_callback_p` 是把 Python 回调暂存（stage out）出去的主要原语。
 debug_callback_p = core.Primitive('debug_callback')
 debug_callback_p.multiple_results = True
 
@@ -112,13 +120,13 @@ def debug_callback_abstract_eval(*flat_avals, callback: Callable[..., Any],
 
 
 def debug_batching_rule(args, dims, *, primitive, **params):
-  """Unrolls the debug callback across the mapped axis."""
+  """把调试回调沿被映射的轴展开（unroll）。"""
   axis_size = next(x.shape[i] for x, i in zip(args, dims)
                    if i is not None)
-  # TODO(sharadmv): implement in terms of rolled loop unstead of unrolled.
+  # TODO(sharadmv): 改为用循环（rolled loop）实现，而不是展开（unrolled）。
   def get_arg_at_dim(i, dim, arg):
     if dim is None:
-      # Broadcast unmapped argument
+      # 广播未被映射的参数
       return arg
     return lax.index_in_dim(arg, i, axis=dim, keepdims=False)
   outs = []
@@ -155,11 +163,11 @@ def _debug_callback_partial_auto(axis_context, *args, **params):
 def debug_callback_lowering(ctx, *args, effect, partitioned, callback, **params):
   axis_context = ctx.module_context.axis_context
   if isinstance(axis_context, sharding_impls.SPMDAxisContext):
-    # We're a shard_map, which might be partial-manual or full-manual.
+    # 我们处在 shard_map 中，可能是部分手动（partial-manual）或全手动（full-manual）分片。
     partial_auto = set(axis_context.mesh.axis_names) - axis_context.manual_axes
     if partial_auto:
-      # If we have partial manual / partial auto sharding, we gather and
-      # conditionally run the callback.
+      # 如果存在部分手动 / 部分自动的分片，我们会先做聚集（gather），再
+      # 有条件地执行回调。
       lower = partial(
           _debug_callback_partial_auto,
           axis_context,
@@ -170,19 +178,19 @@ def debug_callback_lowering(ctx, *args, effect, partitioned, callback, **params)
       )
       return mlir.lower_fun(lower)(ctx, *args)
     elif set(axis_context.manual_axes) == set(axis_context.mesh.axis_names):
-      # If we have fully manual sharding during lowering, that means the JAX
-      # program has per-device semantics, so we run the callback on each device.
+      # 如果降级时是全手动分片，说明该 JAX 程序具有逐设备（per-device）语义，
+      # 因此我们在每台设备上都运行一次回调。
       if config.use_shardy_partitioner.value:
         sharding = cb._get_sdy_array_list_for_callbacks(ctx.avals_out)
       else:
         sharding = xc.OpSharding()
         sharding.type = xc.OpSharding.Type.MANUAL
     else:
-      assert False  # Unreachable
+      assert False  # 不可达
   elif isinstance(axis_context, sharding_impls.ShardingContext):
-    # If we have fully automatic sharding during lowering, that means the JAX
-    # program has bulk array semantics, so we run the callback with a MAXIMAL
-    # sharding and hence execute it only once on the full logical value).
+    # 如果降级时是全自动分片，说明该 JAX 程序具有整体数组（bulk array）语义，
+    # 因此我们用 MAXIMAL 分片来运行回调，
+    # 于是它只在完整的逻辑值上执行一次。
     if config.use_shardy_partitioner.value:
       sharding = sharding_impls.SdyArrayList((
           sharding_impls.SdyArray(
@@ -193,7 +201,7 @@ def debug_callback_lowering(ctx, *args, effect, partitioned, callback, **params)
       sharding.tile_assignment_dimensions = [1]
       sharding.tile_assignment_devices = [0]
   else:
-    # When there's no SPMD partitioning going on, don't annotate a sharding.
+    # 没有进行 SPMD 分区时，不要标注分片。
     sharding = None
 
   def _callback(*flat_args):
@@ -222,39 +230,39 @@ mlir.register_lowering(debug_callback_p, debug_callback_lowering,
                        platform="cpu")
 mlir.register_lowering(
     debug_callback_p, debug_callback_lowering, platform="gpu")
-# Debug callbacks use channel IDs on TPU, which require non-caching.
+# 调试回调在 TPU 上使用 channel ID，因此不能缓存。
 mlir.register_lowering(
     debug_callback_p, debug_callback_lowering, platform="tpu",
     cacheable=False)
 
 
 def _debug_partial_eval_custom(saveable, unks_in, inst_in, eqn, primitive):
-  # The default behavior for effectful primitives is to not stage them if
-  # possible. For debug callback, we actually want it to be staged to
-  # provide more information to the user. This rule bypasses partial_eval's
-  # regular behavior to do that. Specifically, we will stage the callback
-  # if:
-  # 1) the policy says debug_callbacks are not saveable
-  # 2) the policy says debug_callbacks are saveable BUT all of the input
-  #    values are instantiated.
-  # The purpose is to call back with as much information as possible while
-  # avoiding unnecessarily staging out other values.
+  # 带效果的原语默认行为是尽量不把它们暂存（stage out）。
+  # 但对调试回调，我们恰恰希望把它暂存出去，
+  # 以便向用户提供更多信息。这条规则绕过了 partial_eval 的
+  # 常规行为来实现这一点。具体来说，在以下情况下
+  # 我们就会暂存该回调：
+  # 1) 策略认为 debug_callback 不可保存（saveable）
+  # 2) 策略认为 debug_callback 可保存，但所有输入
+  #    值都已实例化。
+  # 这样做的目的是在回调时提供尽可能多的信息，
+  # 同时避免不必要地暂存其他值。
   if any(unks_in):
-    # The usual case (if we have any unknowns, we need to stage it out)
+    # 常见情形（只要存在未知量，就需要把它暂存出去）
     res = [v for v, inst in zip(eqn.invars, inst_in) if not inst]
     return None, eqn, [], [], res
   if saveable(primitive, *[v.aval for v in eqn.invars], **eqn.params):
-    # The policy is telling us we can save the debug callback.
+    # 策略告诉我们，可以保存这个调试回调。
     if all(inst_in):
-      # If all of the inputs are instantiated, we also stage out the
-      # debug_callback.
+      # 如果所有输入都已实例化，我们也把
+      # debug_callback 暂存出去。
       return eqn, eqn, [], [], []
     else:
-      # If any are not instantiated, we don't do any extra staging to avoid
-      # affecting the computation.
+      # 如果有输入尚未实例化，我们不做额外的暂存，以免
+      # 影响计算结果。
       return eqn, None, [], [], []
-  # If we can't save the debug callback (thanks to the policy) we listen to
-  # the policy and stage out the debug callback.
+  # 如果（根据策略）不能保存调试回调，我们就遵从策略，
+  # 把它暂存出去。
   return eqn, eqn, [], [], []
 
 
@@ -266,7 +274,7 @@ pe.partial_eval_jaxpr_custom_rules[debug_callback_p] = partial(
 def _debug_callback_state_discharge_rule(
     ctx, *args, effect, partitioned, callback, **params
 ):
-  del ctx  # Unused.
+  del ctx  # 未使用。
   out = debug_callback_p.bind(
       *args, effect=effect, partitioned=partitioned, callback=callback, **params
   )
@@ -336,7 +344,7 @@ def debug_print_impl(
 
 @debug_print_p.def_effectful_abstract_eval
 def debug_print_abstract_eval(*avals: Any, fmt: str, ordered, **kwargs):
-  del avals, fmt, kwargs  # Unused.
+  del avals, fmt, kwargs  # 未使用。
   effect = ordered_debug_effect if ordered else debug_effect
   return [], {effect}
 
@@ -400,7 +408,7 @@ pe.partial_eval_jaxpr_custom_rules[debug_print_p] = partial(
 
 @state_discharge.register_discharge_rule(debug_print_p)
 def _debug_print_state_discharge_rule(ctx, *args, **kwargs):
-  del ctx  # Unused.
+  del ctx  # 未使用。
   out = debug_print_p.bind(*args, **kwargs)
   return args, out
 
@@ -430,54 +438,54 @@ def debug_callback(
     partitioned: bool = False,
     **kwargs: Any,
 ) -> Callable[..., None] | None:
-  """Calls a stageable Python callback.
+  """调用一个可暂存的 Python 回调（callback）。
 
-  For more explanation, see `External Callbacks`_.
+  更多说明参见 `External Callbacks`_。
 
-  ``jax.debug.callback`` enables you to pass in a Python function that can be
-  called inside of a staged JAX program. A ``jax.debug.callback`` follows
-  existing JAX transformation *pure* operational semantics, which are therefore
-  unaware of side-effects. This means the effect could be dropped, duplicated,
-  or potentially reordered in the presence of higher-order primitives and
-  transformations.
+  ``jax.debug.callback`` 让你可以传入一个 Python 函数，
+  并能在已暂存的 JAX 程序中调用它。``jax.debug.callback`` 遵循
+  JAX 变换既有的*纯*（pure）操作语义，因此
+  对副作用一无所知。这意味着在高阶原语与变换的作用下，
+  该效果可能被丢弃、复制，
+  甚至被重新排序。
 
-  We want this behavior because we'd like ``jax.debug.callback`` to be
-  "innocuous", i.e. we want these primitives to change the JAX computation as
-  little as possible while revealing as much about them as possible, such as
-  which parts of the computation are duplicated or dropped.
+  我们之所以希望如此，是因为想让 ``jax.debug.callback``
+  保持“无害”（innocuous），即希望这些原语在尽可能少地
+  改变 JAX 计算的同时，尽可能多地暴露关于它的信息，
+  例如计算的哪些部分被复制或被丢弃。
 
-  ``jax.debug.callback`` supports two ways of being called:
+  ``jax.debug.callback`` 支持两种调用方式：
 
-  1. Two-call form (Recommended):
+  1. 两次调用形式（推荐）：
      ``jax.debug.callback(ordered=True)(callback, *args, **kwargs)``
-     Options are passed in the first call. The callback and its arguments are
-     passed in the second call. No option arguments are accepted in the second
-     call.
+     选项在第一次调用中传入。回调及其参数
+     在第二次调用中传入。第二次调用不接受
+     任何选项参数。
 
-  2. Single-call form:
+  2. 单次调用形式：
      ``jax.debug.callback(callback, *args, ordered=True, **kwargs)``
-     (Soft deprecated) Mixing `ordered` and `partitioned` options with callback
-     ``kwargs`` is soft deprecated.
+     （软弃用）把 `ordered` 与 `partitioned` 选项与回调的
+     ``kwargs`` 混在一起使用已被软弃用。
 
   Args:
-    callback: A Python callable returning None.
-    *args: The positional arguments to the callback.
-    ordered: A keyword only argument used to indicate whether or not the staged
-      out computation will enforce ordering of this callback w.r.t. other
-      ordered callbacks.
-    partitioned: If True, then print local shards only; this option avoids an
-      all-gather of the operands. If False, print with logical operands; this
-      option requires an all-gather of operands first.
-    **kwargs: The keyword arguments to the callback.
+    callback: 一个返回 None 的 Python 可调用对象。
+    *args: 传给回调的位置参数。
+    ordered: 仅关键字参数，用于指示已暂存的计算是否
+      会对该回调与其他 ordered 回调之间的先后顺序
+      强制执行排序。
+    partitioned: 若为 True，则只打印本地分片；该选项可避免
+      对操作数做 all-gather。若为 False，则用逻辑操作数打印；
+      该选项需要先对操作数做一次 all-gather。
+    **kwargs: 传给回调的关键字参数。
 
   Returns:
     None
 
   See Also:
-    - :func:`jax.experimental.io_callback`: callback designed for impure
-      functions.
-    - :func:`jax.pure_callback`: callback designed for pure functions.
-    - :func:`jax.debug.print`: callback designed for printing.
+    - :func:`jax.experimental.io_callback`: 为不纯（impure）
+      函数设计的回调。
+    - :func:`jax.pure_callback`: 为纯函数设计的回调。
+    - :func:`jax.debug.print`: 为打印设计的回调。
 
   .. _External Callbacks:
      https://docs.jax.dev/en/latest/notebooks/external_callbacks.html
@@ -529,7 +537,7 @@ class _DebugPrintFormatChecker(string.Formatter):
 
   def format_field(self, value, format_spec):
     del value, format_spec
-    return ""  # No formatting is done.
+    return ""  # 不做任何格式化。
 
   def check_unused_args(self, used_args, args, kwargs):
     unused_args = [arg for i, arg in enumerate(args) if i not in used_args]
@@ -608,48 +616,48 @@ def debug_print(
     _use_logging: bool = False,
     **kwargs,
 ) -> Callable[..., None] | None:
-  """Prints values and works in staged out JAX functions.
+  """打印值，并能在已暂存（staged out）的 JAX 函数中工作。
 
-  This function does *not* work with f-strings because formatting is delayed.
-  So instead of ``jax.debug.print(f"hello {bar}")``, write
-  ``jax.debug.print("hello {bar}", bar=bar)``.
+  该函数*不*支持 f-string，因为格式化被延迟了。
+  所以不要写 ``jax.debug.print(f"hello {bar}")``，而应写
+  ``jax.debug.print("hello {bar}", bar=bar)``。
 
-  ``jax.debug.print`` supports two ways of being called:
+  ``jax.debug.print`` 支持两种调用方式：
 
-  1. Two-call form (Recommended):
+  1. 两次调用形式（推荐）：
      ``jax.debug.print(ordered=True)("hello {x}", x=42)``
-     Options are passed in the first call. The format string and arguments are
-     passed in the second call. No option arguments are accepted in the second
-     call.
+     选项在第一次调用中传入。格式字符串与参数
+     在第二次调用中传入。第二次调用不接受
+     任何选项参数。
 
-  2. Single-call form:
+  2. 单次调用形式：
      ``jax.debug.print("hello {x}", x=42, ordered=True)``
-     (Soft deprecated) Mixing `ordered` and `partitioned` options with print
-     ``kwargs`` is soft deprecated.
+     （软弃用）把 `ordered` 与 `partitioned` 选项与 print 的
+     ``kwargs`` 混在一起使用已被软弃用。
 
   Args:
-    fmt: A format string, e.g. ``"hello {x}"``, that will be used to format
-      input arguments, like ``str.format``. See the Python docs on `string
+    fmt: 格式字符串，例如 ``"hello {x}"``，用于格式化
+      输入参数，用法类似 ``str.format``。参见 Python 文档中的 `string
       formatting <https://docs.python.org/3/library/stdtypes.html#str.format>`_
-      and `format string syntax
-      <https://docs.python.org/3/library/string.html#formatstrings>`_.
-    *args: A list of positional arguments to be formatted, as if passed to
-      ``fmt.format``.
-    ordered: A keyword only argument used to indicate whether or not the staged
-      out computation will enforce ordering of this ``jax.debug.print`` w.r.t.
-      other ordered ``jax.debug.print`` calls.
-    partitioned: If True, then print local shards only; this option avoids an
-      all-gather of the operands. If False, print with logical operands; this
-      option requires an all-gather of operands first.
-    skip_format_check: If True, the format string is not checked. This is useful
-      when using the function from inside a Pallas TPU kernel, where scalars
-      args will be printed after the format string.
-    **kwargs: Additional keyword arguments to be formatted, as if passed to
-      ``fmt.format``.
+      以及 `format string syntax
+      <https://docs.python.org/3/library/string.html#formatstrings>`_。
+    *args: 要被格式化的位置参数列表，如同传给
+      ``fmt.format``。
+    ordered: 仅关键字参数，用于指示已暂存的计算是否
+      会对这个 ``jax.debug.print`` 相对于其他 ordered 的
+      ``jax.debug.print`` 调用强制排序。
+    partitioned: 若为 True，则只打印本地分片；该选项可避免
+      对操作数做 all-gather。若为 False，则用逻辑操作数打印；
+      该选项需要先对操作数做一次 all-gather。
+    skip_format_check: 若为 True，则不检查格式字符串。这在
+      从 Pallas TPU kernel 内部使用该函数时很有用，此时标量
+      参数会打印在格式字符串之后。
+    **kwargs: 要被格式化的额外关键字参数，如同传给
+      ``fmt.format``。
   """
   def _debug_print(fmt: str, *c_args, **c_kwargs):
     if not skip_format_check:
-      # Check that we provide the correct arguments to be formatted.
+      # 检查我们传给格式化的参数是否正确。
       formatter.format(fmt, *c_args, **c_kwargs)
     has_placeholders = False
     if fmt:
@@ -686,7 +694,7 @@ def debug_print(
 
 debug_log = partial(debug_print, _use_logging=True)
 
-# Sharding visualization
+# 分片可视化
 
 inspect_sharding_p = core.Primitive("inspect_sharding")
 inspect_sharding_p.multiple_results = True
@@ -699,7 +707,7 @@ inspect_sharding_p.def_impl(_inspect_sharding_impl)
 
 def _inspect_sharding_abstract_eval(aval, **_):
   del aval
-  # Effectful abstract avoids DCE
+  # 带效果的抽象求值可避免死代码消除（DCE）
   return [], {debug_effect}
 inspect_sharding_p.def_effectful_abstract_eval(_inspect_sharding_abstract_eval)
 
@@ -738,8 +746,8 @@ def _inspect_sharding_lowering_rule(ctx: mlir.LoweringRuleContext, value, *,
     raise NotImplementedError(type(axis_context))
   assert devices is not None
 
-  # If we have a nontrivial parallel computation, we need to wait until the SPMD
-  # partitioner calls back with the `HloSharding.
+  # 如果存在非平凡的并行计算，我们需要等到 SPMD 分区器
+  # 用 `HloSharding` 回调回来。
   def _hlo_sharding_callback(hlo_sharding: xc.HloSharding):
     if mesh.empty:
       return callback(
@@ -749,14 +757,14 @@ def _inspect_sharding_lowering_rule(ctx: mlir.LoweringRuleContext, value, *,
     return callback(NamedSharding(mesh, pspec))
 
   if len(devices) == 1:
-    # If we only have one device in our computation, we can construct a
-    # replicated HloSharding and call it right now.
+    # 如果计算中只有一台设备，我们可以直接构造一个
+    # 复制的（replicated）HloSharding 并立即调用它。
     _hlo_sharding_callback(sharding_impls.replicated_hlo_sharding)
     return []
 
   key = xc.encode_inspect_sharding_callback(_hlo_sharding_callback)
-  # We need to make sure `_hlo_sharding_callback` is still alive when the SPMD
-  # partitioner runs so we keep it alive by attaching it to the executable.    #
+  # 我们需要确保 SPMD 分区器运行时 `_hlo_sharding_callback` 仍然存活，
+  # 因此把它挂到可执行文件上以保持其存活。
   ctx.module_context.add_keepalive(_hlo_sharding_callback)
 
   hlo.CustomCallOp([value.type], [value],
@@ -811,11 +819,11 @@ def visualize_sharding(shape: Sequence[int], sharding: Sharding, *,
                        use_color: bool = True, scale: float = 1.,
                        min_width: int = 9, max_width: int = 80,
                        color_map: ColorMap | None = None):
-  """Visualizes a ``Sharding`` using ``rich``."""
+  """用 ``rich`` 可视化一个 ``Sharding``。"""
   if not importlib.util.find_spec("rich"):
     raise ValueError("`visualize_sharding` requires `rich` to be installed.")
 
-  # These imports are local so that they don't affect JAX import times.
+  # 这些导入放在函数内部，以免影响 JAX 的导入时间。
   import rich.align  # pyrefly: ignore[missing-import]
   import rich.console  # pyrefly: ignore[missing-import]
   import rich.box  # pyrefly: ignore[missing-import]
@@ -840,7 +848,7 @@ def visualize_sharding(shape: Sequence[int], sharding: Sharding, *,
   base_width = int(base_height * aspect_ratio)
   height_to_width_ratio = 2.5
 
-  # Grab the device kind from the first device
+  # 从第一台设备获取设备类型
   device_kind = next(iter(sharding.device_set)).platform.upper()
 
   device_indices_map = sharding.devices_indices_map(tuple(shape))
@@ -865,7 +873,7 @@ def visualize_sharding(shape: Sequence[int], sharding: Sharding, *,
       heights[chunk_idxs] = chunk_height
       widths[chunk_idxs] = chunk_width
     else:
-      # In the 1D case, we set the height to 1.
+      # 在一维情形下，我们把高度设为 1。
       horiz, = slcs
       vert = slice(0, 1, None)
       horiz_size = (
@@ -925,33 +933,33 @@ def visualize_sharding(shape: Sequence[int], sharding: Sharding, *,
   console.print(table, end='\n\n')
 
 def inspect_array_sharding(value, *, callback: Callable[[Sharding], None]):
-  """Enables inspecting array sharding inside JIT-ted functions.
+  """让你可以在经 JIT 处理的函数内部检查数组分片。
 
-  This function, when provided with a Pytree of arrays, calls back with each of
-  their shardings and works in ``jax.jit``-ted computations, enabling inspecting
-  the chosen intermediate shardings.
+  给定一个由数组组成的 Pytree，该函数会针对每个数组的分片进行
+  回调，并且能在经 ``jax.jit`` 处理的计算中工作，从而可以检查
+  所选中间值（intermediate）的分片。
 
-  The policy for when ``callback`` is called is *as early as possible* when the
-  sharding information is available. This means if ``inspect_array_callback`` is
-  called without any transformations, the callback will happen immediately
-  since we have the array and its sharding readily available. Inside of a
-  ``jax.jit``, the callback will happen at lowering time, meaning you can
-  trigger the callback using the AOT API (``jit(f).lower(...)``). When inside of
-  a ``jax.jit``, the callback happens *at compile time* since the sharding is
-  determined by XLA. You can trigger the callback by using JAX's AOT API
-  (``jax.jit(f).lower(...).compile()``). In all cases, the callback will be
-  triggered by running the function, since running a function entails lowering
-  and compiling it first. However, once the function is compiled and cached,
-  the callback will no longer occur.
+  ``callback`` 的调用时机策略是：一旦分片信息可用就*尽早*调用。
+  这意味着如果在没有任何变换的情况下调用 ``inspect_array_callback``，
+  回调会立即发生，因为数组及其分片信息随手可得。
+  在 ``jax.jit`` 内部，回调会发生在降级（lowering）阶段，
+  也就是说你可以用 AOT API（``jit(f).lower(...)``）来
+  触发回调。在 ``jax.jit`` 内部时，由于分片由 XLA 决定，
+  回调发生在*编译期*。你可以用 JAX 的 AOT API
+  （``jax.jit(f).lower(...).compile()``）来触发回调。
+  无论哪种情况，只要运行该函数就会触发回调，
+  因为运行函数必然先降级并编译它。
+  不过，一旦函数编译完成并被缓存，
+  回调就不会再发生了。
 
-  This function is experimental and its behavior may change in the future.
+  该函数是实验性的，其行为将来可能改变。
 
   Args:
-    value: A Pytree of JAX arrays.
-    callback: A callable that takes in a ``Sharding`` and doesn't return a value.
+    value: 由 JAX 数组组成的 Pytree。
+    callback: 接收一个 ``Sharding`` 且不返回值的可调用对象。
 
-  In the following example, we print out the sharding of an intermediate value
-  in a ``jax.jit``-ted computation:
+  下面的例子会打印出经 ``jax.jit`` 处理的计算中
+  某个中间值的分片：
 
   >>> import jax
   >>> import jax.numpy as jnp
@@ -974,13 +982,13 @@ def inspect_array_sharding(value, *, callback: Callable[[Sharding], None]):
   tree_util.tree_map(_inspect, value)
 
 def visualize_array_sharding(arr, **kwargs):
-  """Visualizes an array's sharding."""
+  """可视化一个数组的分片。"""
   def _visualize(sharding):
     return visualize_sharding(arr.shape, sharding, **kwargs)
   inspect_array_sharding(arr, callback=_visualize)
 
 
-# TODO(mattjj): working around an apparent XLA or PjRt bug, remove eventually
+# TODO(mattjj): 绕过疑似 XLA 或 PjRt 的 bug，最终应移除
 def _debug_callback_eager_rule(
     mesh,
     *args,

@@ -12,17 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：定义在追踪期携带 JAX 类型信息的标量与主机侧数组字面量类型。
+# TypedInt、TypedFloat、TypedComplex 让 Python 内建标量可以携带 JAX 数据
+# 类型；TypedNdArray 则是带有 aval 与弱类型标记的 np.ndarray 子类。这些类型
+# 在规范化过程中不会被改写，从而在不同 jax_enable_x64 模式下保持 dtype 稳定。
+
 from jax._src import dtypes
 from jax._src.core import ShapedArray
 from jax._src.lib import _jax
 import numpy as np
 
-# TypedInt, TypedFloat, and TypedComplex are subclasses of int, float, and
-# complex that carry a JAX dtype. Canonicalization forms these types from int,
-# float, and complex. Repeated canonicalization, including under different
-# jax_enable_x64 modes, preserves the dtype.
+# TypedInt、TypedFloat 和 TypedComplex 是 int、float 和 complex 的子类，
+# 它们携带 JAX 数据类型。规范化会从 int、float 和 complex 构造出这些
+# 类型。重复规范化（包括在不同 jax_enable_x64 模式下进行）会保留
+# 原有的数据类型。
 
-# Precomputed weak scalar avals
+# 预先计算好的弱标量 aval
 _weak_int32_aval = ShapedArray((), np.dtype(np.int32), weak_type=True)
 _weak_int64_aval = ShapedArray((), np.dtype(np.int64), weak_type=True)
 _weak_float32_aval = ShapedArray((), np.dtype(np.float32), weak_type=True)
@@ -114,13 +119,11 @@ typed_scalar_types: set[type] = {TypedInt, TypedFloat, TypedComplex}
 
 
 class TypedNdArray(np.ndarray):
-  """A TypedNdArray is a host-side array used by JAX during tracing.
+  """TypedNdArray 是 JAX 在追踪期间使用的主机侧数组。
 
-  TypedNdArray is a subclass of np.ndarray that carries additional JAX type
-  information:
-  * its type is not canonicalized by JAX, irrespective of the jax_enable_x64
-    mode
-  * it can be weakly typed.
+  TypedNdArray 是 np.ndarray 的子类，携带额外的 JAX 类型信息：
+  * 无论 jax_enable_x64 模式如何，它的类型都不会被 JAX 规范化
+  * 它可以是弱类型的。
   """
   __slots__ = ('_aval', '_weak_type')
 
@@ -139,8 +142,8 @@ class TypedNdArray(np.ndarray):
   def aval(self) -> ShapedArray:
     result = self._aval
     if result is None:
-      # It is possible that multiple threads might race to reach here. However
-      # this seems safe since they will all set the same value.
+      # 可能有多个线程竞争到达这里。不过这似乎是安全的，
+      # 因为它们都会设置相同的值。
       result = ShapedArray(self.shape, self.dtype, weak_type=self._weak_type)
       self._aval = result
     return result

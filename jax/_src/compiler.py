@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Interface to the compiler
+# 文件职责：本模块是 JAX 通往 XLA 运行时的编译器接口层。
+# 它把降级得到的 MLIR 模块交给 XLA 客户端编译、加载与序列化，并负责组装
+# `CompileOptions`（副本数、分区、设备分配、优化等级与内存适配等级、FDO profile）。
+# 主要入口 `compile_or_get_cached` 先查持久化编译缓存，未命中才真正编译；多进程下
+# 还可跨主机共享二进制与 FDO profile，并支持 PGLE 采样后的再编译优化。
+# 此外还提供 XLA 运行时错误处理钩子，以及缓存命中/未命中和详细编译日志的开关。
 
 from __future__ import annotations
 
@@ -44,13 +49,11 @@ import numpy as np
 
 
 class CompilerEffortLevel(enum.Enum):
-  """Effort level enumeration for XLA.
+  """XLA 的投入等级（effort level）枚举。
 
-  Used to specify the degree to which the XLA compiler should optimize for
-  runtime performance or memory fitting, as described in
-  https://openxla.org/xla/effort_levels. Higher effort levels will expend
-  more compile time but should yield better results in the respective
-  dimension.
+  用于指定 XLA 编译器应针对运行时性能还是内存适配做多大程度的优化，详见
+  https://openxla.org/xla/effort_levels。投入等级越高，编译时间越长，但在
+  相应维度上应能取得更好的结果。
   """
 
   UNKNOWN = 0
@@ -87,8 +90,8 @@ _COMPILER_DETAILED_LOGGING_MIN_OPS = config.int_flag(
     ),
 )
 
-# The special XLA-AutoFDO profile version that indicates that a profile is not
-# available and retrieval should not be attempted.
+# 特殊的 XLA-AutoFDO profile 版本号：它表示 profile 不可用，
+# 因此不应尝试去获取。
 _NO_PROFILE_DONT_RETRIEVE = -1
 
 traceback_util.register_exclusion(__file__)
@@ -99,11 +102,11 @@ logger = logging.getLogger(__name__)
 
 
 def _add_disabled_hlo_pass(disabled_passes: str, pass_name: str) -> str:
-  """Adds a pass to a comma-separated pass list, preserving existing entries.
+  """向逗号分隔的 pass 列表中添加一个 pass，同时保留已有条目。
 
-  ``DebugOptions.xla_disable_hlo_passes`` may already hold passes the user
-  disabled via ``XLA_FLAGS=--xla_disable_hlo_passes=...``; those must not be
-  overwritten. Entries are stripped because XLA matches pass names exactly.
+  ``DebugOptions.xla_disable_hlo_passes`` 里可能已经存有用户通过
+  ``XLA_FLAGS=--xla_disable_hlo_passes=...`` 禁用的 pass，这些不能被覆盖。
+  条目会被去掉首尾空白，因为 XLA 对 pass 名称做精确匹配。
   """
   passes = [p.strip() for p in disabled_passes.split(",") if p.strip()]
   if pass_name not in passes:
@@ -112,30 +115,30 @@ def _add_disabled_hlo_pass(disabled_passes: str, pass_name: str) -> str:
 
 
 def _get_cross_compile_backend(compile_only_backend):
-  """Returns a real backend for cross-compilation via a real client.
+  """返回真实后端，用来借助真实客户端做交叉编译。
 
-  When cross-compiling via a compile-only client, checks if a real backend
-  is available for the same platform. If so, returns it so compilation can
-  leverage real hardware (e.g., for GPU kernel autotuning).
+  当通过仅编译客户端做交叉编译时，检查同一平台上是否有可用的真实后端。
+  若有则返回它，以便编译过程能利用真实硬件
+  （例如用于 GPU kernel 自动调优）。
   """
   platform = compile_only_backend.platform
   try:
     real_backend = xb.get_backend(platform)
   except Exception:
     return None
-  # Don't use the real backend if it's also a compile-only client.
+  # 如果真实后端本身也是仅编译客户端，就不要使用它。
   if isinstance(real_backend, _jax.CompileOnlyPyClient):
     return None
-  # Don't use real backend if platform version is different, this can lead
-  # to timeouts and hangs.
+  # 如果平台版本不同，就不要使用真实后端，
+  # 否则会导致超时和挂起。
   if real_backend.platform_version != compile_only_backend.platform_version:
     return None
   return real_backend
 
 
-# Will be monkeypatched with the function that gets the XLA-AutoFDO profile
-# version. The default (-1) takes care of errors.
-# TODO(b/289098047): consider refactoring this interface.
+# 本函数会被 monkeypatch 为获取 XLA-AutoFDO profile 版本的函数。
+# 默认实现（-1）负责处理出错的情况。
+# TODO(b/289098047): 考虑重构这个接口。
 def get_latest_profile_version(backend: xc.Client) -> int:
   del backend
   return -1
@@ -155,7 +158,7 @@ def _walk_operations(op, k):
 
 
 def use_detailed_logging(module: ir.Module) -> bool:
-  """Returns 'true' if detailed logging should be enabled for 'module'."""
+  """如果应为 'module' 启用详细日志，则返回 'true'。"""
   bound = _COMPILER_DETAILED_LOGGING_MIN_OPS.value
   return _walk_operations(module.operation, bound) < 0
 
@@ -172,7 +175,7 @@ def log_persistent_cache_miss(module_name: str, cache_key: str) -> None:
                         if config.explain_cache_misses.value
                         and compilation_cache.is_persistent_cache_enabled()
                         else logging.DEBUG)
-  # all caps to match the tracing cache "TRACING CACHE MISS"
+  # 全部大写，以便与追踪缓存的 "TRACING CACHE MISS" 保持一致
   logger.log(miss_log_priority, "PERSISTENT COMPILATION CACHE MISS for '%s' with key %r",
              module_name, cache_key)
 
@@ -186,21 +189,19 @@ def get_compile_options(
     detailed_logging: bool = True,
     backend: xc.Client | None = None,
 ) -> xc.CompileOptions:
-  """Returns the compile options to use, as derived from flag values.
+  """返回应使用的编译选项，其取值来自各个 flag。
 
   Args:
-    num_replicas: Number of replicas for which to compile.
-    num_partitions: Number of partitions for which to compile.
-    device_assignment: Optional ndarray of jax devices indicating the assignment
-      of logical replicas to physical devices (default inherited from
-      xla_client.CompileOptions). Must be consistent with `num_replicas` and
-      `num_partitions`.
-    env_options_overrides: dict of additional options parsed by the compiler
-    fdo_profile: Optional profile for feedback-directed optimization passed to
-      XLA.
-    detailed_logging: Is this an "interesting" computation about which XLA would
-      be wise to log compilation information?
-    backend: the client, if available.
+    num_replicas: 要编译的副本（replica）数量。
+    num_partitions: 要编译的分区数量。
+    device_assignment: 可选的 jax 设备 ndarray，表示逻辑副本到物理设备的
+      分配（默认沿用 xla_client.CompileOptions）。必须与 `num_replicas`
+      和 `num_partitions` 保持一致。
+    env_options_overrides: 由编译器解析的额外选项字典
+    fdo_profile: 可选的反馈导向优化（FDO）profile，会传给 XLA。
+    detailed_logging: 这是否是一个值得关注的计算，XLA 是否值得
+      为它记录编译信息？
+    backend: 可用的客户端。
   """
   compile_options = xc.CompileOptions()
   compile_options.num_replicas = num_replicas
@@ -216,7 +217,7 @@ def get_compile_options(
         num_replicas, num_partitions, device_assignment)
     device_assignment = np.array(device_assignment)
 
-    # Allow 1D device assignment if num_partitions is 1.
+    # 当 num_partitions 为 1 时，允许使用一维的设备分配。
     if (device_assignment.ndim == 1) and (num_partitions == 1):
       device_assignment = device_assignment[:, None]
 
@@ -244,7 +245,7 @@ def get_compile_options(
   ).value
 
   if env_options_overrides is not None:
-    # Some overrides are passed directly on build_options.
+    # 有些覆盖项是直接作用在 build_options 上的。
     overrides_on_build_options = ["optimization_level", "memory_fitting_level"]
 
     env_options_overrides = dict(env_options_overrides)
@@ -270,13 +271,12 @@ def get_compile_options(
     debug_options.xla_disable_hlo_passes = _add_disabled_hlo_pass(
         debug_options.xla_disable_hlo_passes, "rematerialization")
 
-  # XLA-AutoFDO profile version: precedence order is:
-  # 1. Whatever --jax_xla_profile_version is set to.
-  # 2. If --jax_xla_profile_version is not set (i.e., 0), call the function
-  #    set in get_latest_profile_version and use the return value if non-zero.
-  #    If the function returns 0, set -1; this is an error.
-  # -1 indicates that no attempt should be made to retrieve the latest profile
-  # later on.
+  # XLA-AutoFDO profile 版本的优先级顺序为：
+  # 1. 以 --jax_xla_profile_version 的取值为准。
+  # 2. 若未设置 --jax_xla_profile_version（即为 0），则调用
+  #    get_latest_profile_version 中设置的函数，若非零就使用其返回值。
+  #    若该函数返回 0，则置为 -1；这是一种错误。
+  # -1 表示后续不应尝试获取最新的 profile。
   jax_xla_profile_version = config.jax_xla_profile_version.value
   if jax_xla_profile_version > 0:
     compile_options.profile_version = jax_xla_profile_version
@@ -301,10 +301,9 @@ def get_compile_options(
 
   debug_options.xla_detailed_logging = detailed_logging
 
-  # If persistent cache is enabled, also enable additional XLA caching features.
+  # 如果启用了持久化缓存，还要同时开启额外的 XLA 缓存特性。
   if compilation_cache.is_persistent_cache_enabled():
-    # compilation_cache_dir can't be None here, but the type checker is a bit
-    # strict.
+    # 这里的 compilation_cache_dir 不可能是 None，只是类型检查器比较严格。
     path = pathlib.Path(config.compilation_cache_dir.value or "")
     enabled_flags = config.persistent_cache_enable_xla_caches.value or ""
 
@@ -318,7 +317,7 @@ def get_compile_options(
       debug_options.xla_gpu_per_fusion_autotune_cache_dir = str(autotune_cache_path)
       logger.debug("Enabling XLA autotuning cache at '%s'", autotune_cache_path)
 
-      # Set caching mode so that only process 0 can write to the cache.
+      # 设置缓存模式，使得只有进程 0 可以向缓存写入。
       if distributed.global_state.process_id == 0:
         debug_options.xla_gpu_experimental_autotune_cache_mode = xc.AutotuneCacheMode.UPDATE
       else:
@@ -347,13 +346,13 @@ def backend_compile_and_load(
     )
 
   try:
-    # we use a separate function call to ensure that XLA compilation appears
-    # separately in Python profiling results
-    # TODO(dsuo): Simplify this logic once we delete _jax.CompileOnlyPyClient.
+    # 这里通过一次单独的函数调用，确保 XLA 编译过程
+    # 在 Python 性能分析结果中单独出现
+    # TODO(dsuo): 等删除 _jax.CompileOnlyPyClient 之后简化这段逻辑。
     if isinstance(backend, _jax.CompileOnlyPyClient):
-      # When a real backend is available for the same platform, use it for
-      # cross-compilation. The real client provides hardware access (e.g.,
-      # for GPU kernel autotuning) while the topology specifies the target.
+      # 当同一平台上存在可用的真实后端时，用它来做交叉编译。真实客户端
+      # 提供硬件访问能力（例如用于 GPU kernel 自动调优），而拓扑结构
+      # 则指定目标设备。
       cross_compile_backend = _get_cross_compile_backend(backend)
       if cross_compile_backend is not None and not host_callbacks:
         cross_compile_topology = xc.get_topology_for_devices(backend.devices())
@@ -369,9 +368,9 @@ def backend_compile_and_load(
             compile_options=options,
             host_callbacks=host_callbacks,
         )
-      # Some backends don't have `host_callbacks` option yet
-      # TODO(sharadmv): remove this fallback when all backends allow `compile`
-      # to take in `host_callbacks`
+      # 有些后端还不支持 `host_callbacks` 选项
+      # TODO(sharadmv): 当所有后端都允许 `compile` 接收
+      # `host_callbacks` 之后，删除这个回退分支
       return backend.compile(  # pyrefly: ignore[bad-return]
           module,
           executable_devices=executable_devices,
@@ -385,9 +384,9 @@ def backend_compile_and_load(
             compile_options=options,
             host_callbacks=host_callbacks,
         )
-      # Some backends don't have `host_callbacks` option yet
-      # TODO(sharadmv): remove this fallback when all backends allow `compile`
-      # to take in `host_callbacks`
+      # 有些后端还不支持 `host_callbacks` 选项
+      # TODO(sharadmv): 当所有后端都允许 `compile` 接收
+      # `host_callbacks` 之后，删除这个回退分支
       return backend.compile_and_load(
           module,
           executable_devices=executable_devices,
@@ -407,17 +406,17 @@ _XLA_RUNTIME_ERROR_HANDLERS = []
 def register_xla_runtime_error_handler(
     handler_fn: Callable[[_jax.JaxRuntimeError], Exception | None],
 ):
-  """Registers a custom exception handler for XLA runtime errors.
+  """为 XLA 运行时错误注册自定义异常处理器。
 
-  Registering a custom handler allows re-raising a more informative exception
-  after encountering an XLARuntimeError.
+  注册自定义处理器后，可以在遇到 XLARuntimeError 之后重新抛出信息更丰富的
+  异常。
 
   Args:
-    handler_fn: A function which returns a new exception to replace the original
-      XLA runtime error, or None if the original error should be propagated.
+    handler_fn: 一个函数，返回用于替换原始 XLA 运行时错误的新异常；若原始
+      错误应当继续传播则返回 None。
 
   Returns:
-    A new exception or None.
+    一个新的异常，或 None。
   """
   _XLA_RUNTIME_ERROR_HANDLERS.append(handler_fn)
 
@@ -444,7 +443,7 @@ def compile_or_get_cached(
       devices.flatten(), key=lambda device: device.id
   ).process_index
 
-  # cache_key: may be None if compilation caching is disabled
+  # cache_key：如果编译缓存被禁用，它可能为 None
   cache_key, compile_options = _resolve_compilation_strategy(
     computation,
     devices,
@@ -513,28 +512,22 @@ def compile_or_get_cached(
     )
 
 
-# When PGLE is enabled there might be 3 types of situations:
-# 1. PGLE optimized module (the one which was recompiled with FDO profile) is
-# in the persistent cache. In this case the module should be returned from
-# cache and PGLE should be disabled for this module. Is module is stored in
-# the persistent cache under the "pgle_optimized_cache_key", which is
-# calculated by replacing the FDO profile with a sentinel value that identifies
-# that the module was optimized with PGLE.
-# 2. PGLE profiled module is not in the persistent cache and the module is
-# getting built with an FDO profile. In this case we need to share the FDO
-# profile with any other processes and store the result under the
-# "pgle_optimized_cache_key" so later in case 1 we will be able to find the
-# module.
-# 3. PGLE profiled module is not in the persistent cache and the module is
-# getting compiled to be PGLEd (FDO profile is empty). In this case we need to
-# simply return the non-PGLE profiled module from the persistent cache if it
-# exists, and otherwise compile it.
+# 启用 PGLE 时，可能出现 3 种情况：
+# 1. PGLE 优化后的模块（即用 FDO profile 重新编译过的那个模块）已经在持久化
+# 缓存中。此时应从缓存返回该模块，并对该模块禁用 PGLE。该模块存放在持久化
+# 缓存的 "pgle_optimized_cache_key" 键下，这个键由 FDO profile 替换为一个
+# 哨兵值计算得到，该哨兵值标识出这个模块是用 PGLE 优化过的。
+# 2. PGLE 采样过的模块不在持久化缓存中，且该模块正带着 FDO profile 构建。
+# 此时我们需要把 FDO profile 分享给其他进程，并把结果存放在
+# "pgle_optimized_cache_key" 下，这样之后在情况 1 中就能找到该模块。
+# 3. PGLE 采样过的模块不在持久化缓存中，且该模块正被编译为待 PGLE 优化的
+# 版本（FDO profile 为空）。此时如果持久化缓存中存在非 PGLE 采样的模块，
+# 我们只需直接返回它；否则就编译它。
 #
-# If the compilation_cache_expect_pgle option is set then in case 1 the PGLE
-# optimized module will be loaded even if PGLE is not enabled in the current
-# process. This is useful if we want to combine the use of PGLE with other
-# profiling tools (e.g. Nsight Systems) that cannot co-exist with PGLE due to
-# contention for CUPTI resources.
+# 如果设置了 compilation_cache_expect_pgle 选项，那么在情况 1 中即使当前
+# 进程未启用 PGLE，也会加载 PGLE 优化后的模块。当我们想把 PGLE 与其他性能
+# 分析工具（例如 Nsight Systems）结合使用时这很有用，因为这些工具会争用
+# CUPTI 资源，无法与 PGLE 共存。
 def _resolve_compilation_strategy(
     computation: ir.Module,
     devices: np.ndarray,
@@ -553,17 +546,16 @@ def _resolve_compilation_strategy(
                           computation=computation, devices=devices)
 
   if is_auto_pgle_used or config.compilation_cache_expect_pgle.value:
-    # This can be None if cache key generation fails.
+    # 如果 cache key 生成失败，它可能为 None。
     pgle_optimized_cache_key = get_cache_key(compile_options,
                                              override_fdo_profile=b"pgle profiled")
-    # TODO(b/376647494): remove the workaround when the bug is fixed; the JAX
-    # profiler cannot collect sufficiently detailed profile data for PGLE if
-    # command buffers / CUDA graphs are enabled. Therefore disable command
-    # buffers when compiling for PGLE data collection, but not if AutoPGLE is
-    # not enabled, and not when re-compiling using PGLE data. This condition
-    # includes `compilation_cache_expect_pgle` so that slow-to-compile modules
-    # that are not executed often enough to trigger re-compilation will still
-    # be cached between an "enable_pgle" run and an "expect_pgle" run.
+    # TODO(b/376647494): 该 bug 修复后移除这个变通方案；如果启用了
+    # command buffer / CUDA graph，JAX profiler 就无法为 PGLE 采集到足够
+    # 详细的 profile 数据。因此在为 PGLE 数据采集而编译时要禁用 command
+    # buffer，但在 AutoPGLE 未启用时不禁用，在用 PGLE 数据重新编译时也不禁用。
+    # 这一条件包含 `compilation_cache_expect_pgle`，这样那些编译很慢、
+    # 执行次数不足以触发重新编译的模块，仍然能在 "enable_pgle" 运行与
+    # "expect_pgle" 运行之间被缓存下来。
     first_pass_compile_options = copy.deepcopy(compile_options)
     first_pass_compile_options.env_option_overrides += [
       ("xla_gpu_enable_command_buffer", ""),
@@ -572,22 +564,22 @@ def _resolve_compilation_strategy(
     pgle_optimized_cache_key = None
     first_pass_compile_options = compile_options
 
-  # This can be None if cache key generation fails or caching is disabled
+  # 如果 cache key 生成失败或缓存被禁用，它可能为 None
   cache_key = get_cache_key(first_pass_compile_options)
 
   if cache_key is not None and pgle_optimized_cache_key is not None:
-    # The compilation cache is enabled and AutoPGLE is enabled/expected
+    # 编译缓存已启用，且 AutoPGLE 已启用或已预期使用
     if _is_executable_in_cache(backend, pgle_optimized_cache_key):
       if config.compilation_cache_expect_pgle.value:
         logger.info(f"PGLE-optimized {module_name} loaded from compilation cache")
-      # No need to record N profiles in this case
+      # 这种情况下不需要再记录 N 次 profile 采样
       if pgle_profiler is not None:
         pgle_profiler.disable()
       return pgle_optimized_cache_key, compile_options
     elif (config.compilation_cache_expect_pgle.value
           and _is_executable_in_cache(backend, cache_key)):
-      # No PGLE-optimized module found in the persistent cache, and the user
-      # asserted (expect_pgle) that this miss was unexpected
+      # 在持久化缓存中没有找到 PGLE 优化后的模块，
+      # 而用户（通过 expect_pgle）断言这次未命中是不应发生的
       warnings.warn(f"PERSISTENT CACHE MISS for PGLE-optimized {module_name} "
                     "despite non-PGLE hit; it may not have been executed "
                     "enough times when the cache was populated")
@@ -595,8 +587,8 @@ def _resolve_compilation_strategy(
   if (is_auto_pgle_used
       and compile_options.executable_build_options.fdo_profile is not None
       and len(compile_options.executable_build_options.fdo_profile)):
-    # Profile data are available to trigger a PGLE-optimized recompilation;
-    # store under `pgle_optimized_cache_key` if the cache is enabled
+    # 已有 profile 数据，可以触发 PGLE 优化的重新编译；
+    # 如果缓存已启用，就把结果存到 `pgle_optimized_cache_key` 下
     if is_multi_process and distributed.global_state.client is not None:
       compile_options.executable_build_options.fdo_profile = (
         _share_fdo_profiles(
@@ -610,8 +602,8 @@ def _resolve_compilation_strategy(
       )
     return pgle_optimized_cache_key, compile_options
   else:
-    # Compile for PGLE collection, store under `cache_key` if the cache is
-    # enabled. This is also the AutoPGLE-disabled path.
+    # 为 PGLE 采样而编译；如果缓存已启用，就把结果存到 `cache_key` 下。
+    # 这也是 AutoPGLE 被禁用时走的路径。
     return cache_key, first_pass_compile_options
 
 def _get_cache_key(
@@ -638,8 +630,8 @@ def _get_cache_key(
                   "skipping the cache: %s", ex)
   return None
 
-# The process that has the lowest device ID should share FDO profile before
-# compilation with other processes.
+# 拥有最小设备 ID 的进程应当在编译之前
+# 把 FDO profile 分享给其他进程。
 def _share_fdo_profiles(
     computation: ir.Module,
     devices: np.ndarray,
@@ -702,8 +694,8 @@ def _share_fdo_profiles(
 _share_fdo_profiles.modules_profiles = {}  # pyrefly: ignore[missing-attribute]
 
 
-# The process with the first_process_id should compile the module and write it
-# to the K-V storage.
+# first_process_id 对应的进程应当编译该模块，
+# 并把它写入 K-V 存储。
 def _compile_and_share_module(
     backend: xc.Client,
     computation: ir.Module,
@@ -776,7 +768,7 @@ def _compile_and_write_cache(
 
 
 def _should_raise_persistent_cache_error(ex: Exception) -> bool:
-  """Returns True if the exception should be raised, False if it should be warned."""
+  """如果该异常应当抛出则返回 True，若应当发出警告则返回 False。"""
   return (
       config.raise_persistent_cache_errors.value or
       isinstance(ex, compilation_cache.CacheVerificationError)
@@ -784,7 +776,7 @@ def _should_raise_persistent_cache_error(ex: Exception) -> bool:
 
 
 def _is_executable_in_cache(backend, cache_key) -> bool:
-  """Checks if executable is presented in cache on a given key
+  """检查在给定的键上，缓存中是否已存在可执行文件
   """
   try:
     return compilation_cache.is_executable_in_cache(backend, cache_key)
@@ -802,8 +794,7 @@ def _cache_read(
     backend: xc.Client, executable_devices: xc.DeviceList,
     host_callbacks: Sequence[Any],
 ) -> tuple[xc.LoadedExecutable | None, int | None]:
-  """Looks up the `computation` and it's compilation time in the persistent
-  compilation cache repository.
+  """在持久化编译缓存仓库中查找 `computation` 及其编译时间。
   """
   try:
     return compilation_cache.get_executable_and_time(
@@ -823,11 +814,10 @@ def _cache_write(cache_key: str,
                  module_name: str,
                  backend: xc.Client,
                  executable: xc.LoadedExecutable) -> None:
-  """Writes the `serialized_computation` and its compilation time to the
-  persistent compilation cache repository.
+  """把 `serialized_computation` 及其编译时间写入持久化编译缓存仓库。
   """
-  # Only write cache entries from the first process. Otherwise we create
-  # problems with contention for writes on some filesystems, e.g., GCS.
+  # 只从第一个进程写入缓存条目。否则在某些文件系统（例如 GCS）上
+  # 会产生写入争用问题。
   log_priority = (logging.WARNING
                   if config.explain_cache_misses.value
                   and compilation_cache.is_persistent_cache_enabled()

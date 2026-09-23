@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 `jax.sharding` 的底层分片类型与 mesh 上下文，是 GSPMD 自动分片
+# 与显式分片模式的公共基础设施。
+# 主要内容：具体分片类 `SingleDeviceSharding`、`GSPMDSharding`（XLA HloSharding
+# 的 JAX 包装）、并行计算的轴上下文 `SPMDAxisContext`/`ShardingContext`、
+# OpSharding 与 PartitionSpec 的互转工具（含 process-uniform 判定与 local→global
+# 形状推导），以及 `make_mesh`/`set_mesh`/`get_mesh` 等 mesh 上下文接口。
+
 from __future__ import annotations
 
 import collections
@@ -56,7 +63,7 @@ Shape = tuple[int, ...]
 Device = xc.Device
 Index = tuple[slice, ...]
 XLADeviceAssignment = tuple[Device, ...]
-# TODO(yashkatariya): Remove this after 3 months of deprecation.
+# TODO(yashkatariya): 弃用满 3 个月后移除此项。
 XLACompatibleSharding = jsharding.Sharding
 
 
@@ -104,10 +111,10 @@ def _unpickle_single_device_sharding(device, memory_kind):
 
 @use_cpp_class(xc.SingleDeviceSharding)
 class SingleDeviceSharding(jsharding.Sharding):
-  """A :class:`Sharding` that places its data on a single device.
+  """一种把数据放置在单个设备上的 :class:`Sharding`。
 
   Args:
-    device: A single :py:class:`Device`.
+    device: 单个 :py:class:`Device`。
 
   Examples:
 
@@ -210,8 +217,8 @@ class GSPMDSharding(jsharding.Sharding):
     self._hlo_sharding = (xc.HloSharding.from_proto(op_sharding)
                           if isinstance(op_sharding, xc.OpSharding) else
                           op_sharding)
-    # Convert HloShardingV3 to V2 as JAX expects tiled sharding for shardings
-    # returned by XLA.
+    # 将 HloShardingV3 转换为 V2，因为对于 XLA 返回的分片，
+    # JAX 期望的是平铺(tiled)分片。
     self._hlo_sharding = xc.HloSharding.v3_to_v2_sharding(self._hlo_sharding)
     self._memory_kind = memory_kind
 
@@ -347,15 +354,15 @@ def prepare_axis_resources(axis_resources, arg_name,
   return tree_util.tree_unflatten(treedef, new_entries)
 
 
-# Axis environments
+# 轴环境
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class SPMDAxisContext:
-  """A hardware axis context for parallel computations that use the GSPMD partitioner.
+  """使用 GSPMD 分区器的并行计算的硬件轴上下文。
 
-  This includes the mesh that will later by used to execute this computation,
-  as well as a set of mesh axes that are currently lowered in the MANUAL
-  sharding mode.
+  其中包含稍后用于执行该计算的 mesh，
+  以及一组当前以 MANUAL 分片模式
+  降级的 mesh 轴。
   """
   mesh: Mesh
   manual_axes: frozenset[MeshAxisName] = frozenset()
@@ -363,10 +370,10 @@ class SPMDAxisContext:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class ShardingContext:
-  """A hardware axis context for parallel computations that use the sharding
-  interface.
+  """使用分片接口的并行计算的
+  硬件轴上下文。
 
-  This context also uses the GSPMD partitioner.
+  该上下文同样使用 GSPMD 分区器。
   """
   num_devices: int
   device_assignment: tuple[xc.Device, ...] | None = None
@@ -378,33 +385,33 @@ class ShardingContext:
       assert self.num_devices == len(self.device_assignment)
 
 
-# -------------------- XLA OpSharding to PartitionSpec --------------------
-# Note that OpSharding is more expressive than PartitionSpecs, so it's not
-# always possible to convert them, but the code below should at least
-# support handle all cases when this is possible.
+# -------------------- XLA OpSharding 转 PartitionSpec --------------------
+# 注意，OpSharding 的表达能力比 PartitionSpec 更强，因此并不总能
+# 在两者之间转换；但下面的代码至少应能处理
+# 所有可转换的情况。
 
 def strides_for_sizes(sizes):
-  """Returns an array of strides for major-to-minor sizes."""
+  """返回从主到次(major-to-minor)的尺寸所对应的步长数组。"""
   return np.cumprod(sizes[::-1])[::-1] // np.asarray(sizes)
 
 def unflatten_array(named_sizes, assignment):
-  """Recovers the ordering of axis names based on a device assignment.
+  """根据设备分配还原轴名称的顺序。
 
-  The device assignments that this function can convert into axis orders
-  are of the form::
+  本函数能够转换为轴顺序的设备分配
+  形如::
 
     np.arange(np.prod(named_sizes.values())).transpose(...).flatten()
 
-  for some transposition ``...``. This is satisfied by all OpSharding assignments
-  generated from partition specs.
+  其中 ``...`` 表示某个转置。由 partition spec 生成的
+  所有 OpSharding 分配都满足这一形式。
 
   Arguments:
-    named_sizes: A dictionary mapping axis names to their sizes.
-    assignment: A permutation of integers between 0 and the product of all
-      named sizes.
+    named_sizes: 从轴名称映射到其大小的字典。
+    assignment: 0 到所有命名大小之积之间的整数
+      的一个排列。
 
   Returns:
-    A major-to-minor list of axis names that corresponds to the given assignment.
+    与给定 assignment 对应的、从主到次的轴名称列表。
   """
   named_sizes = {name: size for name, size in named_sizes.items() if size != 1}
   sizes = np.fromiter(named_sizes.values(), dtype=np.int64)
@@ -414,18 +421,18 @@ def unflatten_array(named_sizes, assignment):
   return [dim_to_name[d] for d in dims]
 
 def unflatten_superdims(assignment):
-  """Unflatten a list of dimension sizes and their strides that generates assignment.
+  """反扁平化一组维度大小及其步长，它们生成 assignment。
 
-  If this function succeeds for a given ``assignment``, then the following property
-  should be satisfied::
+  如果本函数对给定的 ``assignment`` 成功，则应满足
+  以下性质::
 
     dims_with_strides = unflatten_superdims(assignment)
     base_array = np.arange(map(fst, sorted(dims_with_strides, key=snd, reverse=True)))
     assignment == base_array.transpose(argsort(dims_with_strides, key=snd, reverse=True)).flatten()
 
-  That is, the returned dimensions list all sizes of the base array (with strides
-  indicating their initial order). The order of dimensions in the list corresponds
-  to the permutation that applied to the base array generates the assignment.
+  也就是说，返回的维度列出了基准数组的所有大小（步长
+  表示它们的初始顺序）。列表中维度的顺序对应于
+  作用在基准数组上、从而生成该 assignment 的排列。
   """
   def check(cond):
     if cond: return
@@ -439,22 +446,22 @@ def unflatten_superdims(assignment):
     for i in range(len(flat_assignment)):
       if flat_assignment[i] != i * stride: break
     else:
-      # After this loop i should point to an "element after the sequence", so
-      # we have to increment it if the whole array is a strided sequence.
+      # 该循环结束后，i 应指向“序列之后的元素”，因此如果整个
+      # 数组是一个步长序列，就需要将它自增一次。
       i += 1
     size = i
     dims.append((size, stride))
-    assert size > 1  # Ensure progress
+    assert size > 1  # 确保有进展
     flat_assignment = flat_assignment[::size]
   return dims
 
 def explode_superdims(sizes, dims):
-  """Explode superdims to fit a known shape.
+  """拆分超维(superdim)以匹配已知形状。
 
-  The unflattening process might mistakenly generate too few too large dimensions.
-  For example, ``unflatten_superdims(np.arange(n))`` always returns ``[(n, 1)]``.
-  This function takes a list of such contiguous super-dimensions and splits them
-  into smaller dimensions such that::
+  反扁平化过程可能错误地生成过少且过大的维度。
+  例如 ``unflatten_superdims(np.arange(n))`` 总是返回 ``[(n, 1)]``。
+  本函数接收这样一组连续的超维，并将其拆分为更小的
+  维度，使得::
 
     set(map(fst, explode_superdims(sizes, dims))) == set(sizes)
   """
@@ -465,7 +472,7 @@ def explode_superdims(sizes, dims):
     target_size = strides_to_sizes[stride]
     new_dims = []
     while size > target_size:
-      assert target_size > 1  # Ensure progress
+      assert target_size > 1  # 确保有进展
       assert size % target_size == 0
       new_dims.append((target_size, stride))
       size //= target_size
@@ -530,107 +537,107 @@ def _slice_as_tuple(s: slice):
 
 
 class NonUniformShardingError(ValueError):
-  """Raised when sharding is not uniform across processes."""
+  """当分片在各进程间不一致时抛出。"""
 
 
 @util.cache(max_size=4096, trace_context_in_key=False)
 def get_process_index_and_count(
     tensor_sharding: jsharding.Sharding, dim: int, ndims: int) -> tuple[int, int]:
-  """Get current process index and number of unique processes for given dimension.
+  """获取给定维度的当前进程索引与唯一进程数量。
 
-  This function facilitates mapping of process-level data to individual
-  devices. Each process can use its index to obtain the data corresponding
-  to that index. If process level data is sharded on multiple dimensions
-  this function can be used to build the cross product of indices in
-  each sharded axis. Processes that need to load the same data will have
-  the same index. For shardings whose per-process data is not distributed
-  on a grid, the number of distinct shards will be such that it is possible to
-  build the target shape while maintaining a "cube" shape of local-process data.
+  本函数便于把进程级数据映射到各个设备。
+  每个进程都可以用自己的索引来获取与该索引对应的数据。
+  如果进程级数据在多个维度上被分片，可以用本函数构造
+  各个分片轴上索引的笛卡尔积。
+  需要加载相同数据的进程会得到相同的索引。
+  对于每进程数据不按网格分布的分片，其不同分片的数量
+  会使得：在保持本地进程数据呈“立方体”形状的前提下，
+  仍可以构造出目标形状。
 
-  For example, in case of 4 hosts with sharding distributed like so:
+  例如，对于 4 个主机且分片分布如下：
 
   1234
   2143
 
-  For dim 0 (rows): all processes need to access all rows, so we return (0, 1)
-  For dim 1 (cols):
-     process 1 and 2 returns index 0 out of 2 (need cols 0 and 1),
-     process 3 and 4 returns index 1 out of 2 (need cols 2 and 3).
+  维度 0（行）：所有进程都需要访问所有行，因此返回 (0, 1)
+  维度 1（列）：
+     进程 1 和 2 返回 2 个中的索引 0（需要第 0、1 列），
+     进程 3 和 4 返回 2 个中的索引 1（需要第 2、3 列）。
 
-  On the other hand, for a sharding like:
+  另一方面，对于如下分片：
 
   1212
   3434
 
-  Dim 0 (rows): process 1 and 2 returns (0, 2), process 3 and 4 returns (1, 2)
-  Dim 1 (cols): process 1 and 3 returns (0, 2), process 2 and 4 returns (1, 2)
+  维度 0（行）：进程 1 和 2 返回 (0, 2)，进程 3 和 4 返回 (1, 2)
+  维度 1（列）：进程 1 和 3 返回 (0, 2)，进程 2 和 4 返回 (1, 2)
 
-  Note: This function requires sharding to be process uniform in dimension
-  `dim`:
-   each process has the same number of addressable indices in that
-  dimension and all index sets across processes are either disjoint or the same.
+  Note: 本函数要求分片在维度
+  `dim` 上是进程一致的(process uniform)：
+   每个进程在该维度上拥有相同数量的可寻址索引，并且
+   各进程之间的所有索引集合要么互不相交，要么完全相同。
 
-  For sharding to be process uniform the addressable shards doesn't need to
-  form contiguous subtensor, or even a sparse grid  and  in case of
-  interleaved high-dimensional tensor it is possible for sharding to be
-  process uniform only in some dimensions but not others.
+  分片要达到进程一致，其可寻址分片不必构成
+  连续的子张量，甚至不必构成稀疏网格；对于交错的高维
+  张量，分片可能只在部分维度上进程一致，
+  而在其他维度上并不一致。
 
-  For example:
+  例如：
     1111 and 12 and 1212 and 1212
     2222     21     2121     1212
 
-  are all sharding uniform, in both dimensions. However
+  这些分片在两个维度上都是一致的。然而
 
     1122
     2121
     1121
     1222
 
-  is uniform in dimension 0 (both hosts access all rows), but
-  is not uniform in dimension 1 (host 1 accesses columns: 0, 1, and 3),
-  while host 2 accesses (0, 1, 2, 3).
+  它在维度 0 上是一致的（两个主机都访问所有行），但
+  在维度 1 上不一致（主机 1 访问第 0、1、3 列），
+  而主机 2 访问 (0, 1, 2, 3)。
 
   Returns:
-    A tuple of (index, num_distinct_shards) for the given dimension.
-    It is guaranteed that `index` will cover 0 to `num_distinct_shards - 1`,
-    across all processes.
+    给定维度的 (index, num_distinct_shards) 元组。
+    可以保证在所有进程上，`index` 都会覆盖 0 到
+    `num_distinct_shards - 1`。
 
   Raises:
-    NonUniformShardingError: if the sharding is not process uniform in dimension
-    `dim`.
+    NonUniformShardingError: 如果分片在维度
+    `dim` 上不是进程一致的。
   """
-  # TODO(sandler, yashkatariya): Consider making this function public.
+  # TODO(sandler, yashkatariya): 考虑将此函数公开。
 
   if (tensor_sharding.is_fully_addressable or
       tensor_sharding.is_fully_replicated):
     return (0, 1)
-  # Get device to indices map, we don't care about the concrete
-  # global shape here, only to get the distribution of shards across the tensor
-  # using (num_devices, num_devices, ...)  This is a universal shape that is
-  # compatible with any mesh with num_devices.
+  # 获取设备到索引的映射，我们并不关心这里具体的全局形状，
+  # 只是要用 (num_devices, num_devices, ...) 得到分片
+  # 在张量上的分布。这是一个与任何拥有 num_devices 个设备的
+  # mesh 都兼容的通用形状。
   device_map = tensor_sharding.devices_indices_map(
       (tensor_sharding.num_devices,) * ndims)
 
-  # Get the slices for 'dim' for all devices.
+  # 获取所有设备在 'dim' 维度上的切片。
   global_slice = {k: v[dim] for k, v in device_map.items()}
 
-  # Contains mapping from process_index to a set of slices for that process.
+  # 保存从 process_index 到该进程切片集合的映射。
   process_to_slice = collections.defaultdict(set)
-  # Contains global set of slices across all processes.
+  # 保存所有进程的全局切片集合。
   all_slices = set()
 
-  # Compute the set of slices for each process and the global set of slices.
+  # 计算每个进程的切片集合以及全局切片集合。
   for d, v in global_slice.items():
     key = (v.start, v.stop)
     process_to_slice[d.process_index].add(key)
     all_slices.add(key)
 
-  # Get the set of slices for the current process which we will use to compute
-  # the index of the current process.
+  # 获取当前进程的切片集合，我们将用它来计算
+  # 当前进程的索引。
   current_pid = next(iter(tensor_sharding.addressable_devices)).process_index
   addressable_slices = frozenset(process_to_slice[current_pid])
 
-  # Verify that all processes have the same number of slices.
+  # 校验所有进程拥有相同数量的切片。
   slices_per_process = len(addressable_slices)
   if any(len(x) != slices_per_process for x in process_to_slice.values()):
     raise NonUniformShardingError(
@@ -639,9 +646,9 @@ def get_process_index_and_count(
     )
   unique_processes = list({frozenset(x) for x in process_to_slice.values()})
 
-  # After removing duplicate processes all unique slices should
-  # cover the dimension exactly once. If they don' it means that
-  # the sharding is not uniform.
+  # 去掉重复的进程后，所有唯一的切片应恰好
+  # 覆盖该维度一次。如果不满足，就说明
+  # 分片不是一致的。
   if sum(len(h) for h in unique_processes) != len(all_slices):
     raise NonUniformShardingError(
         f'{tensor_sharding=} is non-uniform on {dim=}'
@@ -651,48 +658,48 @@ def get_process_index_and_count(
 
 def local_to_global_shape(
     sharding: jsharding.Sharding, local_shape: Shape) -> tuple[int | None, ...]:
-  """Computes the global shape given the per process if possible.
+  """在可能时根据每进程数据计算全局形状。
 
-  The returned shape will have the size of the global tensor in that dimension
-  or None, if it is not computable. The latter can happen when sharding
-  is not uniform along that dimension, e.g. different hosts require
-  different shapes, or if different processes have partial data overlap.
+  返回的形状在该维度上给出全局张量的大小，若无法计算
+  则为 None。当分片沿该维度不一致时会出现后者，
+  例如不同主机需要不同的形状，
+  或者不同进程的数据存在部分重叠。
 
-  If at most one dimension is sharded the shape is always computable.
-  Generally, global shape is computable for most practical meshes (including
-  topology aware such as meshes returned by mesh_utils.create_device_mesh)
+  如果至多只有一个维度被分片，形状总是可计算的。
+  一般来说，对大多数实用 mesh（包括感知拓扑的 mesh，
+  例如 mesh_utils.create_device_mesh 返回的 mesh）都可计算全局形状。
 
-  Some examples: Suppose mesh is {'a': 2, 'b': 2, 'c': 2} with 2 devices
-  per host, 4 hosts total. For different specs we get:
+  一些示例：假设 mesh 为 {'a': 2, 'b': 2, 'c': 2}，每个主机 2 个设备，
+  共 4 个主机。对于不同的 spec 我们得到：
   - P():
       global_shape = local_shape
 
   - P(('a', 'b', 'c'), None):
       global_shape =  (4 * local_shape[0], local_shape[1])
-      Note: per device shape is (local_shape[0] / 2, local_shape[1])
+      Note: 每设备形状为 (local_shape[0] / 2, local_shape[1])
 
   - P(('a', 'b'), None)
       global_shape =  (4 * local_shape[0], local_shape[1])
-      # NB: the same global shape as above, since sharding along 'c' dimension
-      # happens to be within process, and thus doesn't affect the global shape.
-      # The underlying difference will be in the per *device* shape, which
-      # would be  (local_shape[0], local_shape[1]) in this case.
+      # NB: 与上面相同的全局形状，因为沿 'c' 维度的分片
+      # 恰好发生在进程内部，因此不影响全局形状。
+      # 底层差异体现在每 *设备* 形状上，此处
+      # 该形状为 (local_shape[0], local_shape[1])。
 
   - P(None, ('a', 'c'))
       global_shape = (local_shape[0], 2 * local_shape[1])
-      # Per device shape is (local_shape[0], local_shape[1] / 2)
+      # 每设备形状为 (local_shape[0], local_shape[1] / 2)
   - P(('a', 'c'), 'b'):
       global_shape = (2 * local_shape[0], 2 * local_shape[1])
-      # Per device shape is (local_shape[0] / 2, local_shape[1])
-  - If devices in the Mesh are randomly permuted: For any partition spec
-  which shards more than 1 axis:  e.g. P('a', ('b', 'c')):
+      # 每设备形状为 (local_shape[0] / 2, local_shape[1])
+  - 如果 Mesh 中的设备被随机置换：对于任何
+  分片了多于 1 个轴的 partition spec：例如 P('a', ('b', 'c'))：
       global_shape = (None, None)
 
   Args:
-    local_shape: global shape of the tensor.
+    local_shape: 张量的全局形状。
 
   Returns:
-    global_shape with Nones in non-uniform dimensions.
+    global_shape，其中非一致维度上为 None。
   """
 
   global_shape : list[int | None] = [None] * len(local_shape)
@@ -710,38 +717,38 @@ def local_to_global_shape(
 
 def num_addressable_indices(
     tensor_sharding: jsharding.Sharding, dim: int, global_shape: Shape) -> int:
-  """Returns the number of indices for given dimension this host has access to.
+  """返回本主机对给定维度可访问的索引数量。
 
-  Each host can have multiple number of devices that are spanning
-  possibly discontiguous slices of data. This function computes the
-  total number of unique indices for dimension `dim` that any of its
-  addressable devices hold.
+  每个主机都可以拥有多个设备，
+  这些设备跨越的数据切片可能并不连续。
+  本函数计算其任一可寻址设备在维度 `dim` 上
+  所持有的唯一索引总数。
 
-  In most cases the addressable indices form a sparse grid (and in some
-  cases a subcube), and thus each host will hold the same of number of
-  indices for each dimension.  However, it is possible to design a mesh that
-  addressable shards form a complicated pattern. In that case, the returned
-  value is the number of indices that are addressable by at least one device.
+  大多数情况下，可寻址索引构成稀疏网格（某些情况下
+  构成子立方体），因此每个主机在每个维度上持有的
+  索引数量相同。然而，也可以设计出使得可寻址分片
+  构成复杂模式的 mesh。此时返回值是至少被一个
+  设备可寻址的索引数量。
 
-  For example, suppose the sharding looks like this: (number indicates
-  the host index)
+  例如，假设分片如下所示：（数字表示
+  主机索引）
 
     1221
     1221
     0000
 
-  Then on host 1 and 2, both dim 0 (rows), and  dim=1 (cols) will have size 2,
-  while on host 0, dim 0  will have size 1, and dim 1 will have size 4.
+  那么在主机 1 和 2 上，dim 0（行）和 dim=1（列）的大小都是 2，
+  而在主机 0 上，dim 0 的大小为 1，dim 1 的大小为 4。
 
   Args:
-    tensor_sharding: Sharding of the tensor.
-    dim: dimension along which to compute the number of addressable indices.
-    global_shape: global shape of the tensor.
+    tensor_sharding: 张量的分片。
+    dim: 沿其计算可寻址索引数量的维度。
+    global_shape: 张量的全局形状。
 
   Returns:
-    The number of indices for dimension  `dim` that this host holds.
+    本主机在维度 `dim` 上持有的索引数量。
   """
-  # TODO(sandler, yashkatariya): Consider making this function public.
+  # TODO(sandler, yashkatariya): 考虑将此函数公开。
   addressables = tensor_sharding.addressable_devices_indices_map(global_shape)
   addressables = cast(Mapping[jsharding.Device, Index], addressables)
   num_unique_slices = len({
@@ -785,7 +792,7 @@ def get_logical_gspmd_sharding(logical_shape, dtype, phys_sharding):
       len(logical_shape) + elt_aval.ndim)
   partitions, num_replicas = get_num_ways_dim_sharded(phys_hlo_sharding)
   suffix = [] if num_replicas == 1 else [num_replicas]
-  # Create logical sharding by cutting off the replicated trailing dims.
+  # 通过裁掉被复制的尾部维度来构造逻辑分片。
   logical_op_sharding = phys_hlo_sharding.to_proto().clone()
   tad = partitions[:-elt_aval.ndim] + suffix
   logical_op_sharding.tile_assignment_dimensions = tad
@@ -807,8 +814,8 @@ def check_replicated_trailing_dims(sharding: jsharding.Sharding,
         f"num_trailing_dims: {num_trailing_dims}")
 
 def logical_sharding(logical_shape, dtype, phys_sharding) -> jsharding.Sharding:
-  # The trailing dims should always be replicated.
-  # TODO(yashkatariya): Maybe remove this check or do this at the pxla level?
+  # 尾部维度应始终保持复制状态。
+  # TODO(yashkatariya): 也许可以移除这个检查，或把它放到 pxla 层？
   check_replicated_trailing_dims(phys_sharding, logical_shape, dtype)
 
   if isinstance(phys_sharding, NamedSharding):
@@ -863,10 +870,10 @@ def canonicalize_sharding(sharding: NamedSharding | PartitionSpec | None,
           f' context via `jax.set_mesh`. Got {sharding}')
     sharding = NamedSharding(cur_mesh, sharding)
   else:
-    # There are cases when you have multiple meshes set. Allow that for full
-    # auto mode because of existing use cases.
-    # TODO(yashkatariya): Remove this once we disallow different meshes and
-    # fix the existing use cases.
+    # 存在设置了多个 mesh 的情况。由于已有的用例，
+    # 全自动模式允许这种做法。
+    # TODO(yashkatariya): 一旦我们禁止使用不同的 mesh，就移除这段逻辑，
+    # 并修复现有的用例。
     if (sharding.mesh.abstract_mesh.are_all_axes_auto and
         cur_mesh.are_all_axes_auto):
       check_mesh_consistency = False
@@ -877,8 +884,8 @@ def canonicalize_sharding(sharding: NamedSharding | PartitionSpec | None,
           f' {sharding.mesh.abstract_mesh} passed to {api_name}.'
           ' This error occurs at source: '
           f' {source_info_util.summarize(source_info_util.current())}')
-    # TODO(yashkatariya): Maybe allow concrete mesh at the top level
-    # i.e `core.trace_state_clean()` for APIs like jnp.zeros, etc?
+    # TODO(yashkatariya): 也许可以对 jnp.zeros 之类的 API 在顶层
+    # 允许具体 mesh，即 `core.trace_state_clean()`？
     if isinstance(sharding.mesh, Mesh):
       sharding = NamedSharding(sharding.mesh.abstract_mesh, sharding.spec)
 
@@ -900,20 +907,20 @@ def canonicalize_sharding(sharding: NamedSharding | PartitionSpec | None,
 def make_mesh(axis_sizes: Sequence[int], axis_names: Sequence[str],
               axis_types: tuple[AxisType, ...] | None = None,
               *, devices: Sequence[xc.Device] | None = None) -> Mesh:
-  """Creates an efficient mesh with the shape and axis names specified.
+  """按指定的形状和轴名称创建高效的 mesh。
 
-  This function attempts to automatically compute a good mapping from a set of
-  logical axes to a physical mesh. For example, on a TPU v3 with 8 devices:
+  本函数尝试自动计算从一组逻辑轴到物理 mesh 的
+  良好映射。例如，在拥有 8 个设备的 TPU v3 上：
 
   >>> mesh = jax.make_mesh((8,), ('x'))  # doctest: +SKIP
   >>> [d.id for d in mesh.devices.flat]  # doctest: +SKIP
   [0, 1, 2, 3, 6, 7, 4, 5]
 
-  The above ordering takes into account the physical topology of TPU v3.
-  It orders the devices into a ring, which yields efficient all-reduces on a
-  TPU v3.
+  上面的顺序考虑了 TPU v3 的物理拓扑。
+  它把设备排成一个环，从而在 TPU v3 上
+  获得高效的 all-reduce。
 
-  Now, let's see another example with 16 devices of TPU v3:
+  现在看另一个例子，使用 TPU v3 的 16 个设备：
 
   >>> mesh = jax.make_mesh((2, 8), ('x', 'y'))  # doctest: +SKIP
   >>> [d.id for d in mesh.devices.flat]  # doctest: +SKIP
@@ -922,24 +929,24 @@ def make_mesh(axis_sizes: Sequence[int], axis_names: Sequence[str],
   >>> [d.id for d in mesh.devices.flat]  # doctest: +SKIP
   [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
-  As you can see, logical axes (`axis_sizes`) affect the ordering of the
-  devices.
+  可以看到，逻辑轴（`axis_sizes`）会影响
+  设备的顺序。
 
-  You can use `jax.experimental.mesh_utils.create_device_mesh` if you want to
-  use the extra arguments it provides like `contiguous_submeshes` and
-  `allow_split_physical_axes`.
+  如果你想使用 `jax.experimental.mesh_utils.create_device_mesh`
+  提供的额外参数，例如 `contiguous_submeshes` 和
+  `allow_split_physical_axes`，可以使用该函数。
 
   Args:
-    axis_sizes: Shape of the mesh. For example, axis_shape=(4, 2)
-    axis_names: Names of the mesh axes. For example, axis_names=('x', 'y')
-    axis_types: Optional tuple of :class:`jax.sharding.AxisType` entries
-      corresponding to the ``axis_names``. See `Explicit Sharding`_ for more
-      information.
-    devices: Optional keyword only argument, that allows you to specify the
-      devices you want to create a mesh with.
+    axis_sizes: mesh 的形状。例如 axis_shape=(4, 2)
+    axis_names: mesh 各轴的名称。例如 axis_names=('x', 'y')
+    axis_types: 可选的 :class:`jax.sharding.AxisType` 元组，
+      与 ``axis_names`` 一一对应。更多信息
+      参见 `Explicit Sharding`_。
+    devices: 可选的关键字参数，用于指定
+      你希望用来创建 mesh 的设备。
 
   Returns:
-    A :class:`jax.sharding.Mesh` object.
+    一个 :class:`jax.sharding.Mesh` 对象。
 
   .. _Explicit Sharding:  https://docs.jax.dev/en/latest/parallel.html
   """
@@ -977,25 +984,25 @@ def make_mesh(axis_sizes: Sequence[int], axis_names: Sequence[str],
 
 
 class set_mesh:
-  """Sets a concrete mesh in a thread-local context.
+  """在线程本地上下文中设置具体 mesh。
 
-  ``jax.set_mesh`` has dual behavior. You can use it as a global setter or as a
-  context manager.
+  ``jax.set_mesh`` 具有双重行为。你既可以把它当作全局设置器，
+  也可以当作上下文管理器使用。
 
-  When a mesh is in context via ``jax.set_mesh``, you can use pass
-  raw PartitionSpecs to all APIs that accept sharding as an argument.
-  Using ``jax.set_mesh`` is also required for enabling explicit sharding mode:
+  当通过 ``jax.set_mesh`` 使某个 mesh 处于上下文中时，
+  你可以向所有接受 sharding 参数的 API 传入原始的 PartitionSpec。
+  启用显式分片模式也需要使用 ``jax.set_mesh``：
   https://docs.jax.dev/en/latest/parallel.html
 
-  For example::
+  例如::
 
     mesh = jax.make_mesh((2,), ('x',))
-    jax.set_mesh(mesh)  # use the API as a global setter
+    jax.set_mesh(mesh)  # 把该 API 当作全局设置器使用
 
-    with jax.set_mesh(mesh):  # use the API as a context manager
+    with jax.set_mesh(mesh):  # 把该 API 当作上下文管理器使用
       ...
 
-  Note: ``jax.set_mesh`` can only be used outside of ``jax.jit``.
+  Note: ``jax.set_mesh`` 只能在 ``jax.jit`` 之外使用。
   """
   __slots__ = ["prev_abstract_mesh", "prev_mesh"]
 

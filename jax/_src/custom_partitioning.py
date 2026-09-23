@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The implementation of custom partitioning APIs.
+# 文件职责：实现 JAX 的“自定义分区”（custom partitioning）公开 API。
+# 该模块提供 `custom_partitioning` 装饰器，让用户为自定义算子注册 SPMD 分区
+# 规则：它把被装饰函数包装成 `custom_partitioning` 原语，在 XLA 图中插入
+# `CustomCallOp`，并把 `partition`、`propagate_user_sharding`、
+# `infer_sharding_from_operands` 以及 Shardy 的 `sharding_rule` 等回调交给
+# XLA 的 SPMD 分区器；本模块原先位于 `jax.experimental`，为打破导入循环而迁出。
 
-It was moved out of ``jax.experimental`` to avoid import cycles.
+"""自定义分区 API 的实现。
+
+该模块原先位于 ``jax.experimental``，为避免导入循环而迁出。
 """
 
 from __future__ import annotations
@@ -263,7 +270,7 @@ def _check_for_tracers(x):
 
 @custom_api_util.register_custom_decorator_type
 class custom_partitioning:
-  """Inserts a CustomCallOp into the XLA graph with custom SPMD lowering rules.
+  """把带有自定义 SPMD 降级规则的 ``CustomCallOp`` 插入 XLA 图。
 
   .. code-block:: python
 
@@ -272,7 +279,7 @@ class custom_partitioning:
       return ...
 
     def propagate_user_sharding(mesh, user_shape):
-      '''Update the sharding of the op from a user's shape.sharding.'''
+      '''根据用户的 shape.sharding 更新该算子的分片。'''
       user_sharding = jax.tree.map(lambda x: x.sharding, user_shape)
 
     def partition(mesh, arg_shapes, result_shape):
@@ -280,12 +287,12 @@ class custom_partitioning:
         ... builds computation on per-device shapes ...
       result_shardings = jax.tree.map(lambda x: x.sharding, result_shape)
       arg_shardings = jax.tree.map(lambda x: x.sharding, arg_shapes)
-      # result_sharding and arg_shardings may optionally be modified and the
-      # partitioner will insert collectives to reshape.
+      # result_sharding 与 arg_shardings 可以选择性地修改，分区器会插入
+      # 集合通信来重塑形状。
       return mesh, lower_fn, result_sharding, arg_shardings
 
     def infer_sharding_from_operands(mesh, arg_shapes, shape):
-      '''Compute the result sharding from the sharding of the operands.'''
+      '''由操作数的分片计算结果分片。'''
       arg_shardings = jax.tree.map(lambda x: x.sharding, arg_shapes)
 
 
@@ -293,63 +300,56 @@ class custom_partitioning:
                     infer_sharding_from_operands=infer_sharding_from_operands,
                     sharding_rule='i j -> 'i j')
 
-  The args to ``def_partition`` are as follows:
+  传递给 ``def_partition`` 的参数如下：
 
-  * ``propagate_user_sharding``: Callable which takes the sharding of a user (in the dag)
-    and returns a suggestion for a new `NamedSharding`. The default value is None.
-    A trivial implementation is just to return the input sharding.
-  * ``partition``: Callable which takes the SPMD suggested partition shapes and
-    partition specs and returns the mesh, a per-shard lowering function, and the final
-    input and output sharding specs (the SPMD partitioner will repartition the
-    inputs to match). The mesh is returned to allow configuring axis_names for
-    collectives when no mesh is provided.
-  * ``infer_sharding_from_operands``: Callable which computes an output ``NamedSharding``
-    from the ``NamedSharding`` chosen for each argument.
-  * ``decode_shardings``: When set to True, convert input ``GSPMDSharding``s to
-    ``NamedSharding`` if possible. This may not be possible if the user does not
-    provide a contextual mesh.
-  * ``sharding_rule``: an SdyShardingRule object, an Einsum-like notation string
-    that describes the sharding rule, or a Callable that produces either of
-    these. We call the index labels in Einsum notation factors in our sharding
-    rule. We borrow the idea from the einops.rearrange string , to use a space
-    separator between factors and allow multiple letters factor names. By
-    default, a factor corresponds to a passthrough/elementwise dimension.
-    Factors corresponding to other dimensions can be specified via keyword
-    arguments described below. See
+  * ``propagate_user_sharding``：可调用对象，接收用户（DAG 中）的分片，
+    并返回一个新的 `NamedSharding` 建议值。默认值为 None。
+    最简单的实现就是原样返回输入分片。
+  * ``partition``：可调用对象，接收 SPMD 建议的分片形状和
+    分片规格，返回 mesh、逐分片降级函数，以及最终的
+    输入与输出分片规格（SPMD 分区器会重新分区输入以匹配它们）。
+    返回 mesh 是为了在未提供 mesh 时配置集合通信的 axis_names。
+  * ``infer_sharding_from_operands``：可调用对象，由为每个参数选定的
+    ``NamedSharding`` 计算输出的 ``NamedSharding``。
+  * ``decode_shardings``：设为 True 时，尽可能把输入的 ``GSPMDSharding``
+    转换为 ``NamedSharding``。如果用户没有提供上下文 mesh，
+    则可能无法转换。
+  * ``sharding_rule``：一个 SdyShardingRule 对象、描述分片规则的类 Einsum 记法
+    字符串，或者能产出上述两者之一的可调用对象。我们把 Einsum 记法中的
+    索引标签称为分片规则中的因子（factor）。我们借鉴了
+    einops.rearrange 字符串的做法，用空格分隔因子，
+    并允许因子名包含多个字母。默认情况下，一个因子对应
+    透传/逐元素维度。其他维度对应的因子可以通过下文描述的关键字
+    参数指定。更多细节与示例参见
     `jax-shardy-guide <https://colab.sandbox.google.com/github/openxla/shardy/blob/main/docs/getting_started_jax.ipynb>`_
-    for more details and examples.
-  * ``reduction_factors``: A tuple of strings, specifying the reduction factors
-    for a string `sharding_rule`. A reduction factor corresponds to a dimension
-    that appears in operands but not in the result, such as the contracting
-    dimensions in a matmul operation. If a reduction factor is sharded, the
-    result would need to be all-reduced along the same axes.
-  * ``need_replication_factors``: A tuple of strings, specifying the
-    need_replication factors for a string `sharding_rule`. A need_replication
-    factor corresponds to a dimension that shouldn't be sharded to support
-    the implementation.
-  * ``permutation_factors``: A tuple of strings, specifying the permutation
-    factors for a string `sharding_rule`. A permutation factor corresponds to a
-    dimension that would trigger collective permute if it is sharded.
-  * ``factor_sizes``: A dictionary of variable keyword arguments, specifying
-    the sizes of the factors that are only used in compound factors in a string
-    `sharding_rule`.
+  * ``reduction_factors``：字符串元组，为字符串 `sharding_rule` 指定归约
+    因子。归约因子对应出现在操作数中但不出现在结果中的维度，
+    例如 matmul 运算中的收缩维度。如果归约因子被分片，
+    结果就需要沿相同的轴做 all-reduce。
+  * ``need_replication_factors``：字符串元组，为字符串 `sharding_rule`
+    指定 need_replication 因子。need_replication 因子对应
+    为了支持该实现而不应被分片的维度。
+  * ``permutation_factors``：字符串元组，为字符串 `sharding_rule` 指定
+    置换因子。置换因子对应一旦被分片就会触发 collective permute
+    的维度。
+  * ``factor_sizes``：由可变关键字参数组成的字典，为字符串
+    `sharding_rule` 中仅用于复合因子的因子指定大小。
 
-  When config.use_shardy_partitioner.value is True, `sharding_rule` is used;
-  otherwise, `propagate_user_sharding` and `infer_sharding_from_operands` are
-  used.
+  当 config.use_shardy_partitioner.value 为 True 时使用 `sharding_rule`；
+  否则使用 `propagate_user_sharding` 与
+  `infer_sharding_from_operands`。
 
-  Positional arguments can be specified as static using static_argnums. JAX uses
-  :code:`inspect.signature(fun)` to resolve these positional arguments.
+  可以用 static_argnums 把位置参数指定为静态参数。JAX 使用
+  :code:`inspect.signature(fun)` 来解析这些位置参数。
 
   Examples:
 
-    As an example, assume we want to enhance the existing ``jax.numpy.fft.fft``. This function computes
-    the discrete Fourier transform of an N-dimensional input along the last dimension, and is batched
-    along the first N-1 dimensions.
-    By default, however, it will ignore the sharding of the input and gather the input on all devices.
-    However, since ``jax.numpy.fft.fft`` is batched along the first N-1 dimensions,
-    this is unnecessary. We will create a new ``my_fft`` op that, instead, does not alter the sharding
-    along the first `N-1` dimensions, and only gathers the input along the last dimension if needed.
+    举例来说，假设我们想增强现有的 ``jax.numpy.fft.fft``。该函数沿最后一个
+    维度计算 N 维输入的离散傅里叶变换，并沿前 N-1 个维度做批处理。
+    但默认情况下，它会忽略输入的分片，把输入聚集到所有设备上。
+    然而，由于 ``jax.numpy.fft.fft`` 是沿前 N-1 个维度做批处理的，
+    这样做并无必要。我们将创建一个新的 ``my_fft`` 算子，
+    它不改动前 `N-1` 个维度上的分片，只在需要时沿最后一个维度聚集输入。
 
     .. code-block:: python
 
@@ -363,11 +363,11 @@ class custom_partitioning:
       import regex as re
       import numpy as np
 
-      # Pattern to detect all-gather or dynamic-slice in the generated HLO
+      # 用于检测生成的 HLO 中 all-gather 或 dynamic-slice 的正则模式
       _PATTERN = '(dynamic-slice|all-gather)'
 
-      # For an N-D input, keeps sharding along the first N-1 dimensions
-      # but replicate along the last dimension
+      # 对 N 维输入，保留前 N-1 个维度上的分片，
+      # 但在最后一个维度上做复制
       def supported_sharding(sharding, shape):
           rank = len(shape.shape)
           max_shared_dims = min(len(sharding.spec), rank-1)
@@ -389,22 +389,22 @@ class custom_partitioning:
       def my_fft(x):
           return fft(x)
 
-      # Use Einsum-like notation to specify the sharding rule.
+      # 使用类 Einsum 记法指定分片规则。
       my_fft.def_partition(
         infer_sharding_from_operands=infer_sharding_from_operands,
         partition=partition,
         sharding_rule='...i -> ...i')
-      # Use SdyShardingRule object to specify the sharding rule.
+      # 使用 SdyShardingRule 对象指定分片规则。
       my_fft.def_partition(
         infer_sharding_from_operands=infer_sharding_from_operands,
         partition=partition,
         sharding_rule=SdyShardingRule(operand_mappings=((BATCHING, 'i'),), result_mappings=((BATCHING, 'i'),))))
 
-    Now create a 2D array sharded along the first axis, pass it through ``my_fft``
-    and notice how it is still sharded as expected, and identical to the output
-    of ``fft``. However, inspecting the HLO
-    (using ``lower(x).compile().runtime_executable().hlo_modules()``) reveals that
-    ``my_fft`` does not create any all-gather or dynamic-slice, while ``fft`` does.
+    现在创建一个沿第一个轴分片的 2D 数组，把它传入 ``my_fft``，
+    可以看到它仍然按预期分片，且输出与 ``fft`` 相同。
+    不过，查看 HLO（使用
+    ``lower(x).compile().runtime_executable().hlo_modules()``）会发现，
+    ``my_fft`` 不产生任何 all-gather 或 dynamic-slice，而 ``fft`` 会产生。
 
     .. code-block::
 
@@ -415,9 +415,9 @@ class custom_partitioning:
         pjit_fft    = pjit(fft,    in_shardings=P('x'), out_shardings=P('x'))
         print(pjit_my_fft(y))
         print(pjit_fft(y))
-        # dynamic-slice or all-gather are not present in the HLO for my_fft, because x is a 2D array
+        # 因为 x 是 2D 数组，my_fft 的 HLO 中不存在 dynamic-slice 或 all-gather
         assert(re.search(_PATTERN, pjit_my_fft.lower(x).compile().runtime_executable().hlo_modules()[0].to_string()) is None)
-        # dynamic-slice or all-gather are present in the HLO for fft
+        # fft 的 HLO 中存在 dynamic-slice 或 all-gather
         assert(re.search(_PATTERN, pjit_fft.lower(x).compile().runtime_executable().hlo_modules()[0].to_string())    is not None)
 
     .. code-block::
@@ -432,10 +432,10 @@ class custom_partitioning:
         ...
         -1.6937828  +0.8402481j  15.999859   -4.0156755j]]
 
-    Because of the logic in ``supported_sharding``, ``my_fft`` also works on 1-dimensional arrays.
-    However, in this case, the HLO of ``my_fft`` does show a dynamic-slice, since the last dimension
-    is the dimension along which FFTs are calculated and needs to be replicated on all devices before
-    the computation can be done.
+    由于 ``supported_sharding`` 中的逻辑，``my_fft`` 也能处理一维数组。
+    不过在这种情况下，``my_fft`` 的 HLO 中确实会出现 dynamic-slice，因为最后一个
+    维度是计算 FFT 所沿的维度，需要在计算开始前把它复制到所有
+    设备上。
 
     .. code-block::
 
@@ -446,9 +446,9 @@ class custom_partitioning:
         pjit_fft    = pjit(fft,    in_shardings=P('x'), out_shardings=P('x'))
         print(pjit_my_fft(y))
         print(pjit_fft(y))
-        # dynamic-slice or all-gather are present in the HLO for my_fft, because x is a 1D array
+        # 因为 x 是 1D 数组，my_fft 的 HLO 中存在 dynamic-slice 或 all-gather
         assert(re.search(_PATTERN, pjit_my_fft.lower(x).compile().runtime_executable().hlo_modules()[0].to_string()) is None)
-        # dynamic-slice or all-gather are present in the HLO for fft
+        # fft 的 HLO 中存在 dynamic-slice 或 all-gather
         assert(re.search(_PATTERN, pjit_fft.lower(x).compile().runtime_executable().hlo_modules()[0].to_string())    is not None)
 
     .. code-block::
@@ -620,8 +620,8 @@ def _custom_partitioning_lowering_rule(ctx: mlir.LoweringRuleContext, *values,
       infer_sharding_from_operands, ctx.module_context, mesh, static_args)
   key = str(id(sharding_callback_info))
   _sharding_callbacks[bytes(key, 'utf8')] = sharding_callback_info
-  # We need to make sure `sharding_callback_info` is still alive when the SPMD
-  # partitioner runs so we keep it alive by attaching it to the executable.
+  # 需要保证 SPMD 分区器运行时 `sharding_callback_info` 仍然存活，
+  # 因此把它附加到可执行文件上以维持其存活。
   ctx.module_context.add_keepalive(sharding_callback_info)
 
   result_types, _ = mlir.ir_tree_registry.flatten(

@@ -12,55 +12,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Utilities for defining functions composed with transformations.
+# 文件职责：为 JAX 的各类变换（jit、vjp、grad 等）提供函数包装与线性化辅助设施。
+# 核心是 `WrappedFun`：它把被包装的函数 `f` 与一串嵌套的变换生成器叠成栈，
+# 在调用时依次改写动态参数、关键字参数与返回值，并可收集辅助输出（aux）。
+# 相关设施包括 `Store`/`EqualStore` 辅助输出存储、`wrap_init` 包装入口、
+# `cache` 记忆化、`DebugInfo` 追踪信息，以及 `merge_linear_aux` 辅助输出合并。
 
-For example,
+"""
+用于定义与变换组合而成的函数的工具。
+
+例如，
 
    from jax._src import linear_util as lu
 
-   # Produce a WrappedFun for applying transformations on `f`
+   # 生成一个 WrappedFun，用于对 `f` 施加变换
    wf = lu.wrap_init(f, debug_info=api_util.debug_info("test", f, (), {}))
 
-A `WrappedFun` object represents a function `f`, together with a sequence of
-nested transformations that are to be applied to the positional and keyword
-arguments at call time and function return values at return time.
-A transformation can take some static positional arguments that are given
-at the wrapping time, and may also return some auxiliary output:
+`WrappedFun` 对象表示一个函数 `f`，并携带一串嵌套的变换。这些变换需要在
+调用时施加于位置参数与关键字参数，在返回时施加于函数的返回值。
+一个变换可以接受一些在包装时给定的静态位置参数，
+并且还可以返回一些辅助输出，
+如下所示：
 
     wf, aux_out_thunk = trans1(wf, static_arg)
 
-We can call the transformed function. First, the transformation is applied
-to the dynamic args and keyword args to produce new dynamic and keyword args.
-Then the underlying function is called and the transformation is applied to
-the results.
-If there are multiple transformations, they form a stack. The arguments are
-transformed first with the last applied transformation; the results are
-transformed first with the first applied transformation.
+我们可以调用被变换后的函数。首先，变换会施加于动态参数与关键字参数，
+以产生新的动态参数与关键字参数；
+然后调用底层函数，并把变换施加于结果之上。
+如果存在多个变换，它们会构成一个栈。
+参数按“最后施加的变换优先”的顺序被处理，
+结果则按“最先施加的变换优先”的顺序被处理，
+也就是说，变换栈对参数与结果的作用次序是相反的。
 
     res = wf.call_wrapped(dynamic_args, kwargs)
-    # Now `aux_out_thunk()` is the auxiliary output.
+    # 现在 `aux_out_thunk()` 就是辅助输出。
 
-A transformation is written as a generator function that takes zero or more
-static positional arguments (given when the transformation is instantiated),
-along with positional and keyword arguments to be transformed.
-The generator will yield twice:
+一个变换写成一个生成器函数，它接受零个或多个静态位置参数
+（这些参数在变换被实例化时给出），
+以及待变换的位置参数与关键字参数。
+该生成器会 yield 两次：
 
     @lu.transformation_with_aux
     def trans1(static_arg, *dynamic_args, **kwargs):
       ...
-      # First yield: pair of transformed (args, kwargs). Get back the results.
+      # 第一次 yield：变换后的 (args, kwargs) 二元组；随后取回结果。
       results = yield (new_dynamic_args, new_kwargs)
       ...
-      # Second yield: pair of (transformed results, and auxiliary output)
+      # 第二次 yield：(变换后的结果, 辅助输出) 二元组
       yield new_results, auxiliary_output
 
 
-`WrappedFun` objects explicitly represent the set of transformations so that
-they can be used as dictionary keys for memoization. `WrappedFun` objects
-compare as equal only if they compute the same function. The static and the
-dynamic positional arguments for the generators, and also the auxiliary output
-data must be immutable, because it will be stored in function memoization tables.
+`WrappedFun` 对象显式地表示这组变换，因此可以把它们用作记忆化的字典键。
+`WrappedFun` 对象只有在计算同一个函数时才比较相等。
+生成器的静态位置参数与动态位置参数，
+以及辅助输出数据，都必须是不可变的，
+因为它们会被存放在函数记忆化表中。
 """
 from __future__ import annotations
 
@@ -90,7 +96,7 @@ class EmptyStoreValue: pass
 _EMPTY_STORE_VALUE = EmptyStoreValue()
 
 class Store:
-  """Storage for a value, with checks for overwriting or reading empty store."""
+  """用于存放一个值的存储，会在覆盖写入或读取空存储时进行检查。"""
   __slots__ = ("_val",)
 
   def __init__(self):
@@ -102,7 +108,7 @@ class Store:
     self._val = val
 
   def reset(self):
-    # This should only be called in exceptional circumstances (e.g. debugging).
+    # 只应在异常情形下调用（例如调试）。
     self._val = _EMPTY_STORE_VALUE
 
   @property
@@ -143,22 +149,22 @@ class EqualStore:
 
 
 class WrappedFun:
-  """Represents a function `f` to which `transforms` are to be applied.
+  """表示一个待施加 `transforms` 的函数 `f`。
 
   Args:
-    f: the function to be transformed.
-    f_transformed: transformed function.
-    transforms: a tuple of `(gen, gen_static_args)` tuples representing
-      transformations to apply to `f.` Here `gen` is a generator function and
-      `gen_static_args` is a tuple of static arguments for the generator. See
-      description at the start of this module for the expected behavior of the
-      generator.
-    stores: a list of out_store for the auxiliary output of the `transforms`.
-    params: a tuple of `(name, param)` tuples representing extra parameters to
-      pass as keyword arguments to `f`, along with the transformed keyword
-      arguments.
-    in_type: optional input type
-    debug_info: debugging info about the function being wrapped.
+    f: 待变换的函数。
+    f_transformed: 变换后的函数。
+    transforms: 由 `(gen, gen_static_args)` 二元组构成的元组，表示要施加到
+      `f` 上的变换。这里 `gen` 是一个生成器函数，
+      而 `gen_static_args` 是传给该生成器的一个静态参数元组，
+      用于在包装时确定该变换的静态行为。
+      关于生成器应有的行为，见本模块开头的描述。
+    stores: 存放 `transforms` 辅助输出的 out_store 列表。
+    params: 由 `(name, param)` 二元组构成的元组，表示需要作为关键字参数
+      传给 `f` 的额外参数，它们会与变换后的关键字参数
+      一起传入。
+    in_type: 可选的输入类型
+    debug_info: 关于被包装函数的调试信息。
   """
   __slots__ = ("f", "f_transformed", "transforms", "stores", "params", "in_type", "debug_info")
 
@@ -191,7 +197,7 @@ class WrappedFun:
 
   def wrap(self, gen, gen_static_args,
            out_store: Store | EqualStore | None) -> WrappedFun:
-    """Add another transform and its store."""
+    """再添加一个变换及其存储。"""
     if out_store is None:
       return WrappedFun(self.f, partial(gen, self.f_transformed, *gen_static_args),
                         ((gen, gen_static_args),) + self.transforms,
@@ -202,13 +208,13 @@ class WrappedFun:
                         (out_store,) + self.stores, self.params, None, self.debug_info)
 
   def populate_stores(self, stores):
-    """Copy the values from the `stores` into `self.stores`."""
+    """把 `stores` 中的值复制到 `self.stores` 中。"""
     for self_store, other_store in zip(self.stores, stores):
       if self_store is not None:
         self_store.store(other_store.val)
 
   def call_wrapped(self, *args, **kwargs):
-    """Calls the transformed function"""
+    """调用变换后的函数"""
     return self.f_transformed(*args, **kwargs)
 
   def __repr__(self):
@@ -237,16 +243,16 @@ class WrappedFun:
 
 @curry
 def transformation2(gen, fun: WrappedFun, *gen_static_args) -> WrappedFun:
-  """Adds one more transformation to a WrappedFun.
+  """向一个 WrappedFun 再添加一个变换。
 
   Args:
-    gen: the transformation generator function
-    fun: a WrappedFun on which to apply the transformation
-    gen_static_args: static args for the generator function
+    gen: 变换生成器函数
+    fun: 要施加该变换的 WrappedFun
+    gen_static_args: 生成器函数的静态参数
   """
   return fun.wrap(gen, gen_static_args, None)
 
-# Backwards compat only. TODO: deprecate
+# 仅为向后兼容。TODO: 弃用
 @curry
 def transformation(gen, fun: WrappedFun, *gen_static_args) -> WrappedFun:
   def gen2(f, *args, **kwargs):
@@ -255,7 +261,7 @@ def transformation(gen, fun: WrappedFun, *gen_static_args) -> WrappedFun:
     return gen_inst.send(f(*args_, **kwargs_))
   return transformation2(gen2, fun, *gen_static_args)()
 
-# Backwards compat only. TODO: deprecate
+# 仅为向后兼容。TODO: 弃用
 @curry
 def transformation_with_aux(gen, fun: WrappedFun, *gen_static_args) -> WrappedFun:
   def gen2(f, store, *args, **kwargs):
@@ -270,7 +276,7 @@ def transformation_with_aux(gen, fun: WrappedFun, *gen_static_args) -> WrappedFu
 def transformation_with_aux2(
     gen, fun: WrappedFun, *gen_static_args, use_eq_store: bool = False,
     unk_names: bool = False) -> tuple[WrappedFun, Callable[[], Any]]:
-  """Adds one more transformation with auxiliary output to a WrappedFun."""
+  """向一个 WrappedFun 再添加一个带辅助输出的变换。"""
   out_store = Store() if not use_eq_store else EqualStore()
   out_thunk = lambda: out_store.val
   fun = fun.wrap(gen, gen_static_args, out_store)
@@ -282,44 +288,44 @@ class InitialResultPaths:
 initial_result_paths = InitialResultPaths()
 
 class DebugInfo(NamedTuple):
-  """Debugging info about a func, its arguments, and results."""
-  traced_for: str             # e.g. 'jit', 'scan', etc
+  """关于某个函数及其参数与结果的调试信息。"""
+  traced_for: str             # 例如 'jit'、'scan' 等
 
   func_src_info: str
-  """e.g. ``f'{fun.__name__} at {filename}:{lineno}'`` or ``'{fun.__name__}'`` if
-  we have no source location information. The first word is always the function
-  name, which may be '<unknown>'.
+  """例如 ``f'{fun.__name__} at {filename}:{lineno}'``；如果我们没有源位置
+  信息，则形如 ``'{fun.__name__}'``。第一个词始终是函数名，
+  该名字可能是 '<unknown>'。
   """
 
   arg_names: tuple[str, ...] | None
-  """The paths of the flattened non-static argnames,
-  for example ``('x', 'dict_arg["a"]', ...)``.
-  Uses the empty string for the args that do not correspond to
-  user-named arguments, e.g., tangent args in ``jax.jvp``, or for arguments that
-  we are not yet tracking properly. The value ``None`` denotes argument names.
+  """展平后的非静态参数名的路径，
+  例如 ``('x', 'dict_arg["a"]', ...)``。
+  对于并不对应用户命名参数的那些参数（例如 ``jax.jvp`` 中的切向量参数），
+  或者对于我们还未能正确追踪的参数，使用空字符串表示。
+  取值 ``None`` 表示参数名未知。
 
-  At the moment, ``arg_names`` accuracy is best-effort.
-  Use ``safe_arg_names`` to detect and handle an unexpected
-  number of elements in ``arg_names``.
+  目前，``arg_names`` 的准确性是尽力而为的。
+  请使用 ``safe_arg_names`` 来检测并处理 ``arg_names`` 中
+  元素数量不符合预期的情况。
   """
 
   result_paths: tuple[str, ...] | InitialResultPaths | Callable[[], tuple[str, ...]] | None
-  """The paths to the flattened results, e.g., `('result[0]', result[1])` for a
-  function that returns a tuple of arrays, or `(result,)` for a function that
-  returns a single array. The value `None` denotes unknown paths.
+  """展平后结果的路径。例如，对于返回数组元组的函数，
+  形如 `('result[0]', result[1])`；对于返回单个数组的函数，
+  形如 `(result,)`。取值 `None` 表示路径未知。
 
-  When we first create a `DebugInfo`, we may use the value
-  `initial_result_paths`, which we replace with a thunk when we put the
-  debug info into a `lu.WrappedFun`, before we start tracing. After tracing,
-  we call `self.resolve_result_paths()` to execute the thunk and replace
-  the result paths with a tuple.
+  在最初创建 `DebugInfo` 时，我们可能使用取值
+  `initial_result_paths`；在开始追踪之前，当我们把调试信息放入
+  `lu.WrappedFun` 时，会把它替换成一个 thunk。追踪结束后，
+  我们调用 `self.resolve_result_paths()` 来执行该 thunk，
+  并把结果路径替换为一个元组。
 
-  Use `safe_result_paths` to detect and handle an unexpected
-  number of elements in `result_paths`.
+  请使用 `safe_result_paths` 来检测并处理 `result_paths` 中
+  元素数量不符合预期的情况。
   """
 
   def resolve_result_paths(self) -> DebugInfo:
-    """Return a debug info with resolved result paths."""
+    """返回一个已解析结果路径的调试信息。"""
     assert self.result_paths is not initial_result_paths
     if callable(self.result_paths):
       paths = tuple(self.result_paths())
@@ -353,7 +359,7 @@ class DebugInfo(NamedTuple):
     return int(m.group(4))
 
   def safe_arg_names(self, expected_count: int) -> tuple[str, ...]:
-    """Get the arg_names with a safety check."""
+    """在带安全检查的情况下获取 arg_names。"""
     self.assert_arg_names(expected_count)
     if self.arg_names is not None:
       return self.arg_names
@@ -364,13 +370,13 @@ class DebugInfo(NamedTuple):
         expected_count, self)
 
   def filter_arg_names(self, keep: Sequence[bool]) -> tuple[str, ...] | None:
-    """Keep only the arg_names for which `keep` is True."""
+    """只保留 `keep` 为 True 的那些 arg_names。"""
     if self.arg_names is None:
       return None
     return tuple(v for v, b in zip(self.safe_arg_names(len(keep)), keep) if b)
 
   def safe_result_paths(self, expected_count: int) -> tuple[str, ...]:
-    """Get the result paths with a safety check. Empty paths mean unknown."""
+    """在带安全检查的情况下获取结果路径。空路径表示未知。"""
     assert not isinstance(self.result_paths, InitialResultPaths) and not callable(self.result_paths), self
     self.assert_result_paths(expected_count)
     if self.result_paths is not None:
@@ -385,7 +391,7 @@ class DebugInfo(NamedTuple):
     assert len(self.result_paths) == expected_count, (expected_count, self)
 
   def filter_result_paths(self, keep: Sequence[bool]) -> tuple[str, ...] | None:
-    """Keep only the result_paths for which `keep` is True."""
+    """只保留 `keep` 为 True 的那些 result_paths。"""
     assert not isinstance(self.result_paths, InitialResultPaths) and not callable(self.result_paths), self
     if self.result_paths is None: return None
     return tuple(v for v, b in zip(self.result_paths, keep) if b)
@@ -406,7 +412,7 @@ def _missing_debug_info(for_what: str) -> DebugInfo:
   return DebugInfo("missing_debug_info", "<missing_debug_info>", None, None)
 
 def wrap_init(f: Callable, params=None, *, debug_info: DebugInfo) -> WrappedFun:
-  """Wraps function `f` as a `WrappedFun`, suitable for transformation."""
+  """把函数 `f` 包装成一个 `WrappedFun`，以便对其施加变换。"""
   params_dict = {} if params is None else params
   params = () if params is None else tuple(sorted(params.items()))
   debug_info = debug_info._replace(result_paths=None)
@@ -414,7 +420,7 @@ def wrap_init(f: Callable, params=None, *, debug_info: DebugInfo) -> WrappedFun:
   return fun
 
 
-# We replace <flat index 0> with 0
+# 我们把 <flat index 0> 替换为 0
 _re_clean_keystr_arg_names = re.compile(r"<flat index ([^>]+)>")
 def _clean_keystr_arg_names(k: KeyPath) -> str:
   res = keystr(k)
@@ -429,25 +435,25 @@ def annotate(f: WrappedFun, in_type: core.InputType | None) -> WrappedFun:
                     in_type, f.debug_info)
 
 def _check_input_type(in_type: core.InputType) -> None:
-  # Check that in_type is syntactically well-formed
+  # 检查 in_type 在语法上是否良构
   assert type(in_type) is tuple
   assert all(isinstance(a, core.AbstractValue) for a in in_type)
 
 def cache(call: Callable, *,
           explain: Callable[[WrappedFun, bool, dict, tuple, float], None] | None = None):
-  """Memoization decorator for functions taking a WrappedFun as first argument.
+  """用于首个参数为 WrappedFun 的函数的记忆化装饰器。
 
   Args:
-    call: a Python callable that takes a WrappedFun as its first argument. The
-      underlying transforms and params on the WrappedFun are used as part of the
-      memoization cache key.
+    call: 一个 Python 可调用对象，其第一个参数是 WrappedFun。
+      该 WrappedFun 上底层的变换（transforms）与参数（params）
+      会作为记忆化缓存键的一部分。
 
-    explain: a function that is invoked upon cache misses to log an explanation
-      of the miss.
-      Invoked with `(fun, is_cache_first_use, cache, key, elapsed_sec)`.
+    explain: 一个在缓存未命中时被调用的函数，
+      用于记录未命中的原因说明。
+      调用时传入 `(fun, is_cache_first_use, cache, key, elapsed_sec)`。
 
   Returns:
-     A memoized version of ``call``.
+     返回 ``call`` 的记忆化版本。
   """
   fun_caches: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
@@ -487,7 +493,7 @@ def merge_linear_aux(aux1, aux2):
   try:
     out1 = aux1()
   except StoreException:
-    # store 1 was not occupied, so store 2 better be
+    # 存储 1 未被占用，所以存储 2 最好已被占用
     try:
       out2 = aux2()
     except StoreException:
@@ -495,7 +501,7 @@ def merge_linear_aux(aux1, aux2):
     else:
       return False, out2
   else:
-    # store 1 was occupied, so let's check store 2 is not occupied
+    # 存储 1 已被占用，所以来检查存储 2 未被占用
     try:
       out2 = aux2()
     except StoreException:

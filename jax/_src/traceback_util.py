@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 JAX 的异常回溯过滤（traceback filtering）基础设施。
+# 它登记需要从回溯中剔除的 JAX 内部文件路径，并提供 filter_traceback 等
+# 工具来重建只保留用户代码帧的回溯。
+# api_boundary 装饰器把 JAX 变换产出的函数标记为过滤边界：当函数内部抛出
+# 异常时，会在原异常上挂一条过滤后的回溯，并按 JAX_TRACEBACK_FILTERING
+# 的取值改为设置 __tracebackhide__ 或追加说明等其他模式。
+
 from __future__ import annotations
 
 import functools
@@ -45,14 +52,14 @@ def _path_starts_with(path: str, path_prefix: str) -> bool:
   try:
     common = os.path.commonpath([path, path_prefix])
   except ValueError:
-    # path and path_prefix are both absolute, the only case will raise a
-    # ValueError is different drives.
+    # path 与 path_prefix 都是绝对路径，唯一会抛出
+    # ValueError 的情况是它们位于不同的盘符。
     # https://docs.python.org/3/library/os.path.html#os.path.commonpath
     return False
   try:
     return common == path_prefix or os.path.samefile(common, path_prefix)
   except OSError:
-    # One of the paths may not exist.
+    # 其中一个路径可能不存在。
     return False
 
 def include_frame(f: types.FrameType) -> bool:
@@ -61,9 +68,9 @@ def include_frame(f: types.FrameType) -> bool:
 def include_filename(filename: str) -> bool:
   return not any(_path_starts_with(filename, path) for path in _exclude_paths)
 
-# When scanning stack traces, we might encounter frames from cpython that are
-# removed from printed stack traces, such as frames from parts of importlib. We
-# ignore these frames heuristically based on source and name match.
+# 扫描堆栈回溯时，我们可能遇到 CPython 中那些不会出现在打印结果里的
+# 帧，例如 importlib 某些部分的帧。我们根据源码与名称的匹配
+# 启发式地忽略这些帧。
 def _ignore_known_hidden_frame(f: types.FrameType) -> bool:
   return 'importlib._bootstrap' in f.f_code.co_filename
 
@@ -76,7 +83,7 @@ def _add_tracebackhide_to_hidden_frames(tb: types.TracebackType | None):
 
 def filter_traceback(tb: types.TracebackType) -> types.TracebackType | None:
   out = None
-  # Scan the traceback and collect relevant frames.
+  # 扫描回溯并收集相关的帧。
   frames = list(traceback.walk_tb(tb))
   for f, lineno in reversed(frames):
     if include_frame(f):
@@ -84,15 +91,14 @@ def filter_traceback(tb: types.TracebackType) -> types.TracebackType | None:
   return out
 
 def _add_call_stack_frames(tb: types.TracebackType) -> types.TracebackType:
-  # Continue up the call stack.
+  # 继续沿调用栈向上走。
   #
-  # We would like to avoid stepping too far up, e.g. past the exec/eval point of
-  # a REPL such as IPython. To that end, we stop past the first contiguous bunch
-  # of module-level frames, if we reach any such frames at all. This is a
-  # heuristic that might stop in advance of the REPL boundary. For example, if
-  # the call stack includes module-level frames from the current module A, and
-  # the current module A was imported from within a function F elsewhere, then
-  # the stack trace we produce will be truncated at F's frame.
+  # 我们希望避免向上走得太远，例如越过 IPython 这类 REPL 的
+  # exec/eval 位置。为此，如果遇到了模块级帧，我们会在第一段
+  # 连续的模块级帧之后停止。这是一个启发式规则，可能会在
+  # REPL 边界之前就提前停下。例如，如果调用栈中包含了当前
+  # 模块 A 的模块级帧，而当前模块 A 又是在别处的函数 F 中被
+  # 导入的，那么我们生成的堆栈回溯就会在 F 的帧处被截断。
   out = tb
 
   reached_module_level = False
@@ -136,7 +142,7 @@ class SimplifiedTraceback(Exception):
 SimplifiedTraceback.__module__ = "jax.errors"
 
 def _running_under_ipython() -> bool:
-  """Returns true if we appear to be in an IPython session."""
+  """若我们看起来处于 IPython 会话中则返回 true。"""
   try:
     get_ipython()  # pyrefly: ignore[unknown-name]
     return True
@@ -144,7 +150,7 @@ def _running_under_ipython() -> bool:
     return False
 
 def _ipython_supports_tracebackhide() -> bool:
-  """Returns true if the IPython version supports __tracebackhide__."""
+  """若该 IPython 版本支持 __tracebackhide__ 则返回 true。"""
   import IPython  # pyrefly: ignore[missing-import]
   return IPython.version_info[:2] >= (7, 17)
 
@@ -158,33 +164,30 @@ def _filtering_mode() -> str:
   return mode
 
 
-# TODO(slebedev): use [C: Callable[..., Any]] once facebook/pyrefly#3329 is fixed.
+# TODO(slebedev): 待 facebook/pyrefly#3329 修复后，改用 [C: Callable[..., Any]]。
 def api_boundary[C](
     fun: C, *,
     repro_api_name: str | None = None,
     repro_user_func: bool = False) -> C:
-  '''Wraps ``fun`` to form a boundary for filtering exception tracebacks.
+  '''包装 ``fun``，使其成为过滤异常回溯的边界。
 
-  When an exception occurs below ``fun``, this appends to it a custom
-  ``__cause__`` that carries a filtered traceback. The traceback imitates the
-  stack trace of the original exception, but with JAX-internal frames removed.
+  当 ``fun`` 之下发生异常时，会为该异常附加一个自定义的 ``__cause__``，
+  其中携带过滤后的回溯。该回溯模仿原始异常的堆栈回溯，但去掉了
+  JAX 内部的帧。
 
-  This boundary annotation works in composition with itself. The topmost frame
-  corresponding to an :func:`~api_boundary` is the one below which stack traces
-  are filtered. In other words, if ``api_boundary(f)`` calls
-  ``api_boundary(g)``, directly or indirectly, the filtered stack trace provided
-  is the same as if ``api_boundary(f)`` were to simply call ``g`` instead.
+  这种边界标注可以自我组合。最靠上的那个 :func:`~api_boundary` 对应的帧
+  就是回溯过滤的起点。换句话说，如果 ``api_boundary(f)`` 直接或间接地
+  调用 ``api_boundary(g)``，那么最终提供的过滤后堆栈回溯，与
+  ``api_boundary(f)`` 直接调用 ``g`` 时相同。
 
-  This annotation is primarily useful in wrapping functions output by JAX's
-  transformations. For example, consider ``g = jax.jit(f)``. When ``g`` is
-  called, JAX's JIT compilation machinery is invoked, which in turn calls ``f``
-  in order to trace and translate it. If the function ``f`` raises an exception,
-  the stack unwinds through JAX's JIT internals up to the original call site of
-  ``g``. Because the function returned by :func:`~jax.jit` is annotated as an
-  :func:`~api_boundary`, such an exception is accompanied by an additional
-  traceback that excludes the frames specific to JAX's implementation.
+  该标注主要用于包装 JAX 变换产出的函数。例如，设 ``g = jax.jit(f)``。
+  调用 ``g`` 时会启动 JAX 的 JIT 编译机制，进而调用 ``f`` 以对其进行
+  追踪与转换。如果函数 ``f`` 抛出异常，调用栈会穿过 JAX 的 JIT 内部实现
+  一路展开到 ``g`` 的原始调用点。由于 :func:`~jax.jit` 返回的函数被标注为
+  :func:`~api_boundary`，这样的异常会附带一条额外的回溯，其中不含
+  JAX 实现特有的帧。
 
-  For the "repro" kwargs, see the comments for `repro.boundary`.
+  "repro" 相关关键字参数见 `repro.boundary` 的注释。
   '''
 
   @functools.wraps(fun)  # pyrefly: ignore[bad-argument-type]
@@ -231,7 +234,7 @@ def api_boundary[C](
   return cast(C, reraise_with_filtered_traceback)
 
 try:
-  # TODO: import from the final location
+  # TODO: 待最终位置确定后，从那里导入
   from jax._src import repro  # pyrefly: ignore[missing-module-attribute]
   repro_is_enabled = repro.is_enabled
 except (ImportError, AttributeError):

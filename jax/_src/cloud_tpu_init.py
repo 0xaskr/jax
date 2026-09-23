@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：在 Cloud TPU 虚拟机上自动完成 TPU 运行时所需的环境准备。
+# 它探测本机的 TPU 硬件与 libtpu 库路径，并在加载 TPU 运行时之前设置
+# 拓扑、平台与遥测相关的环境变量，还会对透明大页未开启等情况给出警告。
+# 模块同时提供 libtpu 版本比较工具，供其他组件判断可用特性。
+
 import logging
 import os
 import re
@@ -58,26 +63,25 @@ def jax_force_tpu_init() -> bool:
 
 
 def cloud_tpu_init() -> None:
-  """Automatically sets Cloud TPU topology and other env vars.
+  """自动设置 Cloud TPU 的拓扑以及其他环境变量。
 
-  **This must be called before the TPU runtime is loaded, which happens as soon
-  as JAX's C++ backend is loaded! I.e. call this before xla_bridge or xla_client
-  is imported.**
+  **必须在加载 TPU 运行时之前调用本函数，而 JAX 的 C++ 后端一被加载
+  TPU 运行时就会被加载！也就是说，要在导入 xla_bridge 或 xla_client 之前
+  调用它。**
 
-  Safe to call in non-Cloud TPU environments.
+  在非 Cloud TPU 环境中调用是安全的。
 
-  Some of these environment variables are used to tell the TPU runtime what kind
-  of mesh topology to use. It assumes a single-host topology by default, so we
-  manually set them here to default to the full pod slice if applicable.
+  其中一些环境变量用于告诉 TPU 运行时使用何种 mesh 拓扑。它默认假定为
+  单主机拓扑，因此我们在这里手动设置这些变量，以便在适用时默认为整个
+  pod 切片。
 
-  This will not set any env vars if a single topology-related env var is already
-  set.
+  若已设置任一与拓扑相关的环境变量，本函数不会设置任何环境变量。
   """
   global running_in_cloud_tpu_vm
 
   from jax import version
 
-  # Exit early if we're not running on a Cloud TPU VM or libtpu isn't installed.
+  # 若不在 Cloud TPU VM 上运行或没有安装 libtpu，则提前退出。
   libtpu_path = get_tpu_library_path()
   num_tpu_chips, tpu_id = hardware_utils.num_available_tpu_chips_and_device_id()
   if num_tpu_chips == 0:
@@ -111,13 +115,13 @@ def cloud_tpu_init() -> None:
         + ' --xla_tpu_use_enhanced_launch_barrier=true'
     )
 
-  # this makes tensorstore serialization work better on TPU
+  # 这能让 tensorstore 序列化在 TPU 上表现得更好
   os.environ.setdefault('TENSORSTORE_CURL_LOW_SPEED_TIME_SECONDS', '60')
   os.environ.setdefault('TENSORSTORE_CURL_LOW_SPEED_LIMIT_BYTES', '256')
 
-  # If the JAX_PLATFORMS env variable isn't set, config.jax_platforms defaults
-  # to None. In this case, we set it to 'tpu,cpu' to ensure that JAX uses the
-  # TPU backend.
+  # 若未设置 JAX_PLATFORMS 环境变量，config.jax_platforms 的默认值
+  # 为 None。这种情况下我们把它设为 'tpu,cpu'，以确保 JAX
+  # 会使用 TPU 后端。
   if config.jax_platforms.value is None:
     config.update('jax_platforms', 'tpu,cpu')
 
@@ -139,15 +143,14 @@ def _parse_version(v: str) -> tuple[int, ...]:
 
 
 def is_libtpu_at_least(version_str: str) -> bool:
-  """Returns True if not running on Cloud TPU.
+  """若不在 Cloud TPU 上运行则返回 True。
 
-  If running on Cloud TPU, returns True if the installed libtpu version
-  is at least `version_str`.
+  若在 Cloud TPU 上运行，则当已安装的 libtpu 版本不低于
+  `version_str` 时返回 True。
 
-  Note: This checks the version of the installed `libtpu` Python package.
-  If `TPU_LIBRARY_PATH` is set to a different path than the installed
-  package's default, a warning will be issued as the loaded library
-  might not match the package version we are checking.
+  Note: 这里检查的是已安装的 `libtpu` Python 包的版本。
+  若 `TPU_LIBRARY_PATH` 指向的路径与该包安装后的默认路径不同，
+  则会发出警告，因为实际加载的库可能与我们检查的包版本并不一致。
   """
   if not running_in_cloud_tpu_vm:
     return True

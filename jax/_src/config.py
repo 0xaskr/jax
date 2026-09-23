@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：JAX 运行时配置系统（`jax.config`）的核心实现，统一管理全部配置选项。
+# 每个选项同时对应环境变量、可选的 absl flag，以及一个 `State` 对象——后者既
+# 保存进程级取值，也可作为上下文管理器临时切换线程局部取值。
+# 本模块提供 `bool_state`/`enum_state`/`int_state` 等状态构造器，供本文件后续部分
+# 和各子模块声明 `jax_*` 配置；用户可通过 `config.update(...)` 或
+# `with config.jax_xxx(...)` 切换运行行为，相关状态可计入 JIT 缓存键与追踪上下文。
+
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -40,15 +47,15 @@ _T = TypeVar('_T')
 
 
 def bool_env(varname: str, default: bool) -> bool:
-  """Read an environment variable and interpret it as a boolean.
+  """读取环境变量并将其解释为布尔值。
 
-  True values are (case insensitive): 'y', 'yes', 't', 'true', 'on', and '1';
-  false values are 'n', 'no', 'f', 'false', 'off', and '0'.
+  真值（不区分大小写）为：'y'、'yes'、't'、'true'、'on' 和 '1'；
+  假值为 'n'、'no'、'f'、'false'、'off' 和 '0'。
 
   Args:
-    varname: the name of the variable
-    default: the default boolean value
-  Raises: ValueError if the environment variable is anything else.
+    varname: 变量名
+    default: 默认布尔值
+  Raises: 若环境变量为上述之外的任何值，则抛出 ValueError。
   """
   val = os.getenv(varname, str(default))
   val = val.lower()
@@ -60,16 +67,16 @@ def bool_env(varname: str, default: bool) -> bool:
     raise ValueError(f"invalid truth value {val!r} for environment {varname!r}")
 
 def int_env(varname: str, default: int) -> int:
-  """Read an environment variable and interpret it as an integer."""
+  """读取环境变量并将其解释为整数。"""
   return int(os.getenv(varname, str(default)))
 
 
 class ValueHolder[ValueType](Protocol):
-  """A holder for a configuration value.
+  """配置值的持有者。
 
-  There are two kinds of value holders: ``Flag``, which is assigned exactly
-  once and never modified after; and ``State``, which can be changed locally
-  within a thread via a context manager.
+  值持有者有两类：``Flag``，它恰好被赋值一次，
+  之后永不修改；以及 ``State``，它可以通过上下文
+  管理器在线程内被局部修改。
   """
 
   value: ValueType
@@ -122,13 +129,13 @@ class Config:
     self.meta[name] = (opt_type, meta_args, meta_kwargs)
 
   def config_with_absl(self):
-    """Registers absl flags for the JAX configs.
+    """为 JAX 配置注册 absl flag。
 
-    E.g., for each JAX config defined using bool_state(), this method
-    registers an absl boolean flag, with the same name.
+    例如，对于每个用 bool_state() 定义的 JAX 配置，本方法都会注册一个同名的
+    absl 布尔 flag。
 
-    This is the recommended method to call if you use `app.run(main)` and you
-    need JAX flags.
+    如果你使用 `app.run(main)` 并且需要
+    JAX flag，推荐调用本方法。
 
     Examples:
 
@@ -163,38 +170,38 @@ class Config:
     app.call_after_init(lambda: self.complete_absl_config(absl_flags))
 
   def complete_absl_config(self, absl_flags):
-    # NOTE: avoid calling from outside this module. Instead, use
-    # `config_with_absl()`, and (in rare cases) `parse_flags_with_absl()`.
+    # NOTE：避免从本模块外部调用本方法。请改用
+    # `config_with_absl()`，以及（极少数情况下）`parse_flags_with_absl()`。
     for name, holder in self._value_holders.items():
       try:
         flag = absl_flags.FLAGS[name]
       except KeyError:
-        # This can happen if a new flag was added after config_with_absl() was
-        # called, but before complete_absl_config was run. We could in principle
-        # add code to DEFINE_... to register any newly added flags with ABSL
-        # if config_with_absl() has already been called, but arguably the user
-        # should have called config_with_absl() later.
+        # 如果在调用 config_with_absl() 之后、运行 complete_absl_config 之前
+        # 新增了 flag，就会出现这种情况。原则上我们可以在 DEFINE_... 中加入
+        # 代码，以便在 config_with_absl() 已被调用时把新增的 flag 注册到
+        # ABSL，但更合理的做法或许是让用户晚一些再调用
+        # config_with_absl()。
         continue
       if flag.present:
         holder._set(flag.value)
 
   def parse_flags_with_absl(self):
-    """Parses command-line args that start with --jax.
+    """解析以 --jax 开头的命令行参数。
 
-    This method should be used only by advanced users. Most users should use
-    :meth:`config_with_absl` instead.
+    本方法只应供高级用户使用。大多数用户应改用
+    :meth:`config_with_absl`。
 
-    This method has serious limitations: e.g., although it parses only the
-    --jax* command-line args, it runs the validators of all registered absl
-    flags, even non-JAX ones that have not been set yet; as such, for the
-    non-JAX flags, the validators run on the default flag values, not on the
-    values indicated by the command-line args.
+    本方法有严重的局限：例如，尽管它只解析
+    --jax* 命令行参数，却会运行所有已注册 absl
+    flag 的校验器，甚至包括尚未设置的非 JAX
+    flag；因此对于非 JAX flag，校验器作用在
+    flag 的默认值上，而不是命令行参数所指示的值上。
     """
     global already_configured_with_absl
     if not already_configured_with_absl:
-      # Extract just the --jax... flags (before the first --) from argv. In some
-      # environments (e.g. ipython/colab) argv might be a mess of things
-      # parseable by absl and other junk.
+      # 只从 argv 中提取 --jax... 这些 flag（位于第一个 -- 之前）。在某些
+      # 环境（例如 ipython/colab）中，argv 可能混杂着 absl 可解析的内容以及
+      # 其他无用内容。
       jax_argv = itertools.takewhile(lambda a: a != '--', sys.argv)
       jax_argv = ['', *(a for a in jax_argv if a.startswith('--jax'))]
 
@@ -278,9 +285,9 @@ class State(config_ext.Config[_T]):
     return StateContextManager(self, new_val)
 
   def _add_hooks(self, update_global_hook, update_thread_local_hook):
-    """Private method that adds hooks to an existing context-manager.
+    """为已有上下文管理器添加钩子的私有方法。
 
-    Used to avoid cyclic import dependencies."""
+    用于避免循环导入依赖。"""
     self._update_thread_local_hook = update_thread_local_hook
     self._update_global_hook = update_global_hook
     update_global_hook(self.get_global())
@@ -294,10 +301,10 @@ class StateContextManager[FuncType: Callable[..., Any]]:
 
     if new_val is no_default:
       if state._default_context_manager_value is not no_default:
-        new_val = state._default_context_manager_value  # default_context_manager_value provided to constructor
+        new_val = state._default_context_manager_value  # 构造函数已提供 default_context_manager_value
       else:
-        # no default_value provided to constructor and no value provided as an
-        # argument, so we raise an error
+        # 构造函数未提供 default_value，调用时也未提供作为参数的值，
+        # 因此抛出错误
         raise TypeError(f"Context manager for {state.__name__} config option "
                         "requires an argument representing the new value for "
                         "the config option.")
@@ -349,40 +356,40 @@ def bool_state(
     include_in_trace_context: bool = False,
     validator: Callable[[str], None] | None = None,
 ) -> State[bool]:
-  """Set up thread-local state and return a contextmanager for managing it.
+  """设置线程局部状态，并返回用于管理它的上下文管理器。
 
-  This function is a convenience wrapper. It defines a flag, environment
-  variable, and corresponding thread-local state, which can be managed via the
-  contextmanager it returns.
+  本函数是一个便捷包装器。它定义一个 flag、一个环境变量，
+  以及对应的线程局部状态，这些都可以通过它返回的
+  上下文管理器来管理。
 
-  The thread-local state value can be read via the ``config.<option_name>``
-  attribute, where ``config`` is the singleton ``Config`` instance.
+  线程局部状态的值可以通过 ``config.<option_name>``
+  属性读取，其中 ``config`` 是单例 ``Config`` 实例。
 
   Args:
-    name: string, converted to lowercase to define the name of the config
-      option (and absl flag). It is converted to uppercase to define the
-      corresponding shell environment variable.
-    default: boolean, a default value for the option.
-    help: string, used to populate the flag help information as well as the
-      docstring of the returned context manager.
-    update_global_hook: a optional callback that is called with the updated
-      value of the global state when it is altered or set initially.
-    update_thread_local_hook: a optional callback that is called with the
-      updated value of the thread-local state when it is altered or set
-      initially.
-    upgrade: optional indicator that this flag controls a canonical feature
-      upgrade, so that it is `True` for the incoming functionality, `False`
-      for the outgoing functionality to be deprecated.
-    extra_description: string, optional: extra information to add to the
-      summary description.
-    include_in_jit_key: bool, optional: whether to include the state in the
-      JIT cache key.
-    include_in_trace_context: bool, optional: whether to include the state in
-      the trace context.
-    validator: optional function to validate the value of the config option.
+    name: 字符串，会被转换为小写以定义配置选项（以及
+      absl flag）的名字。它会被转换为大写，以定义
+      对应的 shell 环境变量。
+    default: 布尔值，该选项的默认值。
+    help: 字符串，用于填充 flag 的帮助信息，同时也作为
+      所返回上下文管理器的文档字符串。
+    update_global_hook: 可选回调，在全局状态被修改或
+      初次设置时，会以更新后的取值调用它。
+    update_thread_local_hook: 可选回调，当线程局部状态被
+      修改或初次设置时，会以更新后的取值
+      调用它。
+    upgrade: 可选指示符，表示该 flag 控制一项规范的
+      功能升级，因此对即将引入的功能为 `True`，对
+      将要废弃的旧功能为 `False`。
+    extra_description: 字符串，可选：要添加到
+      摘要描述中的额外信息。
+    include_in_jit_key: 布尔值，可选：是否将该状态纳入
+      JIT 缓存键。
+    include_in_trace_context: 布尔值，可选：是否将该状态纳入
+      追踪上下文。
+    validator: 可选函数，用于校验该配置选项的值。
 
   Returns:
-    A contextmanager to control the thread-local state value.
+    用于控制线程局部状态取值的上下文管理器。
 
   Examples:
 
@@ -391,18 +398,18 @@ def bool_state(
         default=False,
         help='Enable foo.')
 
-    # Now the JAX_ENABLE_FOO shell environment variable and --jax_enable_foo
-    # command-line flag can be used to control the process-level value of
-    # the configuration option, in addition to using e.g.
-    # ``config.update("jax_enable_foo", True)`` directly. We can also use a
-    # context manager:
+    # 现在可以用 JAX_ENABLE_FOO shell 环境变量和 --jax_enable_foo
+    # 命令行 flag 控制该配置选项在进程级的取值，此外还可以
+    # 直接使用例如
+    # ``config.update("jax_enable_foo", True)``。我们也可以使用
+    # 上下文管理器：
 
     with enable_foo(True):
       ...
 
-  The value of the thread-local state or flag can be accessed via
-  ``config.jax_enable_foo``. Reading it via ``config.FLAGS.jax_enable_foo`` is
-  an error.
+  线程局部状态或 flag 的值可以通过
+  ``config.jax_enable_foo`` 访问。通过 ``config.FLAGS.jax_enable_foo``
+  读取它会报错。
   """
   if not isinstance(default, bool):
     raise TypeError(f"Default value must be of type bool, got {default} "
@@ -479,26 +486,26 @@ def enum_state(
     include_in_trace_context: bool = False,
     extra_validator: Callable[[str], None] | None = None,
 ) -> State[str]:
-  """Set up thread-local state and return a contextmanager for managing it.
+  """设置线程局部状态，并返回用于管理它的上下文管理器。
 
-  See docstring for ``bool_state``.
+  参见 ``bool_state`` 的文档字符串。
 
   Args:
-    name: string, converted to lowercase to define the name of the config
-      option (and absl flag). It is converted to uppercase to define the
-      corresponding shell environment variable.
-    enum_values: list of strings representing the possible values for the
-      option.
-    default: string, default value.
-    help: string, used to populate the flag help information as well as the
-      docstring of the returned context manager.
-    include_in_jit_key: bool, optional: whether to include the state in the
-      JIT cache key.
-    extra_validator: optional function to validate the value of the config
-      option.
+    name: 字符串，会被转换为小写以定义配置选项（以及
+      absl flag）的名字。它会被转换为大写，以定义
+      对应的 shell 环境变量。
+    enum_values: 字符串列表，表示该选项
+      可能的取值。
+    default: 字符串，默认值。
+    help: 字符串，用于填充 flag 的帮助信息，同时也作为
+      所返回上下文管理器的文档字符串。
+    include_in_jit_key: 布尔值，可选：是否将该状态纳入
+      JIT 缓存键。
+    extra_validator: 可选函数，用于校验该配置选项
+      的值。
 
   Returns:
-    A contextmanager to control the thread-local state value.
+    用于控制线程局部状态取值的上下文管理器。
   """
   if not isinstance(default, str):
     raise TypeError(f"Default value must be of type str, got {default} "
@@ -547,22 +554,22 @@ def optional_enum_state(
     include_in_jit_key: bool = False,
     include_in_trace_context: bool = False,
 ) -> State[str | None]:
-  """Set up thread-local state and return a contextmanager for managing it.
+  """设置线程局部状态，并返回用于管理它的上下文管理器。
 
-  See docstring for ``bool_state``.
+  参见 ``bool_state`` 的文档字符串。
 
   Args:
-    name: string, converted to lowercase to define the name of the config
-      option (and absl flag). It is converted to uppercase to define the
-      corresponding shell environment variable.
-    enum_values: list of strings representing the possible values for the
-      option.
-    default: optional string, default value.
-    help: string, used to populate the flag help information as well as the
-      docstring of the returned context manager.
+    name: 字符串，会被转换为小写以定义配置选项（以及
+      absl flag）的名字。它会被转换为大写，以定义
+      对应的 shell 环境变量。
+    enum_values: 字符串列表，表示该选项
+      可能的取值。
+    default: 可选字符串，默认值。
+    help: 字符串，用于填充 flag 的帮助信息，同时也作为
+      所返回上下文管理器的文档字符串。
 
   Returns:
-    A contextmanager to control the thread-local state value.
+    用于控制线程局部状态取值的上下文管理器。
   """
   if default is not None and not isinstance(default, str):
     raise TypeError(f"Default value must be of type str or None, got {default} "
@@ -606,27 +613,27 @@ def enum_class_state[EnumType: enum.Enum](
     include_in_trace_context: bool = False,
     extra_validator: Callable[[EnumType], None] | None = None,
 ) -> State[EnumType]:
-  """Set up thread-local state and return a contextmanager for managing it.
+  """设置线程局部状态，并返回用于管理它的上下文管理器。
 
-  See docstring for ``bool_state``.
+  参见 ``bool_state`` 的文档字符串。
 
   Args:
-    name: string, converted to lowercase to define the name of the config
-      option (and absl flag). It is converted to uppercase to define the
-      corresponding shell environment variable.
-    enum_class: a subtype of enum.Enum.
-    default: an instance of enum_class that is the default value.
-    help: string, used to populate the flag help information as well as the
-      docstring of the returned context manager.
-    include_in_jit_key: bool, optional: whether to include the state in the
-      JIT cache key.
-    include_in_trace_context: bool, optional: whether to include the state in
-      the trace context.
-    extra_validator: optional function to validate the value of the config
-      option.
+    name: 字符串，会被转换为小写以定义配置选项（以及
+      absl flag）的名字。它会被转换为大写，以定义
+      对应的 shell 环境变量。
+    enum_class: enum.Enum 的子类型。
+    default: enum_class 的一个实例，作为默认值。
+    help: 字符串，用于填充 flag 的帮助信息，同时也作为
+      所返回上下文管理器的文档字符串。
+    include_in_jit_key: 布尔值，可选：是否将该状态纳入
+      JIT 缓存键。
+    include_in_trace_context: 布尔值，可选：是否将该状态
+      纳入追踪上下文。
+    extra_validator: 可选函数，用于校验该配置选项
+      的值。
 
   Returns:
-    A contextmanager to control the thread-local state value.
+    用于控制线程局部状态取值的上下文管理器。
   """
   if not isinstance(default, enum_class):
     raise TypeError(
@@ -684,20 +691,20 @@ def int_state(
     include_in_trace_context: bool = False,
     validator: Callable[[Any], None] | None = None,
 ) -> State[int]:
-  """Set up thread-local state and return a contextmanager for managing it.
+  """设置线程局部状态，并返回用于管理它的上下文管理器。
 
-  See docstring for ``bool_state``.
+  参见 ``bool_state`` 的文档字符串。
 
   Args:
-    name: string, converted to lowercase to define the name of the config
-      option (and absl flag). It is converted to uppercase to define the
-      corresponding shell environment variable.
-    default: optional int, default value.
-    help: string, used to populate the flag help information as well as the
-      docstring of the returned context manager.
+    name: 字符串，会被转换为小写以定义配置选项（以及
+      absl flag）的名字。它会被转换为大写，以定义
+      对应的 shell 环境变量。
+    default: 可选整数，默认值。
+    help: 字符串，用于填充 flag 的帮助信息，同时也作为
+      所返回上下文管理器的文档字符串。
 
   Returns:
-    A contextmanager to control the thread-local state value.
+    用于控制线程局部状态取值的上下文管理器。
   """
   if not isinstance(default, int):
     raise TypeError(f"Default value must be of type int, got {default} "
@@ -736,20 +743,20 @@ def float_state(
     update_global_hook: Callable[[float], None] | None = None,
     update_thread_local_hook: Callable[[float | None], None] | None = None,
 ) -> State[float]:
-  """Set up thread-local state and return a contextmanager for managing it.
+  """设置线程局部状态，并返回一个用于管理它的 contextmanager。
 
-  See docstring for ``bool_state``.
+  参见 ``bool_state`` 的文档字符串。
 
   Args:
-    name: string, converted to lowercase to define the name of the config
-      option (and absl flag). It is converted to uppercase to define the
-      corresponding shell environment variable.
-    default: default value.
-    help: string, used to populate the flag help information as well as the
-      docstring of the returned context manager.
+    name: 字符串，会转换为小写以定义配置项（以及 absl flag）的名称。
+      它会被转换为大写以定义
+      对应的 shell 环境变量。
+    default: 默认值。
+    help: 字符串，用于填充 flag 的帮助信息，以及所返回的 context manager
+      的文档字符串。
 
   Returns:
-    A contextmanager to control the thread-local state value.
+    一个用于控制线程局部状态值的 contextmanager。
   """
   if not isinstance(default, float):
     raise TypeError(f"Default value must be of type float, got {default} "
@@ -785,25 +792,25 @@ def string_state(
     update_global_hook: Callable[[str], None] | None = None,
     update_thread_local_hook: Callable[[str | None], None] | None = None,
 ) -> State[str]:
-  """Set up thread-local state and return a contextmanager for managing it.
+  """设置线程局部状态，并返回一个用于管理它的 contextmanager。
 
-  See docstring for ``bool_state``.
+  参见 ``bool_state`` 的文档字符串。
 
   Args:
-    name: string, converted to lowercase to define the name of the config
-      option (and absl flag). It is converted to uppercase to define the
-      corresponding shell environment variable.
-    default: string, a default value for the option.
-    help: string, used to populate the flag help information as well as the
-      docstring of the returned context manager.
-    update_global_hook: an optional callback that is called with the updated
-      value of the global state when it is altered or set initially.
-    update_thread_local_hook: an optional callback that is called with the
-      updated value of the thread-local state when it is altered or set
-      initially.
+    name: 字符串，会转换为小写以定义配置项（以及 absl flag）的名称。
+      它会被转换为大写以定义
+      对应的 shell 环境变量。
+    default: 字符串，该配置项的默认值。
+    help: 字符串，用于填充 flag 的帮助信息，以及所返回的 context manager
+      的文档字符串。
+    update_global_hook: 可选回调，当全局状态的值被修改或首次设置时，
+      会以更新后的值调用它。
+    update_thread_local_hook: 可选回调，当线程局部状态的值被修改或
+      首次设置时，会以更新后的
+      值调用它。
 
   Returns:
-    A contextmanager to control the thread-local state value.
+    一个用于控制线程局部状态值的 contextmanager。
   """
   if not isinstance(default, str):
     raise TypeError(f"Default value must be of type str, got {default} "
@@ -830,25 +837,25 @@ def optional_string_state(
     update_thread_local_hook: Callable[[str | None], None] | None = None,
     include_in_trace_context: bool = False,
 ) -> State[str | None]:
-  """Set up thread-local state and return a contextmanager for managing it.
+  """设置线程局部状态，并返回一个用于管理它的 contextmanager。
 
-  See docstring for ``bool_state``.
+  参见 ``bool_state`` 的文档字符串。
 
   Args:
-    name: string, converted to lowercase to define the name of the config
-      option (and absl flag). It is converted to uppercase to define the
-      corresponding shell environment variable.
-    default: optional string, a default value for the option.
-    help: string, used to populate the flag help information as well as the
-      docstring of the returned context manager.
-    update_global_hook: an optional callback that is called with the updated
-      value of the global state when it is altered or set initially.
-    update_thread_local_hook: an optional callback that is called with the
-      updated value of the thread-local state when it is altered or set
-      initially.
+    name: 字符串，会转换为小写以定义配置项（以及 absl flag）的名称。
+      它会被转换为大写以定义
+      对应的 shell 环境变量。
+    default: 可选的字符串，该配置项的默认值。
+    help: 字符串，用于填充 flag 的帮助信息，以及所返回的 context manager
+      的文档字符串。
+    update_global_hook: 可选回调，当全局状态的值被修改或首次设置时，
+      会以更新后的值调用它。
+    update_thread_local_hook: 可选回调，当线程局部状态的值被修改或
+      首次设置时，会以更新后的
+      值调用它。
 
   Returns:
-    A contextmanager to control the thread-local state value.
+    一个用于控制线程局部状态值的 contextmanager。
   """
   if default is not None and not isinstance(default, str):
     raise TypeError(f"Default value must be of type str or None, got {default} "
@@ -877,30 +884,30 @@ def string_or_object_state(
     include_in_jit_key: bool = False,
     include_in_trace_context: bool = False,
 ) -> State[Any]:
-  """Set up thread-local state and return a contextmanager for managing it.
+  """设置线程局部状态，并返回一个用于管理它的 contextmanager。
 
-  Similar to ``string_state``, except the context manager will accept
-  any object, not just a string. Any value passed via command line flag or
-  environment variable will be treated as a string.
+  与 ``string_state`` 类似，区别在于该 context manager 可以接受任何对象，
+  而不只是字符串。任何通过命令行 flag 或环境变量传入的
+  值都会被当作字符串处理。
 
   Args:
-    name: string, converted to lowercase to define the name of the config
-      option (and absl flag). It is converted to uppercase to define the
-      corresponding shell environment variable.
-    default: string, a default value for the option.
-    help: string, used to populate the flag help information as well as the
-      docstring of the returned context manager.
-    update_global_hook: an optional callback that is called with the updated
-      value of the global state when it is altered or set initially.
-    update_thread_local_hook: an optional callback that is called with the
-      updated value of the thread-local state when it is altered or set
-      initially.
-    validator: an optional callback that is called with the new
-      value on any update, and should raise an error if the new value is
-      invalid.
+    name: 字符串，会转换为小写以定义配置项（以及 absl flag）的名称。
+      它会被转换为大写以定义
+      对应的 shell 环境变量。
+    default: 字符串，该配置项的默认值。
+    help: 字符串，用于填充 flag 的帮助信息，以及所返回的 context manager
+      的文档字符串。
+    update_global_hook: 可选回调，当全局状态的值被修改或首次设置时，
+      会以更新后的值调用它。
+    update_thread_local_hook: 可选回调，当线程局部状态的值被修改或
+      首次设置时，会以更新后的
+      值调用它。
+    validator: 可选回调，在每次更新时都会以新值调用它；
+      如果新值无效，它应当
+      抛出错误。
 
   Returns:
-    A contextmanager to control the thread-local state value.
+    一个用于控制线程局部状态值的 contextmanager。
   """
   name = name.lower()
   default = os.getenv(name.upper(), default)
@@ -1053,15 +1060,15 @@ class UserConfig:
 
 
 def make_user_context(default_value=None):
-  """Creates a `jax.jit` cache sensitive context.
+  """创建一个对 `jax.jit` 缓存敏感（cache sensitive）的上下文。
 
-  If the value of the context changes, JAX's tracing, lowering and compilation
-  cache won't get a hit and the jitted function will be re-traced, re-lowered
-  and re-compiled.
+  如果该上下文的值发生变化，JAX 的追踪、降级与编译
+  缓存都不会命中，被 jit 的函数将被重新追踪、
+  重新降级并重新编译。
 
-  Adding new user contexts is not thread-safe. Do not call make_user_context
-  concurrently with other JAX APIs. However, using a user context once it has
-  been constructed is thread-safe.
+  新增用户上下文不是线程安全的。不要与其他 JAX API
+  并发调用 make_user_context。不过，一旦用户上下文
+  构造完成，使用它就是线程安全的。
 
   Example:
 
@@ -1074,14 +1081,14 @@ def make_user_context(default_value=None):
   with my_context(1):
     f(1.)
   with my_context(2):
-    f(1.)  # tracing cache miss
+    f(1.)  # 追踪缓存未命中
   ```
   """
   return UserConfig(default_value)
 
 jax_jit_cpp_cache_obj = make_user_context(None)
 
-# TODO(b/214340779): remove flag when XLA:CPU is improved.
+# TODO(b/214340779): 待 XLA:CPU 改进后移除该 flag。
 jax2tf_associative_scan_reductions = bool_state(
     name='jax2tf_associative_scan_reductions',
     default=False,
@@ -1110,7 +1117,7 @@ jax2tf_default_native_serialization = bool_state(
 
 jax_serialization_version = int_state(
     name='jax_serialization_version',
-    default=int_env('JAX_SERIALIZATION_VERSION', 0),  # We use 0 to detect default.
+    default=int_env('JAX_SERIALIZATION_VERSION', 0),  # 用 0 来检测默认值。
     help=(
         'DEPRECATED: use jax_export_calling_convention_version.'
     )
@@ -1118,10 +1125,10 @@ jax_serialization_version = int_state(
 
 jax_export_calling_convention_version = int_state(
     name='jax_export_calling_convention_version',
-    # Note: bump the default calling convention version at least one month after
-    # we update XlaCallModule to support the new version, so that serialized
-    # modules are forward compatible with deployed versions of XlaCallModule.
-    # Version 10 of XlaCallModule is supported since May 20th, 2025.
+    # 注意：在更新 XlaCallModule 以支持新版本之后，至少再等一个月才提升
+    # 默认的调用约定版本，这样序列化后的模块才能与已部署的
+    # XlaCallModule 版本保持向前兼容。
+    # XlaCallModule 的第 10 版自 2025 年 5 月 20 日起获得支持。
     default=int_env('JAX_EXPORT_CALLING_CONVENTION_VERSION', 10),
     help=(
         'The calling convention version number to use for exporting. This must be '
@@ -1458,10 +1465,10 @@ embedded_constants_max_bytes = int_state(
     include_in_jit_key=True,
     include_in_trace_context=True)
 
-# This config is temporary and should go away since this is a user problem.
-# If they don't want 1 sized mesh axis names to show up in sharding and vma
-# bits on ShapedArray, then their mesh (which they pass to set_mesh) should not
-# contain those axes at all.
+# 这个配置是临时性的，本应被移除，因为问题出在用户侧。
+# 如果用户不希望大小为 1 的 mesh 轴名出现在 sharding 与 vma
+# 位（位于 ShapedArray 上）中，那么他们传给 set_mesh 的 mesh
+# 就根本不应该包含这些轴。
 remove_size_one_mesh_axis_from_type = bool_state(
     name='jax_remove_size_one_mesh_axis_from_type',
     default=False,
@@ -1469,7 +1476,7 @@ remove_size_one_mesh_axis_from_type = bool_state(
     include_in_jit_key=True,
     include_in_trace_context=True)
 
-# TODO make it so people don't use this, this is internal...
+# TODO 想办法让人们不要使用这个，它属于内部实现...
 _check_vma = bool_state(
     name='check_vma',
     default=False,
@@ -1515,7 +1522,7 @@ persistent_cache_min_entry_size_bytes = int_state(
           '  filesystem being used for the cache. '
           '* > 0: the actual minimum size desired; no overrides.'))
 
-# TODO: Change default to all
+# TODO: 把默认值改为 all
 persistent_cache_enable_xla_caches = optional_string_state(
     name='jax_persistent_cache_enable_xla_caches',
     default='xla_gpu_per_fusion_autotune_cache_dir',
@@ -1729,8 +1736,8 @@ disallow_mesh_context_manager = bool_state(
     ),
 )
 
-# TODO(ayx): Move these 3 flags out of config once we have a user-level
-# extension mechanism for adding contexts to which the jit cache is sensitive.
+# TODO(ayx): 等我们有了用户级的扩展机制、可以添加 jit 缓存敏感的上下文
+# 之后，就把这 3 个 flag 从 config 中移出去。
 error_checking_behavior_nan = enum_state(
     name='jax_error_checking_behavior_nan',
     enum_values=['ignore', 'raise'],
@@ -1776,7 +1783,7 @@ enable_x64 = bool_state(
 
 jax_jit.set_enable_x64_state(enable_x64)
 
-# TODO(phawkins): remove after fixing users of FLAGS.x64_enabled.
+# TODO(phawkins): 修好 FLAGS.x64_enabled 的使用者后移除。
 config._contextmanager_flags.remove('jax_enable_x64')
 
 setattr(Config, "x64_enabled", property(lambda _: enable_x64.value))
@@ -1785,8 +1792,8 @@ def _validate_default_device(val):
   if (val is not None and
       not isinstance(val, xla_client.Device) and
       val not in ['cpu', 'gpu', 'tpu']):
-    # TODO(skyewm): this is a workaround for non-PJRT Device types. Remove when
-    # all JAX backends use a single C++ device interface.
+    # TODO(skyewm): 这是针对非 PJRT Device 类型的变通方案。等所有 JAX 后端
+    # 都改用统一的 C++ 设备接口后即可移除。
     if 'Device' in str(type(val)):
       logger.info(
           'Allowing non-`xla_client.Device` default device: %s, type: %s',
@@ -1837,9 +1844,9 @@ auto_pcast = bool_state(
 default_matmul_precision = optional_enum_state(
     name='jax_default_matmul_precision',
     enum_values=[
-        # Legacy precision API values
+        # 旧版精度 API 取值
         'default', 'high', 'highest', 'bfloat16', 'tensorfloat32', 'float32',
-        # Dot algorithm presets
+        # dot 算法预设
         'ANY_F8_ANY_F8_F32', 'ANY_F8_ANY_F8_F32_FAST_ACCUM', 'ANY_F8_ANY_F8_ANY',
         'ANY_F8_ANY_F8_ANY_FAST_ACCUM', 'F16_F16_F16', 'F16_F16_F32',
         'BF16_BF16_BF16', 'BF16_BF16_F32', 'BF16_BF16_F32_X3',
@@ -1897,7 +1904,7 @@ traceback_filtering = enum_state(
          "a brief message (to the ``__cause__`` of the exception) describing that this has "
          "happened.\n\n")
 
-# TODO(rdyro): Remove once we always enable emit_pipeline primitive.
+# TODO(rdyro): 等我们始终启用 emit_pipeline 原语后移除。
 use_emit_pipeline_primitive = bool_state(
     name = 'jax_use_emit_pipeline_primitive',
     default=False,
@@ -1906,15 +1913,15 @@ use_emit_pipeline_primitive = bool_state(
     include_in_trace_context=True)
 
 
-# This flag is for internal use.
-# TODO(tianjianlu): Removes once we always enable cusparse lowering.
-# TODO(b/262050896): Set to true after bug is fixed
+# 这个 flag 供内部使用。
+# TODO(tianjianlu): 等我们始终启用 cusparse 降级后移除。
+# TODO(b/262050896): bug 修复后设为 true
 bcoo_cusparse_lowering = bool_state(
     name='jax_bcoo_cusparse_lowering',
     default=False,
     help=('Enables lowering BCOO ops to cuSparse.'))
 
-# This is for stackless backward compat with e.g. equinox
+# 这是为了与 equinox 等实现保持无栈（stackless）向后兼容
 eager_constant_folding = bool_state(
     name='eager_constant_folding',
     default=False,
@@ -1955,7 +1962,7 @@ mutable_array_checks = bool_state(
     help='Enable error checks for mutable arrays that rule out aliasing.',
     include_in_trace_context=True)
 
-# TODO(mattjj, yashkatariya): remove once we land box plumbing
+# TODO(mattjj, yashkatariya): 等我们落地 box plumbing 后移除
 disable_bwd_checks = bool_state(
     name='jax_disable_bwd_checks',
     default=False,
@@ -1994,7 +2001,7 @@ jax_xla_profile_version = int_state(
 
 @contextlib.contextmanager
 def explicit_device_put_scope() -> Generator[None]:
-  """Indicates that the current context is an explicit device_put*() call."""
+  """表示当前上下文是一次显式的 device_put*() 调用。"""
   state = guard_lib.thread_local_state()
   prev = state.explicit_device_put
   state.explicit_device_put = True
@@ -2005,7 +2012,7 @@ def explicit_device_put_scope() -> Generator[None]:
 
 @contextlib.contextmanager
 def explicit_device_get_scope() -> Generator[None]:
-  """Indicates that the current context is an explicit device_get() call."""
+  """表示当前上下文是一次显式的 device_get() 调用。"""
   state = guard_lib.thread_local_state()
   prev = state.explicit_device_get
   state.explicit_device_get = True
@@ -2015,7 +2022,7 @@ def explicit_device_get_scope() -> Generator[None]:
     state.explicit_device_get = prev
 
 def _update_transfer_guard(state, key, val):
-  """Applies the transfer guard level within guard_lib."""
+  """在 `guard_lib` 中应用传输防护等级。"""
   if val is None:
     setattr(state, key, None)
   elif val == 'allow':
@@ -2036,8 +2043,8 @@ transfer_guard_host_to_device = optional_enum_state(
     enum_values=[
         'allow', 'log', 'disallow', 'log_explicit', 'disallow_explicit'
     ],
-    # The default is applied by guard_lib. Use None here to avoid accidentally
-    # overriding --jax_transfer_guard.
+    # 默认值由 guard_lib 应用。这里用 None，以免意外
+    # 覆盖 --jax_transfer_guard。
     default=None,
     help=('Select the transfer guard level for host-to-device transfers. '
           'Default is "allow".'),
@@ -2051,8 +2058,8 @@ transfer_guard_device_to_device = optional_enum_state(
     enum_values=[
         'allow', 'log', 'disallow', 'log_explicit', 'disallow_explicit'
     ],
-    # The default is applied by guard_lib. Use None here to avoid accidentally
-    # overriding --jax_transfer_guard.
+    # 默认值由 guard_lib 应用。这里用 None，以免意外
+    # 覆盖 --jax_transfer_guard。
     default=None,
     help=('Select the transfer guard level for device-to-device transfers. '
           'Default is "allow".'),
@@ -2066,8 +2073,8 @@ transfer_guard_device_to_host = optional_enum_state(
     enum_values=[
         'allow', 'log', 'disallow', 'log_explicit', 'disallow_explicit'
     ],
-    # The default is applied by guard_lib. Use None here to avoid
-    # accidentally overriding --jax_transfer_guard.
+    # 默认值由 guard_lib 应用。这里用 None，以免
+    # 意外覆盖 --jax_transfer_guard。
     default=None,
     help=('Select the transfer guard level for device-to-host transfers. '
           'Default is "allow".'),
@@ -2088,8 +2095,8 @@ _transfer_guard = optional_enum_state(
     enum_values=[
         'allow', 'log', 'disallow', 'log_explicit', 'disallow_explicit'
     ],
-    # The default is applied by guard_lib. Use None here to avoid accidentally
-    # overriding --jax_transfer_guard_*.
+    # 默认值由 guard_lib 应用。这里用 None，以免意外
+    # 覆盖 --jax_transfer_guard_*。
     default=None,
     help=('Select the transfer guard level for all transfers. This option is '
           'set-only; the transfer guard level for a specific direction should '
@@ -2099,13 +2106,13 @@ _transfer_guard = optional_enum_state(
 
 @contextlib.contextmanager
 def transfer_guard(new_val: str) -> Generator[None]:
-  """A contextmanager to control the transfer guard level for all transfers.
+  """用于控制所有传输的传输防护等级的上下文管理器。
 
-  For more information, see
+  更多信息请见
   https://docs.jax.dev/en/latest/transfer_guard.html
 
   Args:
-    new_val: The new thread-local transfer guard level for all transfers.
+    new_val: 所有传输的新线程局部传输防护等级。
 
   Yields:
     None.
@@ -2119,7 +2126,7 @@ def transfer_guard(new_val: str) -> Generator[None]:
 
 
 def _update_garbage_collection_guard(state, key, val):
-  """Applies the transfer guard level within guard_lib."""
+  """在 `guard_lib` 中应用传输防护等级。"""
   if val is None:
     setattr(state, key, None)
   elif val == 'allow':
@@ -2134,7 +2141,7 @@ def _update_garbage_collection_guard(state, key, val):
 array_garbage_collection_guard = optional_enum_state(
     name='jax_array_garbage_collection_guard',
     enum_values=['allow', 'log', 'fatal'],
-    # The default is applied by guard_lib.
+    # 默认值由 guard_lib 应用。
     default=None,
     help=(
         'Select garbage collection guard level for ``jax.Array`` objects.\n\n'
@@ -2168,7 +2175,7 @@ thread_guard = bool_state(
         'processes, leading to non-deterministic crashes.'
     ),
     update_thread_local_hook=(
-        # If the state is None, set it to False.
+        # 若该状态为 None，则把它设为 False。
         lambda val: guard_lib.update_thread_guard_global_state(val or False)),
 )
 
@@ -2207,7 +2214,7 @@ send_traceback_to_runtime = enum_class_state(
         val.as_cpp_enum() if val is not None else None),
 )
 
-# Don't define a context manager since this isn't threadsafe.
+# 不要定义上下文管理器，因为这里不是线程安全的。
 string_state(
     name='jax_debug_log_modules',
     default='',
@@ -2216,7 +2223,7 @@ string_state(
           'for.'),
     update_global_hook=logging_config.update_debug_log_modules)
 
-# Don't define a context manager since this isn't threadsafe.
+# 不要定义上下文管理器，因为这里不是线程安全的。
 optional_enum_state(
     name='jax_logging_level',
     enum_values=['NOTSET', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
@@ -2326,7 +2333,7 @@ jax_include_debug_info_in_dumps = bool_flag(
         'be preserved in the IR dump. To avoid exposing source code and '
         'potentially sensitive information, set to false ')
 
-# TODO(dsuo): Turn this into a list-valued flag.
+# TODO(dsuo): 把它改造成取值为列表的 flag。
 jax_dump_ir_modes = string_flag(
     name="jax_dump_ir_modes",
     default=os.getenv("JAX_DUMP_IR_MODES", "stablehlo"),

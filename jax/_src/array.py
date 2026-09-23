@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 `jax.Array` 的数组表示与分片基础设施。
+# 核心类 `ArrayImpl`（经 `use_cpp_class` 映射到 C++ 的 `xc.ArrayImpl`）把全局
+# 形状、`Sharding` 分片方案与每个可寻址设备的本地缓冲区统一封装为惰性、可能跨
+# 进程的数组，并提供 `Shard` 视图、主机拷贝、删除检测、DLPack 等接口。
+# 同文件还提供 `make_array_from_callback` 等构造入口，并向 pxla 注册分片参数
+# 与全局结果处理器，是 `jax.device_put` 与分布式分片机制的关键实现。
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -56,7 +63,7 @@ zip, unsafe_zip = safe_zip, zip
 Shape = tuple[int, ...]
 Device = xc.Device
 Index = tuple[slice, ...]
-PRNGKeyArray = Any  # TODO(jakevdp): fix cycles and import this.
+PRNGKeyArray = Any  # TODO(jakevdp): 修复循环依赖并改为导入它。
 
 def _get_device(a: ArrayImpl) -> Device:
   devices = a.sharding._internal_device_list
@@ -68,15 +75,14 @@ def _get_device(a: ArrayImpl) -> Device:
 
 
 class Shard:
-  """A single data shard of an Array.
+  """`Array` 的单个数据分片。
 
   Attributes:
-    device : Which device this shard resides on.
-    index : The index into the global array of this shard.
-    replica_id : Integer id indicating which replica of the global array this
-      shard is part of. Always 0 for fully sharded data
-      (i.e. when there’s only 1 replica).
-    data : The data of this shard. None if ``device`` is non-local.
+    device : 该分片所在的设备。
+    index : 该分片在全局数组中的索引。
+    replica_id : 整数 id，表示该分片属于全局数组的哪个副本。对于完全分片数据
+      （即只有 1 个副本时）始终为 0。
+    data : 该分片的数据。若 ``device`` 非本地，则为 None。
   """
 
   def __init__(self, device: Device, sharding: Sharding, global_shape: Shape,
@@ -119,7 +125,7 @@ class Shard:
 
 
 def _reconstruct_array(fun, args, arr_state, aval_state):
-  """Method to reconstruct a device array from a serialized state."""
+  """从序列化状态重建设备数组的方法。"""
   np_value = fun(*args)
   np_value.__setstate__(arr_state)
   jnp_value = api.device_put(np_value)
@@ -142,7 +148,7 @@ def _cached_index_calc(s, shape):
 
 @cache(max_size=4096, trace_context_in_key=False)
 def _process_has_full_value_in_mcjax(s, shape):
-  # Return False for single host as a fast path.
+  # 单主机时作为快速路径直接返回 False。
   if xla_bridge.process_count() == 1:
     return False
 
@@ -159,7 +165,7 @@ def _validate_shape_and_dtype_for_per_device_arrays(
     aval: core.ShapedArray,
     expected_shape: Shape,
 ):
-  """Validates that per-device arrays are valid and consistent."""
+  """校验每设备数组合法且相互一致。"""
   expected_dtype = aval.dtype
   for db in arrays:
     if db.dtype != expected_dtype:
@@ -188,7 +194,7 @@ class ArrayImpl(basearray.Array):
   def __init__(self, aval: core.ShapedArray, sharding: Sharding,
                arrays: Sequence[ArrayImpl],
                committed: bool, _skip_checks: bool = False):
-    # NOTE: the actual implementation of the constructor is moved to C++.
+    # NOTE: 构造函数的具体实现已移到 C++ 中。
 
     self.aval = aval
     self._sharding = sharding
@@ -196,10 +202,9 @@ class ArrayImpl(basearray.Array):
     self._npy_value = None
     arrays = [a._arrays[0] for a in arrays]
 
-    # Don't rearrange if skip_checks is enabled because this assumes that the
-    # input buffers are already arranged properly. This usually happens when
-    # Array's are created as output of a JAX transformation
-    # (like pjit, etc).
+    # 若启用了 skip_checks 就不要重排，因为这里假定输入缓冲区
+    # 已经排布正确。这通常发生在 `Array` 作为 JAX 变换
+    # （如 pjit 等）的输出被创建时。
     if not _skip_checks or config.enable_checks.value:
       arrays = self._check_and_rearrange(arrays, self._sharding, self.aval)
     self._arrays = arrays
@@ -223,8 +228,8 @@ class ArrayImpl(basearray.Array):
           " must be from distinct devices, but got device IDs"
           f" {buffer_device_ids}")
 
-    # Calculate a symmetric difference because the device ids between sharding
-    # and _arrays should match.
+    # 计算对称差，因为 sharding 与 _arrays 的
+    # 设备 id 本应一致。
     diff = array_device_ids ^ addressable_device_ids
     if diff:
       dev_in_sharding_not_in_arrays = addressable_device_ids - array_device_ids
@@ -246,7 +251,7 @@ class ArrayImpl(basearray.Array):
         expected_shape=sharding.shard_shape(aval.shape),
     )
 
-    # Rearrange arrays based on the device assignment.
+    # 根据设备分配重排数组。
     addressable_da = sharding._addressable_device_assignment
     return [device_id_to_buffer[device.id] for device in addressable_da]
 
@@ -289,7 +294,7 @@ class ArrayImpl(basearray.Array):
     try:
       return self.shape[0]
     except IndexError as err:
-      raise TypeError("len() of unsized object") from err  # same as numpy error
+      raise TypeError("len() of unsized object") from err  # 与 numpy 的报错一致
 
   def __bool__(self):
     core.check_bool_conversion(self)
@@ -330,7 +335,7 @@ class ArrayImpl(basearray.Array):
       return repr(self)
     elif (self.is_fully_addressable or self.is_fully_replicated and
           self.sharding.has_addressable_devices):
-      # Simulates behavior of https://github.com/numpy/numpy/pull/9883
+      # 模拟 https://github.com/numpy/numpy/pull/9883 的行为
       return format(self._value if self.ndim else self._value[()], format_spec)
     else:
       return repr(self)
@@ -343,14 +348,14 @@ class ArrayImpl(basearray.Array):
 
   def __iter__(self):
     if self.ndim == 0:
-      raise TypeError("iteration over a 0-d array")  # same as numpy error
+      raise TypeError("iteration over a 0-d array")  # 与 numpy 的报错一致
     else:
       assert self.is_fully_replicated or self.is_fully_addressable
       if self.sharding.num_devices == 1 or self.is_fully_replicated:
         return (sl for chunk in self._chunk_iter(100) for sl in chunk._unstack())  # pyrefly: ignore[missing-attribute]
       else:
-        # TODO(yashkatariya): Don't bounce to host and use `_chunk_iter` path
-        # here after uneven partitioning support is added.
+        # TODO(yashkatariya): 在支持非均匀分区后，不要绕到主机，
+        # 而是直接使用此处的 `_chunk_iter` 路径。
         return (api.device_put(self._value[i]) for i in range(self.shape[0]))
 
   @property
@@ -388,28 +393,27 @@ class ArrayImpl(basearray.Array):
       return repr(self)
     elif (self.is_fully_addressable or self.is_fully_replicated and
           self.sharding.has_addressable_devices) and self.nbytes < 1 << 20:
-      return str(self._value)  # doesn't print Array(...)
+      return str(self._value)  # 不会打印 Array(...)
     else:
       return repr(self)
 
   @property
   def is_fully_addressable(self) -> bool:
-    """Is this Array fully addressable?
+    """该 `Array` 是否完全可寻址？
 
-    A jax.Array is fully addressable if the current process can address all of
-    the devices named in the :class:`Sharding`. ``is_fully_addressable`` is
-    equivalent to "is_local" in multi-process JAX.
+    如果当前进程能够寻址 :class:`Sharding` 中命名的所有设备，那么该
+    jax.Array 就是完全可寻址的。``is_fully_addressable`` 等价于多进程
+    JAX 中的 "is_local"。
 
-    Note that fully replicated is not equal to fully addressable i.e.
-    a jax.Array which is fully replicated can span across multiple hosts and is
-    not fully addressable.
+    注意，完全复制并不等于完全可寻址，也就是说，完全复制的 jax.Array
+    可以跨多个主机，因而是不完全可寻址的。
     """
     return self.sharding.is_fully_addressable
 
   def __array__(self, dtype: np.dtype | None = None,
                 context: None = None, copy: bool | None = None):
-    del context  # unused
-    # copy argument is supported by np.asarray starting in numpy 2.0
+    del context  # 未使用
+    # 从 numpy 2.0 起 np.asarray 支持 copy 参数
     kwds = {} if copy is None else {'copy': copy}
     return np.asarray(self._value, dtype=dtype, **kwds)  # pyrefly: ignore[no-matching-overload]
 
@@ -508,7 +512,7 @@ class ArrayImpl(basearray.Array):
 
   @use_cpp_method()
   def on_device_size_in_bytes(self):
-    """Returns the total global on-device size of the array in bytes."""
+    """返回该数组在设备上的全局总字节大小。"""
     arr = self._arrays[0]
     per_shard_size = arr.on_device_size_in_bytes()
     return per_shard_size * self.sharding.num_devices
@@ -543,13 +547,13 @@ class ArrayImpl(basearray.Array):
     for a in self._arrays:
       out.append(Shard(_get_device(a), self.sharding, self.shape, a))
     if len(out) != 1:
-      # when len(out) == 1, out is just [Shard(self)] and it makes a cycle.
+      # 当 len(out) == 1 时，out 只是 [Shard(self)]，会构成循环引用。
       self.__dict__["addressable_shards"] = out
     return out
 
   @property
   def format(self):
-    # TODO(yashkatariya): Remove the deleted check from here.
+    # TODO(yashkatariya): 从这里移除“已删除”检查。
     if self.is_deleted():
       return Format(None, self.sharding)
     try:
@@ -564,10 +568,10 @@ class ArrayImpl(basearray.Array):
 
   @property
   def global_shards(self) -> Sequence[Shard]:
-    """Returns list of all `Shard`s of the Array across all devices.
+    """返回该 `Array` 跨所有设备的全部 `Shard` 列表。
 
-    The result includes shards that are not addressable by the current process.
-    If a `Shard` is not addressable, then its `data` will be `None`.
+    结果包含当前进程无法寻址的分片。如果某个 `Shard` 不可寻址，
+    那么它的 `data` 将为 `None`。
     """
     self._check_if_deleted()
     if self.is_fully_addressable:
@@ -596,9 +600,8 @@ class ArrayImpl(basearray.Array):
   def is_deleted(self):
     if self._arrays is None:
       return True
-    # This path is taken when a view of `Array` is created and the original
-    # Array is deleted. In that case, the buffers the view represents also get
-    # deleted.
+    # 当创建了 `Array` 的视图且原 Array 被删除时会走这条路径。
+    # 此时该视图所表示的缓冲区也会一并被删除。
     return any(buf.is_deleted() for buf in self._arrays)
 
   def _check_if_deleted(self):
@@ -637,7 +640,7 @@ class ArrayImpl(basearray.Array):
     self._check_if_deleted()
 
     if self._npy_value is None:
-      # addressable_device_list can be empty. If it's empty, we will error below
+      # addressable_device_list 可能为空。若为空，我们会在下面报错
       if self.is_fully_replicated and self.sharding.has_addressable_devices:
         npy_value, did_copy = self._single_device_array_to_np_array_did_copy()
         npy_value.flags.writeable = False
@@ -645,9 +648,9 @@ class ArrayImpl(basearray.Array):
           self._npy_value = npy_value
         return npy_value
 
-      # TODO(yashkatariya): Merge `_process_has_full_value_in_mcjax` with
-      # is_fully_addressable.
-      # is_fully_addressable return False if addressable_device_list is empty.
+      # TODO(yashkatariya): 把 `_process_has_full_value_in_mcjax` 与
+      # is_fully_addressable 合并。
+      # 当 addressable_device_list 为空时，is_fully_addressable 返回 False。
       if (not self.is_fully_addressable and
           not _process_has_full_value_in_mcjax(self.sharding, self.shape)):
         raise RuntimeError(
@@ -673,7 +676,7 @@ def _get_shape_from_index(slc: Index, shape: Shape) -> Shape:
   return tuple(
       (s.stop or dim) - (s.start or 0)
       for s, dim in safe_zip(slc, shape)
-      if isinstance(s, slice)  # If element is int, this dimension is reduced
+      if isinstance(s, slice)  # 若元素是 int，则该维度被规约
   )
 
 
@@ -699,37 +702,37 @@ def _get_and_check_dtype(
   return dtype
 
 
-# explicitly set to be unhashable.
+# 显式设为不可哈希。
 setattr(ArrayImpl, "__hash__", None)
 setattr(ArrayImpl, "__array_priority__", 100)
 
-# TODO(yashkatariya): Remove None from callback input type.
+# TODO(yashkatariya): 从回调输入类型中移除 None。
 
 def make_array_from_callback(
     shape: Shape, sharding: Sharding | Format,
     data_callback: Callable[[Index | None], ArrayLike],
     dtype: DTypeLike | None = None) -> ArrayImpl:
   # pyformat: disable
-  """Returns a ``jax.Array`` via data fetched from ``data_callback``.
+  """通过 ``data_callback`` 获取的数据返回一个 ``jax.Array``。
 
-  ``data_callback`` is used to fetch the data for each addressable shard of the
-  returned ``jax.Array``. This function must return concrete arrays, meaning that
-  ``make_array_from_callback`` has limited compatibility with JAX transformations
-  like :func:`jit` or :func:`vmap`.
+  ``data_callback`` 用于获取返回的 ``jax.Array`` 每个可寻址分片的数据。该函数
+  必须返回具体数组，这意味着 ``make_array_from_callback`` 与 :func:`jit` 或
+  :func:`vmap` 等 JAX 变换的兼容性有限。
 
   Args:
-    shape : Shape of the ``jax.Array``.
-    sharding: A ``Sharding`` instance which describes how the ``jax.Array`` is
-      laid out across devices.
-    data_callback : Callback that takes indices into the global array value as
-      input and returns the corresponding data of the global array value.
-      The data can be returned as any array-like object, e.g. a ``numpy.ndarray``.
-    dtype: The dtype of the output ``jax.Array``. If not provided, the dtype of
-      the data for the first addressable shard is used. If there are no
-      addressable shards, the ``dtype`` argument must be provided.
+    shape : ``jax.Array`` 的形状。
+    sharding: 一个 ``Sharding`` 实例，用于描述该 ``jax.Array``
+      如何在各个设备上布局。
+    data_callback : 以全局数组值中的索引作为输入、返回全局数组值
+      对应数据的回调。返回的数据可以是任意类数组对象，
+      例如 ``numpy.ndarray``。
+    dtype: 输出 ``jax.Array`` 的数据类型。若未提供，则使用第一个
+      可寻址分片的数据类型。若不存在可寻址分片，
+      则必须提供 ``dtype`` 参数。
 
   Returns:
-    A ``jax.Array`` via data fetched from ``data_callback``.
+    通过 ``data_callback`` 获取的数据构造出的
+    ``jax.Array``。
 
   Examples:
 
@@ -766,9 +769,8 @@ def make_array_from_callback(
   def get_data(
       index: Index | None,
   ) -> ArrayImpl | literals.TypedNdArray | np.ndarray:
-    # Perhaps cache on index here, then we can unify fully_replicated
-    # and non-fully_replicated cases below and become faster for
-    # partially replicated cases.
+    # 也许可以在这里按索引做缓存，这样就能统一下面完全复制与
+    # 非完全复制两种情况，并在部分复制的情形下更快。
     assert index is not None
     r = data_callback(index)
     if isinstance(r, core.Tracer):
@@ -776,7 +778,7 @@ def make_array_from_callback(
           "jax.make_array_from_callback cannot be called within a traced"
           " context."
       )
-    # Value can be python scalars, resolve it into something with dtype.
+    # 值可能是 Python 标量，把它解析成带数据类型的形式。
     r = dtypes.canonicalize_value(r)
     if isinstance(r, (literals.TypedInt, literals.TypedFloat,
                       literals.TypedComplex)):
@@ -787,7 +789,7 @@ def make_array_from_callback(
 
   if sharding.is_fully_replicated:
     devices = list(sharding._internal_device_list.addressable_device_list)
-    # Only compute data once.
+    # 只计算一次数据。
     per_device_values = [get_data((slice(None),) * len(shape))] * len(devices)
   else:
     device_to_index_map = sharding.addressable_devices_indices_map(shape)
@@ -820,7 +822,7 @@ def make_array_from_callback(
       return first_value
 
   if dtypes.issubdtype(aval.dtype, dtypes.extended):
-    # TODO(yashkatariya): Can this also use batched_device_put?
+    # TODO(yashkatariya): 这里也能用 batched_device_put 吗？
     arrays = api.device_put(per_device_values, devices)
     return aval.dtype._rules.make_sharded_array(
         aval, sharding, arrays, committed=True
@@ -828,13 +830,12 @@ def make_array_from_callback(
 
   if dll is not None:
     devices = [Format(dll, make_single_device_sharding(d)) for d in devices]
-    # pxla.batched_device_put doesn't support Layout... Take the slow route
+    # pxla.batched_device_put 不支持 Layout……只能走慢路径
     arrays = api.device_put(per_device_values, devices)
     return ArrayImpl(aval, sharding, arrays, committed=True)
 
   if isinstance(first_value, ArrayImpl) and len(first_value.devices()) > 1:
-    # The output of the callback is already a sharded array, move it to
-    # to target device.
+    # 回调的输出已经是分片数组，把它移动到目标设备。
     per_device_values = api.device_put(per_device_values, devices)
 
   return pxla.batched_device_put(aval, sharding, per_device_values, devices)
@@ -845,44 +846,44 @@ def make_array_from_process_local_data(
     local_data,  # PyTree[np.ndarray]
     global_shape=None):  # PyTree[Shape]
   # pyformat: disable
-  """Creates distributed tensor using the data available in process.
+  """使用进程内可用的数据创建一个分布式张量。
 
-  This function is a common special case of `make_array_from_callback`. It
-  assumes that the data is available in the process and takes care of the
-  index wrangling.
+  该函数是 `make_array_from_callback` 的一个常见特例。
+  它假定数据已经存在于当前进程内，
+  并自动处理索引的换算工作。
 
-  The most common case is when the sharding is sharded across the batch
-  dimension and each host just loads its corresponding sub-batch. This function
-  supports more general cases as well, such as mixed multi-host and multi-axis
-  replication and sharding but you would need to compute the size and the
-  contents of process-local data correctly to satisfy the sharding constraints.
+  最常见的情形是分片沿 batch 维度切分，每个主机只加载
+  与之对应的那个子批次。该函数也支持更一般的情形，
+  例如多主机与多轴混合的复制与分片，但此时你需要自行
+  正确计算进程本地数据的大小与内容，
+  才能满足分片方案所施加的约束条件。
 
-  In particular, if any two hosts are replicas, host_local_data should be
-  identical as well.
+  特别地，如果任意两个主机互为副本，
+  那么这两个主机上的 host_local_data 也必须完全相同。
 
-  The global_shape is optional. If not provided it will be be inferred from
-  the local_data and sharding, under the assumption that
-  each host represents only their own data for uniform sharding. If sharding
-  is non-uniform, (see note below) an exception will be raised.
+  global_shape 是可选的。若未提供，它会根据 local_data 与
+  sharding 推断出来，前提是对于均匀分片，每个主机只表示
+  自己的数据。若分片是非均匀的（见下方说明），
+  则会抛出异常。
 
-  Setting global_shape explicitly allows for finer grain control and works with
-  non-uniform shardings. Each dimension of global_shape must either match
-  host_local_data, or match the inferred global shape of the sharding (in which
-  case it is equivalent to setting it to None, but is more explicit).
+  显式设置 global_shape 可以获得更精细的控制，并且同样适用于
+  非均匀分片。global_shape 的每一维要么与 host_local_data 匹配，
+  要么与推断出的 sharding 全局形状匹配（这等价于将其设为
+  None，但表达更明确）。
 
-  For example if dimension `i` is fully sharded then this size would be
-  `per_device_shape[i] * jax.local_device_count()`.  Each device will be mapped
-  into local slice of `local_data` array. For example, if given process
-  addresses slices (8, 12) and  (24, 28), then these slices will be mapped
-  into (0, 4) and (4, 8) of the `local_data`.
+  例如，若维度 `i` 被完全分片，则该大小为
+  `per_device_shape[i] * jax.local_device_count()`。每个设备都会映射到
+  `local_data` 数组中对应的本地切片。例如，若给定进程处理
+  切片 (8, 12) 与 (24, 28)，那么这些切片将被映射到
+  `local_data` 的 (0, 4) 与 (4, 8)。
 
-  For each dimension where global_shapes matches local_shape, each device
-  will lookup the slice in the local_data. For example if
-  global_shape == local_data.shape, the local data is assumed to be the
-  actual target array that will be sharded into device.
+  对于 global_shape 与 local_shape 匹配的每一维，每个设备都会到
+  local_data 中查找对应的切片。例如若
+  global_shape == local_data.shape，则假定本地数据就是要分片到
+  设备上的实际目标数组。
 
-  If global_shape is the same as local_data.shape, then the data must
-  be the same across all hosts.
+  如果 global_shape 与 local_data.shape 相同，
+  那么所有主机上的数据也必须完全一致。
 
   Examples:
     >>> from jax.sharding import PartitionSpec as P
@@ -904,56 +905,56 @@ def make_array_from_process_local_data(
     >>> assert output_global_array.addressable_data(0).shape == per_device_shape
     >>> assert output_global_array.shape == global_shape
 
-  NB: While most shardings are uniform, It is possible to design an exotic
-  sharding mesh where each process's  devices will be arranged in a non-grid
-  like pattern in some dimensions, or for indices to overlap non-trivially.
-  Such sharding is called "non-uniform" in those dimensions. In that case,
-  the global shape along those directions must match local shape as there is
-  no meaningful way to represent all needed
-  per-process data in non-overlapping fashion. For example for global_shape 4x4
-  if sharding looks like this::
+  NB: 虽然大多数分片是均匀的，但也可以设计出奇特的分片网格：
+  在某些维度上每个进程的设备呈非网格状排列，
+  或者索引之间存在非平凡的重叠。
+  这种分片在这些维度上被称为“非均匀”。
+  此时，这些方向上的全局形状必须与本地形状一致，
+  因为不存在以不重叠方式表示所有所需进程内数据的
+  有意义做法。例如对于 global_shape 4x4，
+  若分片形如::
 
       0123
       2103
       4675
       4567
 
-  with 4 processes, containing devices (0,1), (2, 3), (4, 5), (6, 7) respectively.
-  Then the data for each host look like::
+  共有 4 个进程，分别包含设备 (0,1)、(2, 3)、(4, 5)、(6, 7)。
+  那么每个主机的数据形如::
 
       xx..    ..xx     ....    ....
       .xx.    x..x     ....    ....
       ....    ....     x..x    .xx.
       ....    ....     xx..    ..xx
 
-  the sharding is uniform on rows (each host requires either rows 1-2, or rows 3-4)
-  and non-uniform on columns (hosts require overlapping but not matching
-  set of columns). Thus local data must have the shape 2x4 or 4x4
-  for all hosts, even though each  host can potentially fit into 2x2 shape.
-  In this case user must provide global_shape explicitly and for
-  local_shape=(2, 4), potentially valid global shapes are (2, 4) and (4, 4).
+  该分片在行方向上是均匀的（每个主机需要第 1-2 行或第 3-4 行），
+  在列方向上是非均匀的（各主机需要的列集合彼此重叠但不相同）。
+  因此所有主机的本地数据形状都必须是 2x4 或 4x4，
+  尽管每个主机本来都可能放进 2x2 的形状。
+  此时用户必须显式提供 global_shape，并且对于 local_shape=(2, 4)，
+  可能合法的全局形状是 (2, 4) 与 (4, 4)。
 
-  On the other hand for sharding::
+  另一方面，对于如下分片::
 
       0213   x.x.  .x.x.  ....  ....
       0213   x.x.  .x.x.  ....  ....
       4657   ....  ....   .x.x  x.x.
       4657   ....  ....   .x.x  x.x.
 
-  for local_shape=(2, 2) this function can accept a choice of 2x2, 2x4, 4x2
-  and 4x4 global shapes. Setting global_shape to None, is equivalent to
-  setting it to (4, 4) in this case.
+  对于 local_shape=(2, 2)，该函数可以接受 2x2、2x4、4x2 与
+  4x4 的全局形状。此时把 global_shape 设为 None 等价于
+  将其设为 (4, 4)。
 
   Args:
-    sharding: Sharding of the global array.
-    local_data: Data on the host to be placed on local devices. Each
-      dimension should either match global_shape, or match
-      num_addressable_indices(dim).
-    global_shape: The target shape of the global array. If None,
-      will infer from local_data and sharding.
+    sharding: 全局数组的分片方式。
+    local_data: 主机上的数据，将被放置到本地设备上。
+      每一维要么与 global_shape 匹配，
+      要么与 num_addressable_indices(dim) 匹配。
+    global_shape: 全局数组的目标形状。若为 None，则根据
+      local_data 与 sharding 推断。
 
   Returns:
-    Tensor that will have sharding=sharding and of shape global_shape.
+    一个分片为 sharding、形状为 global_shape 的张量。
   """
   # pyformat: enable
   local_data_flat, treedef = tree_flatten(local_data)
@@ -965,7 +966,7 @@ def make_array_from_process_local_data(
       global_shape, local_data,
       is_leaf=lambda x: x is None or isinstance(x, tuple))
   if xla_bridge.process_count() == 1:
-    # Safety check if the provided data doesn't match expected global_shape
+    # 安全检查：所提供的数据是否与期望的 global_shape 匹配
     for s, d in zip(global_shape_flat, local_data_flat):
       if s is not None and s != d.shape:
         raise ValueError(
@@ -983,8 +984,8 @@ def make_array_from_process_local_data(
 def _array_from_process_local_data(
     local_data: np.ndarray, sharding: Sharding,
     global_shape: Shape | None = None) -> ArrayImpl:
-  # TODO(sandler): consider supporting partially specified global_shape or
-  # making local_to_global_shape available in the api.
+  # TODO(sandler): 考虑支持部分指定的 global_shape，或
+  # 在 api 中公开 local_to_global_shape。
   local_shape = local_data.shape
   if global_shape is None:
     global_shape = local_to_global_shape(sharding, local_shape)  # pyrefly: ignore[bad-assignment]
@@ -1024,8 +1025,8 @@ def _array_from_process_local_data(
 
   @functools.lru_cache(maxsize=4096)
   def local_slice(i, start):
-    # Looks up the index of this slice in the list of slices for this dimension.
-    # This will determine the slice in host_local_data
+    # 查找该切片在本维度切片列表中的位置。
+    # 这决定了它在 host_local_data 中的切片。
     start = slices_for_each_dim[i].index(start or 0) * shard_shape[i]
     end = start + shard_shape[i]
     return slice(start, end)
@@ -1045,23 +1046,23 @@ def make_array_from_single_device_arrays(
     shape: Shape, sharding: Sharding, arrays: Sequence[basearray.Array], *,
     dtype: DTypeLike | None = None,
 ) -> ArrayImpl:
-  r"""Returns a ``jax.Array`` from a sequence of ``jax.Array``\s each on a single device.
-      Every device in input ``sharding``\'s mesh must have an array in ``arrays``\s.
+  r"""由一组 ``jax.Array``（每个位于单个设备上）返回一个 ``jax.Array``。
+      输入 ``sharding`` 的网格中每个设备都必须在 ``arrays`` 中有对应的数组。
 
   Args:
-    shape : Shape of the output ``jax.Array``. This conveys information already included with
-      ``sharding`` and ``arrays`` and serves as a double check.
-    sharding: Sharding: A global Sharding instance which describes how the output jax.Array is laid out across devices.
-    arrays: `list` or `tuple` of ``jax.Array``\s that are each single device addressable. ``len(arrays)``
-      must equal ``len(sharding.addressable_devices)`` and the shape of each array must be the same. For multiprocess code,
-      each process will call with a different ``arrays`` argument that corresponds to that processes' data.
-      These arrays are commonly created via ``jax.device_put``.
-    dtype: The dtype of the output ``jax.Array``. If not provided, the dtype of the first array in
-      ``arrays`` is used. If ``arrays`` is empty, the ``dtype`` argument must be provided.
+    shape : 输出 ``jax.Array`` 的形状。它表达的信息已包含在
+      ``sharding`` 与 ``arrays`` 中，此处用作双重检查。
+    sharding: 全局 ``Sharding`` 实例，描述输出 jax.Array 如何在各设备上布局。
+    arrays: 每个都可在单设备上寻址的 ``jax.Array`` 组成的 `list` 或 `tuple`。``len(arrays)``
+      必须等于 ``len(sharding.addressable_devices)``，且各数组的形状必须相同。在多进程代码中，
+      每个进程会用各自数据对应的不同 ``arrays`` 参数调用。
+      这些数组通常通过 ``jax.device_put`` 创建。
+    dtype: 输出 ``jax.Array`` 的数据类型。若未提供，则使用 ``arrays`` 中第一个数组的
+      数据类型。若 ``arrays`` 为空，则必须提供 ``dtype`` 参数。
 
   Returns:
-    A global ``jax.Array``, sharded as ``sharding``, with shape equal to ``shape``, and with per-device
-      contents matching ``arrays``.
+    一个全局 ``jax.Array``，按 ``sharding`` 分片，形状等于 ``shape``，
+      且每个设备上的内容与 ``arrays`` 对应。
 
   Examples:
 
@@ -1085,22 +1086,22 @@ def make_array_from_single_device_arrays(
     >>> arr = jax.make_array_from_single_device_arrays(global_shape, sharding, arrays)
     >>> assert arr.shape == (8,8) # arr.shape is (8,8) regardless of jax.device_count()
 
-  For cases where you have a local array and want to convert it to a global
-  jax.Array, use ``jax.make_array_from_process_local_data``.
+  如果你有一个本地数组并想把它转换为全局 jax.Array，
+  请使用 ``jax.make_array_from_process_local_data``。
   """
   if isinstance(arrays, Sequence):
     dtype = _get_and_check_dtype(
         arrays, dtype, "make_array_from_single_device_arrays")
 
-  # All input arrays should be committed. Checking it is expensive on
-  # single-controller systems.
+  # 所有输入数组都应是已提交（committed）的。
+  # 在单控制器系统上检查这一点开销很大。
   aval = core.update_aval_with_sharding(
       core.ShapedArray(shape, dtype, weak_type=False), sharding)
   if dtypes.issubdtype(aval.dtype, dtypes.extended):
     return aval.dtype._rules.make_sharded_array(aval, sharding, arrays,
                                                 committed=True)
   arrays = list(arrays) if isinstance(arrays, tuple) else arrays
-  # TODO(phawkins): ideally the cast() could be checked.
+  # TODO(phawkins): 理想情况下 cast() 应该被检查。
   try:
     return ArrayImpl(aval, sharding, cast(Sequence[ArrayImpl], arrays),
                      committed=True)
@@ -1126,8 +1127,8 @@ def _array_mlir_constant_handler(val, aval):
   try:
     return mlir.ir_constant(val._value)
   except RuntimeError as e:
-    # TODO(yashkatariya): Ideally we would catch a custom exception from
-    # `_value` function in ArrayImpl instead of checking the error string.
+    # TODO(yashkatariya): 理想情况下应该捕获 ArrayImpl 中 `_value`
+    # 函数抛出的自定义异常，而不是检查错误字符串。
     if 'Fetching value for `jax.Array` that spans non-addressable' in str(e):
       raise RuntimeError(
           "Closing over jax.Array that spans non-addressable (non process"
@@ -1140,13 +1141,12 @@ mlir.register_constant_handler(ArrayImpl, _array_mlir_constant_handler)
 if config.use_simplified_jaxpr_constants.value:
   core.literalable_types.add(ArrayImpl)
 
-# NOTE(skye): we could refactor to generate _multi_slice parameters directly
-# from the input ShardingSpec, rather than the indices. However, this would
-# require duplicating the ordering logic of spec_to_indices, which is more
-# subtle and more likely to change than the index logic we have to support here.
+# NOTE(skye): 我们可以重构为直接从输入 ShardingSpec 生成 _multi_slice 参数，
+# 而不是从索引生成。但这需要重复 spec_to_indices 的排序逻辑，
+# 而那部分逻辑比我们这里要支持的索引逻辑更微妙、也更易变动。
 def as_slice_indices(arr: Any, idx: Index) -> tuple[
     tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-  """Returns start_indices, limit_indices, removed_dims"""
+  """返回 start_indices、limit_indices、removed_dims"""
   start_indices = [0] * arr.ndim
   limit_indices = list(arr.shape)
   removed_dims: list[int] = []
@@ -1175,8 +1175,8 @@ def shard_device_array(x, devices, indices, sharding):
   if sharding.is_fully_replicated:
     shards = [x] * len(devices)
   else:
-    # TODO(yashkatariya): Maybe this should be set when we call the handler in
-    # InputsHandler.__call__?
+    # TODO(yashkatariya): 也许应该在 InputsHandler.__call__
+    # 中调用该处理器时设置它？
     with (_internal_use_concrete_mesh(empty_concrete_mesh),
           use_abstract_mesh(empty_abstract_mesh)):
       shards = x._multi_slice(start_indices, limit_indices, removed_dims)
@@ -1193,14 +1193,14 @@ def shard_sharded_device_array_slow_path(x, devices, indices, sharding):
 
   bufs = []
   for idx, device in safe_zip(indices, devices):
-    # Look up all buffers that contain the correct slice of the logical array.
+    # 查找所有包含逻辑数组正确切片的缓冲区。
     candidates_list = candidates[hashed_index(idx)]
     if not candidates_list:
       return pxla.shard_args([sharding], [None],
                              [xc.ArrayCopySemantics.REUSE_INPUT], [x._value],
                              canonicalize=False)[0]
-    # Try to find a candidate buffer already on the correct device,
-    # otherwise copy one of them.
+    # 尝试找一个已经在正确设备上的候选缓冲区，
+    # 否则就复制其中一个。
     for buf in candidates_list:
       if buf.devices() == {device}:
         bufs.append(buf)
@@ -1249,15 +1249,15 @@ def _array_shard_arg(xs, shardings, layouts, copy_semantics):
     else:
       devices = sharding._internal_device_list.addressable_device_list
       if same_sharding and same_layout:
-        # Add a placeholder result that will be filled in later.
+        # 先加入占位结果，稍后再填充。
         results.append(None)
-        # Accumulate arguments to `batched_copy_array_to_devices_with_sharding`.
+        # 累积传给 `batched_copy_array_to_devices_with_sharding` 的参数。
         batch_xs.append(x)
         batch_devs.append(devices)
         batch_shardings.append(sharding)
         batch_indices.append(i)
         batch_cs.append(cs)
-      # Resharding starts here:
+      # 重新分片从这里开始：
       elif not same_layout:
         results.append(api.device_put(x, Format(layout, sharding)))
       else:
@@ -1294,7 +1294,7 @@ def _array_global_result_handler(global_aval, out_sharding, committed):
   )
 pxla.global_result_handlers[core.ShapedArray] = _array_global_result_handler
 
-# Token handlers
+# Token 处理器
 
 def _token_shard_arg(xs, shardings, layouts, copy_semantics):
   results = []

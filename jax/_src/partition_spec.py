@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：定义 JAX 的分片规格数据结构 `PartitionSpec`（内部名 `P`）。
+# 它用一个元组描述数组的每一维如何映射到设备网格（mesh）的轴，是
+# `jax.sharding.NamedSharding`、`jax.jit(in_shardings=...)` 等分片 API 的公共表示。
+# 文件还定义未归约/已归约轴集合与 `UnreducedKind` 枚举，并用弱值驻留
+# （weak interner）保证相同规格在进程内共享同一个对象。
+
 from __future__ import annotations
 import enum
 from typing import Any
@@ -64,7 +70,7 @@ def _get_ur_str(unreduced, reduced):
     return f"unreduced={set(unreduced)!r}"
   elif not unreduced and reduced:
     return f"reduced={set(reduced)!r}"
-  assert False  # unreachable
+  assert False  # 不可达
 
 _canonicalize_partition = _jax.canonicalize_partition  # type: ignore
 _canonicalize_partitions = _jax.canonicalize_partitions  # type: ignore
@@ -97,13 +103,13 @@ class UnreducedKind(enum.Enum):
 
 @immutable
 class P:
-  """Tuple describing how to partition an array across a mesh of devices.
+  """描述如何把一个数组分片到设备网格（mesh）上的元组。
 
-  Each element is either ``None``, a string, or a tuple of strings.
-  See the documentation of :class:`jax.sharding.NamedSharding` for more details.
+  每个元素要么是 ``None``，要么是字符串，要么是字符串元组。
+  更多细节见 :class:`jax.sharding.NamedSharding` 的文档。
 
-  This class exists so JAX's pytree utilities can distinguish a partition
-  specifications from tuples that should be treated as pytrees.
+  这个类之所以存在，是为了让 JAX 的 pytree 工具能把分片规格与
+  那些应当按 pytree 处理的元组区分开。
   """
   __slots__ = ("_partitions", "unreduced", "reduced", "unreduced_kind",
                "__weakref__")
@@ -112,14 +118,14 @@ class P:
   reduced: frozenset[AxisName]
   unreduced_kind: UnreducedKind | None
 
-  # A sentinel value representing a dim is unconstrained.
+  # 表示某一维不受约束的哨兵值。
   UNCONSTRAINED = _UNCONSTRAINED_PARTITION
 
   @staticmethod
   @weak_value_interner
   def _create(partitions, unreduced, reduced, unreduced_kind):
-    # We cannot modify the arguments within the interned function, but we are
-    # free to throw an exception.
+    # 在驻留（intern）函数内部我们无法修改这些参数，但可以
+    # 自由地抛出异常。
     _check(partitions, unreduced, reduced, unreduced_kind)
     obj = object.__new__(P)
     object.__setattr__(obj, '_partitions', partitions)
@@ -137,7 +143,7 @@ class P:
       unreduced_kind = UnreducedKind.sum
     return P._create(partitions, unreduced, reduced, unreduced_kind)  # type: ignore
 
-  # No __eq__ or __hash__: interned classes use object identity.
+  # 没有 __eq__ 或 __hash__：驻留类使用对象标识（object identity）。
 
   def __init_subclass__(cls, *args, **kwargs):
     raise TypeError("Subclassing `jax.P` is prohibited.")
@@ -204,7 +210,7 @@ class P:
   def __radd__(self, other):
     if not isinstance(other, tuple):
       raise NotImplementedError
-    # other will always be a tuple.
+    # `other` 始终是一个 `tuple`。
     if self.unreduced:
       raise TypeError(
           f"other {other} cannot be of instance `tuple` when self {self} has"

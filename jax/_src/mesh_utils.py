@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Utils for building a device mesh."""
+# 文件职责：构建设备网格（device mesh）的工具，供 `jax.sharding.Mesh` 使用。
+# 依据物理拓扑（TPU 托盘内的环形连接、N 维环面网络，或 ICI/DCN 的混合网络）
+# 与逻辑网格形状重排设备顺序，目标是让集合通信获得最大带宽。
+# 对外暴露 `create_device_mesh()` 与 `create_hybrid_device_mesh()` 两个入口；
+# 内部按设备类型选用预设的设备顺序（如 TPU v2/v3、v4i/v8i、v5e、v5p、7x），
+# 并实现 N 维环面上的逻辑轴到物理轴分配算法、按需拆分物理轴，以及用于生成
+# 连续子网格的转置技巧。
+"""构建设备网格的工具。"""
 
 from __future__ import annotations
 
@@ -38,11 +45,11 @@ _TPU_7X = "TPU7x"
 _TPU_7 = "TPU7"
 _TPU_8I = "TPU8i"
 
-# Maps physical topology -> mesh shape -> transpose to use for jekbradbury's
-# famous contiguous mesh trick.
+# 将物理拓扑映射到网格形状，再映射到 jekbradbury 那个著名的连续网格技巧
+# 所使用的转置。
 #
-# The trick only works for certain topologies and mesh shapes. Trivial dims of
-# size 1 can be added to the shapes listed, and they are also supported.
+# 该技巧只对特定的拓扑和网格形状有效。所列形状可以追加大小为 1 的平凡维度，
+# 这些形状同样受支持。
 _TRANSPOSE_TRICKS: dict[
     tuple[int, ...], dict[tuple[int, ...], tuple[int, ...]]
 ] = {
@@ -68,7 +75,7 @@ _TRANSPOSE_TRICKS: dict[
     },
 }
 
-# Physical ordering of core IDs in a tray that creates a ring
+# 托盘（tray）中核心 ID 的物理顺序，该顺序构成一个环
 _TRAY_RING_ORDER = (0, 1, 2, 3, 6, 7, 4, 5)
 _TRAY_2x2_RING_ORDER = (0, 1, 3, 2)
 _TRAY_4x4_RING_ORDER = (0, 1, 2, 3, 7, 6, 5, 9, 10, 11, 15, 14, 13, 12, 8, 4)
@@ -94,14 +101,14 @@ def _tpu_v2_v3_create_device_mesh(
     device_mesh = device_mesh[..., perm]
     return device_mesh
   else:
-    # TODO(skye): implement 2D mesh_shape logic here:
+    # TODO(skye): 在这里实现二维 mesh_shape 的逻辑：
     # https://github.com/tensorflow/lingvo/blob/0df40cf604dfcd14e28f7087d73687a0bd2fe5c6/lingvo/core/gshard_utils.py#L187
-    # (possibly replaces above mesh_shape[-1] == 8 case)
+    # （可能会取代上面 mesh_shape[-1] == 8 的分支）
     return np.asarray(devices).reshape(mesh_shape)
 
 
-# TODO(b/303712469): Unit test these handler functions.
-# Creates a physical ring 0->1->3->2 if on v4i.
+# TODO(b/303712469): 为这些处理函数补充单元测试。
+# 在 v4i 上创建物理环 0->1->3->2。
 def _v4i_v8i_create_device_mesh(
     mesh_shape: Sequence[int], devices: Sequence[Any], **unused_kwargs
 ) -> np.ndarray | None:
@@ -116,21 +123,20 @@ def _v4i_v8i_create_device_mesh(
 def _v5e_create_device_mesh(
     mesh_shape: Sequence[int], devices: Sequence[Any], **unused_kwargs
 ) -> np.ndarray | None:
-  """Creates rotated pincer device assignment for selected topologies.
+  """为选定的拓扑创建旋转式 pincer 设备分配。
 
   Args:
-    mesh_shape: Logical mesh shape used by the model.
-    devices: TPU devices.
+    mesh_shape: 模型使用的逻辑网格形状。
+    devices: TPU 设备。
     **unused_kwargs: ...
 
   Returns:
-    None or reordered devices reshaped as `mesh_shape`.
+    None，或者重排后按 `mesh_shape` 变形的设备数组。
   """
   max_x, max_y, max_z = max(getattr(d, "coords", (0, 0, 0)) for d in devices)
   bound_x, bound_y, bound_z = max_x + 1, max_y + 1, max_z + 1
-  # Our ring re-ordering makes sense only if the passed-in devices are
-  # sequential, which may not always be the case. reversed() changes z-minor to
-  # x-minor.
+  # 只有在传入的设备按顺序排列时，我们的环形重排才有意义，而实际情况未必
+  # 如此。reversed() 把 z 为主序改为 x 为主序。
   sequential_devices = sorted(
       devices,
       key=lambda d: tuple(reversed(getattr(d, "coords", (0, 0, 0)))))
@@ -152,7 +158,7 @@ def _v5e_create_device_mesh(
     return device_mesh
 
   if bound_x == bound_y == 4 and bound_z == 1 and len(devices) == 16:  # v5e4x4
-    # Only uses ring order if the whole mesh is a replica group.
+    # 仅当整个网格是一个副本组时才使用环形顺序。
     if max(mesh_shape) == len(devices):
       device_mesh = np.asarray(sequential_devices)
       device_mesh = device_mesh[np.array(_TRAY_4x4_RING_ORDER)]
@@ -165,21 +171,20 @@ def _v5e_create_device_mesh(
 def _v5p_create_device_mesh(
     mesh_shape: Sequence[int], devices: Sequence[Any], **unused_kwargs
 ) -> np.ndarray | None:
-  """Creates device assignment for selected topologies.
+  """为选定的拓扑创建设备分配。
 
   Args:
-    mesh_shape: Logical mesh shape used by the model.
-    devices: TPU devices.
+    mesh_shape: 模型使用的逻辑网格形状。
+    devices: TPU 设备。
     **unused_kwargs: ...
 
   Returns:
-    None or reordered devices reshaped as `mesh_shape`.
+    None，或者重排后按 `mesh_shape` 变形的设备数组。
   """
   max_x, max_y, max_z = max(getattr(d, "coords", (0, 0, 0)) for d in devices)
   bound_x, bound_y, bound_z = max_x + 1, max_y + 1, max_z + 1
-  # Our ring re-ordering makes sense only if the passed-in devices are
-  # sequential, which may not always be the case. reversed() changes z-minor to
-  # x-minor.
+  # 只有在传入的设备按顺序排列时，我们的环形重排才有意义，而实际情况未必
+  # 如此。reversed() 把 z 为主序改为 x 为主序。
   sequential_devices = sorted(
       devices,
       key=lambda d: tuple(reversed(getattr(d, "coords", (0, 0, 0)))))
@@ -194,26 +199,25 @@ def _v5p_create_device_mesh(
 def _7x_create_device_mesh(
     mesh_shape: Sequence[int], devices: Sequence[Any], **unused_kwargs
 ) -> np.ndarray | None:
-  """Creates device assignment for small 7x topologies.
+  """为小规模 7x 拓扑创建设备分配。
 
-  The device assignment attempts to minimize the number of hops between
-  neighbors by allocating rings of devices, and assigns the core axis
-  preferentially due to its higher bandwidth.
+  该设备分配会通过划分设备环来尽量减少相邻设备之间的跳数，并由于核心轴具有
+  更高的带宽而优先分配核心轴。
 
   Args:
-    mesh_shape: Logical mesh shape used by the model.
-    devices: TPU devices.
+    mesh_shape: 模型使用的逻辑网格形状。
+    devices: TPU 设备。
     **unused_kwargs: ...
 
   Returns:
-    None or reordered devices reshaped as `mesh_shape`.
+    None，或者重排后按 `mesh_shape` 变形的设备数组。
   """
   if len(devices) % 8 != 0 or len(devices) > 32:
     return None
 
   physical_mesh_shape = _get_physical_tpu_mesh(devices).shape
-  # For the x and y axes, we only support at most 2x2 since we can make one ring
-  # along those axes and repeat with other separate rings along the z axis.
+  # 对于 x 和 y 轴，我们最多只支持 2x2，因为我们可以沿这些轴构成一个环，
+  # 再在 z 轴上用其他彼此独立的环重复。
   if physical_mesh_shape[0] > 2 or physical_mesh_shape[1] > 2:
     return None
 
@@ -228,9 +232,8 @@ def _7x_create_device_mesh(
   return device_mesh
 
 
-# Registers functions to create device mesh for specific device kinds. Takes
-# precedence over the more general logic in create_device_mesh(). Handler may
-# return None; in that case, it will fall back to using the default logic.
+# 注册为特定设备类型创建设备网格的函数。其优先级高于 create_device_mesh()
+# 中更通用的逻辑。处理函数可以返回 None；此时将回退到默认逻辑。
 device_kind_handler_dict: dict[
     str,
     Callable[..., np.ndarray | None],
@@ -255,87 +258,76 @@ def _create_device_mesh_for_nd_torus(
     *,
     allow_split_physical_axes: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-  """Assigns logical parallelism axes to physical axes of an N-D torus network.
+  """把逻辑并行轴分配到 N 维环面网络的物理轴上。
 
-  Given logical parallelism axes with sizes in `mesh_shape` and devices in an
-  N-dimensional torus network represented by `physical_mesh`, maps each logical
-  axis to one or more physical axes. Prefer to map more-performance-sensitive
-  logical axes to larger numbers of physical axes to maximize the bandwidth
-  available to them. Also prefer to assign logical axes to multiple physical
-  axes of the same size (e.g., a 2D square) rather than multiple physical axes
-  of different sizes when possible.
+  给定大小由 `mesh_shape` 描述的逻辑并行轴，以及由 `physical_mesh` 表示的
+  N 维环面网络中的设备，把每个逻辑轴映射到一个或多个物理轴。倾向于把对性能
+  更敏感的逻辑轴映射到更多的物理轴上，以最大化其可用带宽。在可能的情况下，
+  也倾向于把逻辑轴分配到多个大小相同的物理轴（例如一个二维正方形），而不是
+  多个大小不同的物理轴。
 
-  If allow_split_physical_axes = False (default), this routine will error out
-  instead of splitting a physical axis over more than one logical axis (which
-  would reduce total usable bandwidth).
+  如果 allow_split_physical_axes = False（默认），本函数会直接报错，而不是把
+  一个物理轴拆分给多个逻辑轴（那样会降低总可用带宽）。
 
-  Let's use a concrete example to explain the concepts and considerations.
+  我们用一个具体例子来解释这些概念与考量。
 
-  As an example, suppose the logical mesh is [data, model], for data and model
-  parallelism respectively. Also suppose that data parallelism is less
-  performance sensitive than model parallelism. Consider a 3D TPU pod slice of
-  shape 4x4x16, represented by a physical mesh of shape (4, 4, 16).
+  作为示例，假设逻辑网格为 [data, model]，分别对应数据并行和模型并行。再假设
+  数据并行对性能的敏感程度低于模型并行。考虑一个形状为 4x4x16 的三维 TPU
+  pod slice，它由形状 (4, 4, 16) 的物理网格表示。
 
-  A TPU pod slice has equal bandwidth along all axes with wraparound links, but
-  a 2D plane of size 4x4 may have faster XLA collective implementations than a
-  non-square plane or a 1D subgroup. If the mesh_shape is [16, 16], we may want
-  the more performance sensitive `model` axis to be mapped to the 4x4 XY plane.
+  TPU pod slice 借助回绕链路在所有轴上具有相同带宽，但大小为 4x4 的二维平面
+  可能比非正方形平面或一维子组拥有更快的 XLA 集合通信实现。如果 mesh_shape
+  为 [16, 16]，我们可能希望把对性能更敏感的 `model` 轴映射到 4x4 的 XY 平面上。
 
   Args:
-    physical_mesh: a np.ndarray of devices in the shape of the N-D torus
-      physical topology.
-    mesh_shape: shape of the logical mesh (size of the various logical
-      parallelism axes), with axes ordered by increasing network intensity.
-    allow_split_physical_axes: If True, we would split physical axes if
-      necessary to fit the desired mesh shape.
+    physical_mesh: 形状为 N 维环面物理拓扑的设备 np.ndarray。
+    mesh_shape: 逻辑网格的形状（各个逻辑并行轴的大小），其轴按网络强度递增
+      的顺序排列。
+    allow_split_physical_axes: 若为 True，我们会在必要时拆分物理轴以匹配所需
+      的网格形状。
 
   Returns:
-    An np.ndarray of devices in the shape of the logical mesh (mesh_shape), with
-      each logical parallelism axis mapped to one or more physical mesh axes.
-    The axis assignment matrix, which is a 2-d array mapping from
-      (physical_axis, logical_axis) to the size assigned, with the invariant
-      np.prod(assignment, axis=1) = physical_mesh_shape, and
-      np.prod(assignment, axis=0) = mesh_shape.
+    一个形状为逻辑网格（mesh_shape）的设备 np.ndarray，其中每个逻辑并行轴都
+      映射到一个或多个物理网格轴。
+    轴分配矩阵，即一个二维数组，把 (physical_axis, logical_axis) 映射到所分配的
+      大小，并满足不变式 np.prod(assignment, axis=1) = physical_mesh_shape 与
+      np.prod(assignment, axis=0) = mesh_shape。
   """
-  # Remaining physical axes to be assigned to logical axes.
+  # 尚未分配给逻辑轴的剩余物理轴。
   assignable_physical_mesh = list(physical_mesh.shape)
-  # Map each logical axis to a subset of physical axes.
+  # 把每个逻辑轴映射到物理轴的一个子集。
   assignment: list[tuple[int, ...]] = [() for _ in mesh_shape]
 
-  # Build a priority map honoring physical-axis bandwidth. Lower value = higher
-  # priority. Currently only TPU v7/v7x is known to have asymmetric bandwidth:
-  # on a 4D mesh shaped (x, y, z, core) the core axis is highest bandwidth, so
-  # it receives the highest priority (rank 0). All other device kinds treat
-  # every physical axis with equal priority (priority_map None -> unchanged).
+  # 构建尊重物理轴带宽的优先级映射。值越小 = 优先级越高。目前已知只有
+  # TPU v7/v7x 具有非对称带宽：在形状为 (x, y, z, core) 的四维网格上，core
+  # 轴带宽最高，因此获得最高优先级（rank 0）。其他所有设备类型对每个物理轴
+  # 都一视同仁（priority_map 为 None -> 不做改动）。
   priority_map: dict[int, int] | None = None
   if (
       len(physical_mesh.shape) == 4
       and getattr(physical_mesh.flat[0], 'device_kind', None) in (_TPU_7X, _TPU_7)
   ):
-    # 4D mesh (x, y, z, core): core (axis 3) first, then x, y, z.
+    # 四维网格 (x, y, z, core)：core（轴 3）优先，然后是 x、y、z。
     priority_map = {0: 1, 1: 2, 2: 3, 3: 0}
 
-  # Assign logical axes from highest network intensity to lowest.
-  # `mesh_shape` is assumed to ordered by lowest network intensity first, so
-  # reverse it first.
+  # 从网络强度最高到最低依次分配逻辑轴。
+  # 假定 `mesh_shape` 按网络强度从低到高排列，因此先将其反转。
   for logical_axis_index, logical_axis_size in reversed(
       list(enumerate(mesh_shape))
   ):
-    # Preferentially map to more physical axes first for higher bandwidth.
+    # 为获得更高带宽，优先映射到更多的物理轴。
     for num_axes in range(len(physical_mesh.shape), 0, -1):
-      # Try assign to any subset of size num_axes. Generate all candidates.
+      # 尝试分配到任意大小为 num_axes 的子集。生成所有候选。
       candidates = list(
           itertools.combinations(enumerate(assignable_physical_mesh), num_axes)
       )
 
-      # Sort candidates by priority if provided, so that candidates containing
-      # higher priority physical axes are tried first. This ensures high network
-      # intensity logical axes get assigned to high bandwidth physical axes.
+      # 若提供了优先级映射则对候选排序，使包含更高优先级物理轴的候选先被
+      # 尝试。这确保网络强度高的逻辑轴能分配到高带宽的物理轴。
       if priority_map is not None:
         def _candidate_priority(candidate):
-          # Lower rank = higher priority. Sort by best (lowest) priority
-          # among all axes in the candidate, then by sum of priorities
-          # as a tie-breaker.
+          # rank 越小 = 优先级越高。先按候选中所有轴里最好（最小）的优先级
+          # 排序，再以优先级之和作为次序判定。
           indices = tuple(c[0] for c in candidate)
           best_priority = min(priority_map[i] for i in indices)  # type: ignore
           total_priority = sum(priority_map[i] for i in indices)  # type: ignore
@@ -345,30 +337,29 @@ def _create_device_mesh_for_nd_torus(
 
       for elem in candidates:
         c_indices, c_axes = zip(*elem)
-        # TODO(zhangqiaorjc): Due to limitations in XLA, 2D collectives only
-        # implemented for square 2D plane. Mapping a physical axis to two
-        # logical axes might be slower for non-square 2D plane, e.g., map 32 to
-        # 4x8 or a single axis. If XLA 2D collectives support non-square plane
-        # soon, we can continue to preferentially map to 2D plane in general,
-        # otherwise, we should treat non-square 2D plane and 1D submesh equally.
+        # TODO(zhangqiaorjc): 由于 XLA 的限制，二维集合通信目前只为正方的
+        # 二维平面实现。把物理轴映射到两个逻辑轴时，对非正方的二维平面
+        # 可能更慢，例如把 32 映射为 4x8 或单个轴。如果 XLA 的二维集合
+        # 通信很快支持非正方平面，我们就可以继续普遍地优先映射到二维
+        # 平面；否则，我们应当同等对待非正方二维平面和一维子网格。
         if np.prod(c_axes) == logical_axis_size:
           assignment[logical_axis_index] = c_indices
-          # Zero the assigned physical axes.
+          # 把已分配的物理轴清零。
           assignable_physical_mesh = [
               0 if i in c_indices else v
               for i, v in enumerate(assignable_physical_mesh)
           ]
           break
       if assignment[logical_axis_index]:
-        # We already found an assignment from one candidate above.
+        # 上面已经从一个候选中找到了分配方案。
         break
     else:
-      # If the num_axes for loop did not break, i.e. none of the candidates work
-      # goto here with this while-else construct.
+      # 如果 num_axes 的 for 循环没有 break，即所有候选都不适用，就会带着
+      # 这个 while-else 结构走到这里。
       if logical_axis_size > 1:
         if not allow_split_physical_axes:
-          # Although this is now implemented, there are downstream tasks
-          # counting on this being a NotImplementedError.
+          # 尽管该功能现已实现，但仍有下游任务依赖这里抛出
+          # NotImplementedError。
           raise NotImplementedError(
               'Failed to find assignment for logical_axis_index'
               f' {logical_axis_index} of size {logical_axis_size} with'
@@ -380,13 +371,13 @@ def _create_device_mesh_for_nd_torus(
               ' allow_split_physical_axes to True.'
           )
         else:
-          # We will try finding an assignment, even if that means splitting the
-          # physical axes, which requires a more sophisticated implementation.
+          # 我们会继续尝试寻找分配方案，即便这意味着拆分物理轴，而这需要
+          # 更精细的实现。
           return _create_device_mesh_for_nd_torus_splitting_axes(
               physical_mesh, mesh_shape
           )
 
-  # Flatten the assignment, e.g., [(), (2,), (0, 1)] -> (2, 0, 1).
+  # 展平分配结果，例如 [(), (2,), (0, 1)] -> (2, 0, 1)。
   transpose: list[int] = []
   assignment_array = np.ones(
       [len(physical_mesh.shape), len(mesh_shape)], dtype=np.int64
@@ -408,29 +399,26 @@ def _create_device_mesh_for_nd_torus_splitting_axes(
     physical_mesh: np.ndarray,
     mesh_shape: Sequence[int],
 ) -> tuple[np.ndarray, np.ndarray]:
-  """Assigns logical parallelism axes to physical axes of an N-D torus network.
+  """把逻辑并行轴分配到 N 维环面网络的物理轴上。
 
-  This implementation allows creating meshes that requires splitting physical
-  axes, and thus one could produce logical mesh of any shape, as long as the
-  number of devices matches, e.g.,
+  该实现允许创建需要拆分物理轴的网格，因此只要设备数量匹配，就可以生成任意
+  形状的逻辑网格，例如：
 
-  - Creating 2x2x4 from 4x4;
+  - 从 4x4 创建 2x2x4；
 
-  - Creating 2x2x16 from 8x8;
+  - 从 8x8 创建 2x2x16；
 
   Args:
-    physical_mesh: a np.ndarray of devices in the shape of the N-D torus
-      physical topology.
-    mesh_shape: shape of the logical mesh (size of the various logical
-      parallelism axes), with axes ordered by increasing network intensity.
+    physical_mesh: 形状为 N 维环面物理拓扑的设备 np.ndarray。
+    mesh_shape: 逻辑网格的形状（各个逻辑并行轴的大小），其轴按网络强度递增
+      的顺序排列。
 
   Returns:
-    An np.ndarray of devices in the shape of the logical mesh (mesh_shape), with
-      each logical parallelism axis mapped to one or more physical mesh axes.
-    The axis assignment matrix, which is a 2-d array mapping from
-      (physical_axis, logical_axis) to the size assigned, with the invariant
-      np.prod(assignment, axis=1) = physical_mesh_shape, and
-      np.prod(assignment, axis=0) = mesh_shape.
+    一个形状为逻辑网格（mesh_shape）的设备 np.ndarray，其中每个逻辑并行轴都
+      映射到一个或多个物理网格轴。
+    轴分配矩阵，即一个二维数组，把 (physical_axis, logical_axis) 映射到所分配的
+      大小，并满足不变式 np.prod(assignment, axis=1) = physical_mesh_shape 与
+      np.prod(assignment, axis=0) = mesh_shape。
   """
   if np.prod(physical_mesh.shape) != np.prod(mesh_shape):
     raise ValueError(
@@ -442,25 +430,23 @@ def _create_device_mesh_for_nd_torus_splitting_axes(
   physical_mesh_shape = physical_mesh.shape
   logical_mesh_shape = tuple(mesh_shape)
 
-  # (Partial) assignment map as an 2-d array [p_axis, l_axis] -> size.
+  # （部分）分配映射，表示为二维数组 [p_axis, l_axis] -> size。
   assignment = np.ones(
       [len(physical_mesh_shape), len(logical_mesh_shape)], dtype=np.int64
   )
 
-  # Process logical axes from highest network intensity to lowest.
-  # `mesh_shape` is assumed to ordered by lowest network intensity first, so
-  # reverse it.
+  # 从网络强度最高到最低依次处理逻辑轴。
+  # 假定 `mesh_shape` 按网络强度从低到高排列，因此将其反转。
   for logical_axis, logical_axis_size in reversed(
       list(enumerate(logical_mesh_shape))
   ):
-    # Go over all the possible assignment for the logical axis, including the
-    # one that splits multiple physical axes.
+    # 遍历该逻辑轴所有可能的分配方案，包括会拆分多个物理轴的方案。
     best_logical_axis_assignment: np.ndarray | None = None
     for logical_axis_assignment in _enumerate_feasible_logical_axis_assignments(
         physical_mesh_shape, assignment, logical_axis_size
     ):
-      # TODO(rosun): Instead of using heuristics, replace this with a proper
-      # scoring function reflecting the underlying hardware properties.
+      # TODO(rosun): 不要使用启发式规则，而是用能反映底层硬件特性的合适评分
+      # 函数来替代。
       if (
           best_logical_axis_assignment is None
           or _prefer_first_logical_axis_assignment(
@@ -473,7 +459,7 @@ def _create_device_mesh_for_nd_torus_splitting_axes(
         best_logical_axis_assignment = logical_axis_assignment
     assignment[:, logical_axis] = best_logical_axis_assignment  # pyrefly: ignore[unsupported-operation]  # numpy 2.2
 
-  # Read out the assignment.
+  # 读出分配结果。
   logical_mesh = _generate_logical_mesh(
       physical_mesh, logical_mesh_shape, assignment
   )
@@ -482,7 +468,7 @@ def _create_device_mesh_for_nd_torus_splitting_axes(
 
 
 def _get_prime_factors(x: int) -> list[int]:
-  """Returns a sorted list of prime factors for the given number."""
+  """返回给定数字的有序质因数列表。"""
   assert x > 0
   factors = []
   p = 2
@@ -501,24 +487,24 @@ def _enumerate_feasible_logical_axis_assignments(
     assignment: np.ndarray,
     logical_axis_size: int,
 ) -> Generator[np.ndarray]:
-  """Yields feasible assignments for a single logical axis.
+  """为单个逻辑轴生成可行的分配方案。
 
-  For a physical mesh of shape [x_1, ..., x_n], and the product of all previous
-  assignments on each physical axes [y_1, ..., y_n], this function yields all
-  possible assignments for the axis as 1-d arrays [z_1, ..., z_n], so that:
+  对于形状为 [x_1, ..., x_n] 的物理网格，以及各个物理轴上此前已有分配大小的
+  乘积 [y_1, ..., y_n]，本函数以一维数组 [z_1, ..., z_n] 的形式生成该轴所有
+  可能的分配方案，使其满足：
 
   - prod(z_1, ..., z_n) = logical_axis_size
 
   - x_i % (z_i * y_i) = 0
 
   Args:
-    physical_mesh_shape: Physical mesh shape.
-    assignment: Existing assignment matrix.
-    logical_axis_size: Size of the logical axis to assign.
+    physical_mesh_shape: 物理网格形状。
+    assignment: 已有的分配矩阵。
+    logical_axis_size: 待分配的逻辑轴大小。
 
   Yields:
-    All valid assignments for the logical axis. Each assignment is represented
-    as an integer array of length len(physical_mesh_shape).
+    该逻辑轴的所有合法分配方案。每个方案表示为长度为 len(physical_mesh_shape)
+    的整数数组。
   """
   logical_axis_factors: MutableMapping[int, int] = collections.defaultdict(int)
   for factor in _get_prime_factors(logical_axis_size):
@@ -528,10 +514,8 @@ def _enumerate_feasible_logical_axis_assignments(
       assignment, axis=-1
   )
 
-  # To enable efficient enumerations, we first index physical axes by their
-  # prime factors. Since we know the prime factorization of the logical axis
-  # size, we could simply enumerate by picking the correct count for each
-  # prime factor.
+  # 为实现高效枚举，我们先用质因数给物理轴建立索引。既然已知逻辑轴大小的
+  # 质因数分解，我们只需为每个质因数挑选正确的个数即可完成枚举。
   physical_axes_by_factor: MutableMapping[int, list[int]] = (
       collections.defaultdict(list)
   )
@@ -570,28 +554,25 @@ def _prefer_first_logical_axis_assignment(
     physical_mesh_shape: Sequence[int],
     assignment: np.ndarray,
 ) -> bool:
-  """Returns True if the first axis assignment is preferred over the second.
+  """若第一个轴分配方案优于第二个，则返回 True。
 
-  For now, this is implemented with some very simple heuristics. However,
-  it is possible to introduce e.g., a value function here based on a more
-  precise model of the underlying hardware.
+  目前这只是一些非常简单的启发式规则。不过，我们完全可以在这里引入例如基于
+  对底层硬件更精确建模的价值函数。
 
-  TODO(rosun): Use a proxy of network capacity to select the partitions.
+  TODO(rosun): 使用网络容量的一个代理指标来选择划分方案。
 
   Args:
-    x: Logical axis assignment as [len(physical_mesh_shape)] array.
-    y: Logical axis assignment as [len(physical_mesh_shape)] array.
-    physical_mesh_shape: Physical mesh shape.
-    assignment: Assignment matrix.
+    x: 逻辑轴分配方案，形状为 [len(physical_mesh_shape)] 的数组。
+    y: 逻辑轴分配方案，形状为 [len(physical_mesh_shape)] 的数组。
+    physical_mesh_shape: 物理网格形状。
+    assignment: 分配矩阵。
 
   Returns:
-    True if x is preferred over y.
+    若 x 优于 y 则返回 True。
   """
-  # Prefer occupying complete physical axes. I don't have a good reason for
-  # this, except that it is compatible with the existing behavior.
+  # 优先占满完整的物理轴。我对此没有很好的理由，只是它与既有行为兼容。
   #
-  # E.g., on 4 x 4 x 8, [4, 4, -] will be preferred over [4, -, 4], and then
-  # over [2, 2, 4].
+  # 例如，在 4 x 4 x 8 上，[4, 4, -] 优于 [4, -, 4]，后者又优于 [2, 2, 4]。
   x_whole_axis_size = np.prod(
       [s for i, s in enumerate(x) if s == physical_mesh_shape[i]]
   )
@@ -602,9 +583,9 @@ def _prefer_first_logical_axis_assignment(
   if x_whole_axis_size != y_whole_axis_size:
     return x_whole_axis_size > y_whole_axis_size
 
-  # Prefer occupying more whole physical axes for better bandwidth.
+  # 优先占满更多完整的物理轴，以获得更好的带宽。
   #
-  # This is consistent with existing logic, i.e., 2 x 2 is preferred over 4.
+  # 这与既有逻辑一致，即 2 x 2 优于 4。
   x_num_whole_axes = len(
       [1 for i, s in enumerate(x) if s == physical_mesh_shape[i] and s > 1]
   )
@@ -615,11 +596,10 @@ def _prefer_first_logical_axis_assignment(
   if x_num_whole_axes != y_num_whole_axes:
     return x_num_whole_axes > y_num_whole_axes
 
-  # Prefer taking physical axes that are not taken by logical axes of higher
-  # network intensity. E.g., for a 4 x 4 x 4, suppose that the previous
-  # assignments are 1 x 2 x 4, and we want to place a new logical axis of size
-  # 2, we will go for [2, 1, 1] instead of [1, 2, 1], as the latter choice will
-  # tap into bandwidth already taken by the higher intensity axis.
+  # 优先选择尚未被网络强度更高的逻辑轴占用的物理轴。例如对于 4 x 4 x 4，
+  # 假设此前的分配为 1 x 2 x 4，现在要放置一个大小为 2 的新逻辑轴，我们会
+  # 选择 [2, 1, 1] 而不是 [1, 2, 1]，因为后者会占用已被更高强度轴占用的
+  # 带宽。
   assigned_physical_mesh_shape = np.prod(assignment, axis=-1)
 
   x_non_overlapping_axis_size = np.prod(
@@ -632,8 +612,7 @@ def _prefer_first_logical_axis_assignment(
   if x_non_overlapping_axis_size != y_non_overlapping_axis_size:
     return x_non_overlapping_axis_size > y_non_overlapping_axis_size
 
-  # Otherwise sort by reverse lexical graphical order, to be consistent with
-  # existing behavior.
+  # 否则按逆字典序排序，以与既有行为保持一致。
   return tuple(x) > tuple(y)
 
 
@@ -642,15 +621,15 @@ def _generate_logical_mesh(
     logical_mesh_shape: Sequence[int],
     assignment: np.ndarray,
 ) -> np.ndarray:
-  """Compute the logical mesh from assignment map.
+  """根据分配映射计算逻辑网格。
 
   Args:
-    physical_mesh: Physical device mesh.
-    logical_mesh_shape: Logical mesh shape.
-    assignment: 2-d assignment matrix shape [physical_dims, logical_dims].
+    physical_mesh: 物理设备网格。
+    logical_mesh_shape: 逻辑网格形状。
+    assignment: 形状为 [physical_dims, logical_dims] 的二维分配矩阵。
 
   Returns:
-    Logical mesh reshaped from physical mesh.
+    由物理网格变形得到的逻辑网格。
   """
   physical_indices = np.broadcast_to(
       np.expand_dims(
@@ -666,18 +645,17 @@ def _generate_logical_mesh(
       assignment.shape,
   ).reshape([-1])
 
-  # Axes of logical mesh is ordered by (physical_axis, logical_axis).
+  # 逻辑网格的轴按 (physical_axis, logical_axis) 排序。
   #
-  # Note that we sort for each physical_axis the logical_axis, so that higher
-  # intensity logical axes are replicated at inner (minor) dimensions.
+  # 注意我们为每个 physical_axis 对 logical_axis 排序，使强度更高的逻辑轴被
+  # 复制到更靠内（次要）的维度上。
   #
-  # E.g., if a dimension size is 12 = 3x4, where 3 is higher intensity and 4
-  # is lower, we want to reshape so that it becomes 12 = 4x3. Imagine in the
-  # 1-d case, this will allow more connections between the higher intensity
-  # axes.
+  # 例如，若某个维度大小为 12 = 3x4，其中 3 强度更高、4 更低，我们希望变形
+  # 后得到 12 = 4x3。可以想象在一维情形下，这会让强度更高的轴之间有更多
+  # 连接。
   logical_mesh = np.reshape(physical_mesh, assignment.reshape([-1]))
 
-  # We will then group by l_axis as this is what is expected from output.
+  # 接着按 l_axis 分组，因为这是输出所期望的形式。
   _, _, transpose_axes = zip(
       *sorted(
           zip(logical_indices, physical_indices, range(len(logical_indices)))
@@ -685,32 +663,30 @@ def _generate_logical_mesh(
   )
   logical_mesh = np.transpose(logical_mesh, transpose_axes)
 
-  # Reshape to add the trivial dimensions back.
+  # 通过变形把大小为 1 的平凡维度加回来。
   logical_mesh = np.reshape(logical_mesh, logical_mesh_shape)
 
   return logical_mesh
 
 
 def _get_physical_tpu_mesh(jax_devices: Sequence[Any]) -> np.ndarray:
-  r"""Rearrange TPU devices in a slice into a physical mesh.
+  r"""把 TPU slice 中的设备重排为物理网格。
 
   Args:
-    jax_devices: A list of JAX devices in a TPU slice in process-tiled z, y, x,
-      core order, e.g. from jax.devices(). The coordinates of these devices
-      should constitute a cuboid with no holes; e.g., the coordinates can be
-      {(1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)} (a 1x2x2 cuboid); passing
-      only 3 of these devices would result in a "hole" in that cuboid, which is
-      an error.  As in our example, the cuboid is not required to include the
-      point (0, 0, 0).
+    jax_devices: TPU slice 中 JAX 设备的列表，按进程切分的 z、y、x、core 顺序
+      排列，例如来自 jax.devices()。这些设备的坐标应构成一个无空洞的长方体；
+      例如坐标可以是 {(1, 0, 0), (1, 0, 1), (1, 1, 0), (1, 1, 1)}（一个 1x2x2
+      的长方体）；若只传入其中 3 个设备，该长方体中就会出现一个“空洞”，这会
+      导致错误。如我们的例子所示，长方体不要求包含点 (0, 0, 0)。
 
   Returns:
-    A np.ndarray of JAX devices with shape [global_x, global_y, global_z]. On
-      v2 and v3, global_z is instead cores_per_chip (i.e., 2).
+    形状为 [global_x, global_y, global_z] 的 JAX 设备 np.ndarray。在 v2 和 v3
+      上，global_z 改为 cores_per_chip（即 2）。
   """
   device_kind = jax_devices[0].device_kind
   device_coords = [d.coords for d in jax_devices]
   coord_size = len(device_coords[0])
-  # Position-wise max and min coordinates:
+  # 逐位置的最大与最小坐标：
   max_coords = tuple(
       max(dc[i] for dc in device_coords) for i in range(coord_size)
   )
@@ -765,7 +741,7 @@ def _get_physical_tpu_mesh(jax_devices: Sequence[Any]) -> np.ndarray:
           coords[2] - min_coords[2],
       ] = d
 
-  # Check there is no "hole" in the mesh we constructed.
+  # 检查我们构造的网格中不存在“空洞”。
   if (out == None).any():
     raise AssertionError(
         'Constructed mesh contains a "hole"; probable cause: coordinates '
@@ -774,7 +750,7 @@ def _get_physical_tpu_mesh(jax_devices: Sequence[Any]) -> np.ndarray:
   return out
 
 
-# jekbradbury's famous trick for creating contiguous submeshes (where available)
+# jekbradbury 那个用于创建连续子网格的著名技巧（在可用的情况下）
 def _transpose_trick(
     physical_mesh: np.ndarray, mesh_shape: Sequence[int]
 ) -> np.ndarray:
@@ -819,30 +795,25 @@ def create_device_mesh(
     contiguous_submeshes: bool = False,
     allow_split_physical_axes: bool = False,
 ) -> np.ndarray:
-  """Creates a performant device mesh for jax.sharding.Mesh.
+  """为 jax.sharding.Mesh 创建一个高性能的设备网格。
 
   Args:
-    mesh_shape: shape of logical mesh, ordered by increasing network-intensity
-      e.g. [replica, data, mdl] where mdl has the most network communication
-      requirements.
-    devices: optionally, the devices to construct a mesh for. Defaults to
-      jax.devices().
-    contiguous_submeshes: if True, this function will attempt to create a mesh
-      where each process's local devices form a contiguous submesh. A ValueError
-      will be raised if this function can't produce a suitable mesh. This
-      setting was sometimes necessary before the introduction of jax.Array to
-      ensure non-ragged local arrays; if using jax.Arrays, it's better to keep
-      this set to False.
-    allow_split_physical_axes: If True, we will split physical axes if necessary
-      to produce the desired device mesh.
+    mesh_shape: 逻辑网格的形状，按网络强度递增的顺序排列，例如
+      [replica, data, mdl]，其中 mdl 的网络通信需求最大。
+    devices: 可选，用于构建网格的设备。默认为 jax.devices()。
+    contiguous_submeshes: 若为 True，本函数会尝试创建一个让每个进程的本地设备
+      构成连续子网格的网格。若无法生成合适的网格，将抛出 ValueError。在引入
+      jax.Array 之前，为了保证本地数组不是参差不齐的，有时需要该设置；如果
+      使用 jax.Array，最好把它保持为 False。
+    allow_split_physical_axes: 若为 True，我们会在必要时拆分物理轴，以生成所需
+      的设备网格。
 
   Raises:
-    ValueError: if the number of devices doesn't equal the product of
-      `mesh_shape`.
+    ValueError: 若设备数量不等于 `mesh_shape` 的乘积。
 
   Returns:
-    A np.ndarray of JAX devices with mesh_shape as its shape that can be fed
-    into jax.sharding.Mesh with good collective performance.
+    一个以 mesh_shape 为形状的 JAX 设备 np.ndarray，可传入 jax.sharding.Mesh
+    并获得良好的集合通信性能。
   """
   if devices is None:
     devices = xb.devices()
@@ -874,10 +845,9 @@ def create_device_mesh(
     if contiguous_submeshes:
       physical_mesh = _transpose_trick(physical_mesh, new_mesh_shape)
 
-    # For TPU v7/v7x, the core axis (last axis) has higher bandwidth than x/y/z
-    # axes. _create_device_mesh_for_nd_torus detects this from the device kind
-    # and preferentially maps high network intensity logical axes to the core
-    # axis without any caller-supplied priority.
+    # 对于 TPU v7/v7x，core 轴（最后一个轴）的带宽高于 x/y/z 轴。
+    # _create_device_mesh_for_nd_torus 会从设备类型识别出这一点，并在无需
+    # 调用方提供优先级的情况下，优先把网络强度高的逻辑轴映射到 core 轴。
     device_mesh, _ = _create_device_mesh_for_nd_torus(
         physical_mesh,
         new_mesh_shape,
@@ -885,11 +855,10 @@ def create_device_mesh(
     )
     return device_mesh
   elif last_device.platform == 'gpu':
-    # The default jax.devices() order is not guaranteed to be performant, as it is
-    # based on process order rather than the topology-aware global numbering scheme
-    # assigned by XLA. If the device list is single-slice, this does not matter on
-    # modern systems, but the sort avoids a sharp edge if a multi-slice device list
-    # is passed.
+    # 默认的 jax.devices() 顺序不保证高性能，因为它基于进程顺序，而不是 XLA
+    # 分配的拓扑感知全局编号方案。如果设备列表来自单个 slice，这在现代系统
+    # 上没有影响，但当传入多 slice 的设备列表时，这里的排序可以避免一个
+    # 隐患。
     return np.asarray(sorted(devices, key=lambda d: d.id)).reshape(new_mesh_shape)
   else:
     device_mesh = np.asarray(devices).reshape(new_mesh_shape)
@@ -905,34 +874,28 @@ def create_hybrid_device_mesh(
     should_sort_granules_by_key: bool = True,
     allow_split_physical_axes: bool = False,
 ) -> np.ndarray:
-  """Creates a device mesh for hybrid (e.g., ICI and DCN) parallelism.
+  """为混合（例如 ICI 与 DCN）并行创建可用的设备网格。
 
   Args:
-    mesh_shape: shape of the logical mesh for the faster/inner network, ordered
-      by increasing network intensity, e.g. [replica, data, mdl] where mdl has
-      the most network communication requirements.
-    dcn_mesh_shape: shape of the logical mesh for the slower/outer network, in
-      the same order as mesh_shape.
-    devices: optionally, the devices to construct a mesh for. Defaults to
-      jax.devices().
-    process_is_granule: if True, this function will treat processes as the units
-      of the slower/outer network. Otherwise it will look for slice_index
-      attributes on devices and use slices as the units. Enabling this is meant
-      as a fallback for platforms that don't set slice_index.
-    should_sort_granules_by_key: Whether device granules should be sorted by the
-      granule key, either slice or process index, depending on
-      process_is_granule.
-    allow_split_physical_axes: If True, we will split physical axes if necessary
-      to produce the desired device mesh.
+    mesh_shape: 更快/内层网络的逻辑网格形状，按网络强度递增的顺序排列，例如
+      [replica, data, mdl]，其中 mdl 的网络通信需求最大。
+    dcn_mesh_shape: 更慢/外层网络的逻辑网格形状，顺序与 mesh_shape 相同。
+    devices: 可选，用于构建网格的设备。默认为 jax.devices()。
+    process_is_granule: 若为 True，本函数会把进程视为更慢/外层网络的单位。
+      否则它会查找设备上的 slice_index 属性，并以 slice 为单位。启用该选项
+      是为了给那些不设置 slice_index 的平台提供回退方案。
+    should_sort_granules_by_key: 是否按 granule 键（取决于 process_is_granule，
+      为 slice 索引或进程索引）对设备 granule 排序。
+    allow_split_physical_axes: 若为 True，我们会在必要时拆分物理轴，以生成所需
+      的设备网格。
 
   Raises:
-    ValueError: if the number of slices to which the `devices` belong doesn't
-      equal the product of `dcn_mesh_shape`, or if the number of devices
-      belonging to any single slice does not equal the product of `mesh_shape`.
+    ValueError: 若 `devices` 所属的 slice 数量不等于 `dcn_mesh_shape` 的乘积，
+      或者任一单个 slice 中的设备数量不等于 `mesh_shape` 的乘积。
 
   Returns:
-    A np.ndarray of JAX devices with mesh_shape * dcn_mesh_shape as its shape
-    that can be fed into jax.sharding.Mesh for hybrid parallelism.
+    一个以 mesh_shape * dcn_mesh_shape 为形状的 JAX 设备 np.ndarray，可传入
+    jax.sharding.Mesh 用于混合并行。
   """
   if devices is None:
     devices = xb.devices()
@@ -963,7 +926,7 @@ def create_hybrid_device_mesh(
       )
       for granule in granules
   ]
-  # TODO(jekbradbury): handle non-uniform DCN topologies
+  # TODO(jekbradbury): 处理非均匀的 DCN 拓扑
   granule_mesh = np.arange(len(granules)).reshape(dcn_mesh_shape)
   blocks = np.vectorize(lambda i: per_granule_meshes[i], otypes=[object])(
       granule_mesh

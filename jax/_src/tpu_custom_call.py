@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""JAX bindings for Mosaic."""
+# 文件职责：为 Mosaic 编译出的 MLIR 内核提供 JAX 侧的绑定与降级通路。
+# 本模块把 Mosaic 内核模块序列化成 TPU 自定义调用（custom call）的后端配置，
+# 再通过原语 `tpu_custom_call` 在 HLO 中发出，最终交由 Pallas/Mosaic 在 TPU 上执行。
+# 关键内容包括：内存空间与副作用类型枚举、后端配置的 JSON 序列化与 IR 版本降级、
+# 自定义调用的抽象求值/批处理/降级规则，以及 collective id 的自动分配逻辑。
+
+"""Mosaic 的 JAX 绑定。"""
 
 from __future__ import annotations
 
@@ -49,27 +55,27 @@ _AUTO_COLLECTIVE_BASE_ID = 7000
 
 _extra_dialect_loaders: list[Callable[[ir.Context], None]] = []
 
-# TODO(b/489398450): Remove this
+# TODO(b/489398450): 移除此项
 def register_extra_dialect(loader: Callable[[ir.Context], None]):
   _extra_dialect_loaders.append(loader)
 
 
-# Hook to override get_ir_version.
-# TODO(b/499085720): Remove this in favor of something principled.
+# 用于覆盖 get_ir_version 的钩子。
+# TODO(b/499085720): 改用更有原则的方案，届时移除这段代码。
 ir_version_override: Callable[[], int | None] | None = None
 
 
-# Controls the IR serialization version. Upon incrementing the
-# default version in jaxlib/mosaic/dialect/tpu/transforms/serde.cc we must
-# continue to use the old serialization version when in forward compatibility
-# mode: for 1 month when exporting, or when using old cloud TPU.
+# 控制 IR 序列化版本。当 jaxlib/mosaic/dialect/tpu/transforms/serde.cc
+# 中的默认版本被提升之后，我们在前向兼容模式下必须继续使用旧的
+# 序列化版本，前向兼容模式指的是：导出后的 1 个月内，或者
+# 使用旧版 Cloud TPU 时。
 #
-# This can be achieved by adding:
+# 这可以通过加入以下代码来实现：
 #    if ctx.is_forward_compat() or backend is None or not is_libtpu_at_least(<version>):
 #       return <previous_serialization_version>
 #    return None
 #
-# We should also add a TODO to remove the conditional one month later.
+# 我们还应该加一条 TODO，在一个月后移除这个条件分支。
 _FWD_COMPAT_VERSION = 15
 def get_ir_version(ctx: mlir.LoweringRuleContext) -> int | None:
   backend = ctx.module_context.get_backend(optional=True)
@@ -151,11 +157,11 @@ class CostEstimate(TypedDict):
 
 
 class TpuSideEffectType(enum.Enum):
-  # No side effects, can be deduplicated / removed if unused.
+  # 没有副作用，可以被去重；若结果未被使用也可以被移除。
   PURE = "pure"
-  # Cannot be deduplicated, but can be removed if unused.
+  # 不能被去重，但若结果未被使用则可以被移除。
   DATAFLOW_SIDE_EFFECTING = "dataflow_side_effecting"
-  # Cannot be deduplicated or removed.
+  # 既不能被去重，也不能被移除。
   SIDE_EFFECTING = "side_effecting"
 
 
@@ -173,7 +179,7 @@ class OptLevel(enum.Enum):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CustomCallBackendConfig:
-  """Represents an unserialized backend config for custom calls."""
+  """表示自定义调用（custom call）尚未序列化的后端配置。"""
   lowered_module_asm: bytes
   lowered_module_asm_version: int | None
   has_communication: bool
@@ -194,8 +200,8 @@ class CustomCallBackendConfig:
   input_memory_spaces: tuple[MemorySpace | None, ...] | None
   skip_device_barrier: bool
   shape_invariant_numerics: bool
-  tiling: Tiling | None = None  # Only used for SparseCore.
-  opt_level: OptLevel | None = None  # Only used for SparseCore.
+  tiling: Tiling | None = None  # 仅用于 SparseCore。
+  opt_level: OptLevel | None = None  # 仅用于 SparseCore。
 
   def __post_init__(self):
     if self.allow_input_fusion is not None:
@@ -205,15 +211,15 @@ class CustomCallBackendConfig:
       object.__setattr__(self, "cost_estimate",
                          FrozenDict(self.cost_estimate))
 
-  # We omit the body while printing, because primitive params get embedded
-  # in HLO metadata, and the body blows up its size.
+  # 打印时会省略正文，因为原语参数会被嵌入 HLO 元数据，
+  # 而正体会使元数据的体积急剧膨胀。
   def __repr__(self):
     return "CustomCallBackendConfig(<omitted>)"
 
   def downgrade_lowered_module_asm(
       self, version: int
   ) -> CustomCallBackendConfig:
-    """Downgrades the lowered module asm to the given version."""
+    """把已降级模块的汇编（asm）降至指定版本。"""
     assert (
         self.lowered_module_asm_version is None
         or self.lowered_module_asm_version > version
@@ -241,8 +247,8 @@ class CustomCallBackendConfig:
     )
 
   def to_json(self) -> bytes:
-    """Serializes the backend config into JSON."""
-    # We format the JSON ourselves, because json.dumps seems to be overly slow.
+    """把后端配置序列化为 JSON。"""
+    # 我们自己拼接 JSON，因为 json.dumps 似乎过慢。
     config = io.BytesIO()
     config.write(b'{"custom_call_config": {"body": "')
     config.write(base64.b64encode(self.lowered_module_asm))
@@ -305,8 +311,8 @@ class CustomCallBackendConfig:
         if memory_space is None:
           continue
         if memory_space is MemorySpace.SMEM:
-          # TODO(sharadmv): Add support for SMEM (though atm, XLA will not
-          # page out SMEM arrays).
+          # TODO(sharadmv): 添加对 SMEM 的支持（不过目前 XLA 不会
+          # 把 SMEM 数组换出）。
           continue
         if memory_space not in (
             MemorySpace.HBM,
@@ -336,7 +342,7 @@ class CustomCallBackendConfig:
     if self.skip_device_barrier:
       config.write(b', "skip_device_barrier": ')
       config.write(str(self.skip_device_barrier).lower().encode("ascii"))
-    config.write(b"}")  # End of custom_call_config.
+    config.write(b"}")  # custom_call_config 结束。
     if self.device_type == "sparsecore":
       config.write(b', "sparse_core_config": ')
       sparse_core_config: dict[str, Any] = {}
@@ -439,13 +445,13 @@ def _tpu_custom_call_lowering(
         for aval_out in ctx.avals_out
     ])
   extra_attributes: dict[str, ir.Attribute] | None = None
-  # Add kernel_name and kernel_metadata as attributes to the custom call op.
-  # This is because we do not want to pollute the backend_config with this
-  # information.
+  # 把 kernel_name 和 kernel_metadata 作为属性添加到自定义调用操作上。
+  # 这是因为我们不想让这些信息污染 backend_config，
+  # 使其变得臃肿。
   if kernel_name is not None:
     extra_attributes = dict(kernel_name=ir.StringAttr.get(kernel_name))
-  # If the IR version we originally generated the ASM string with is not the
-  # same as the one we should have used, we need to downgrade the ASM string.
+  # 如果我们最初生成 ASM 字符串时所用的 IR 版本与
+  # 本应使用的版本不一致，就需要降级该 ASM 字符串。
   ir_version = get_ir_version(ctx)
   if (
       ir_version is not None and
@@ -490,7 +496,7 @@ def _lower_mosaic_module_to_asm(
   has_communication, has_custom_barrier = tpu.private_has_communication(
       module.operation
   )
-  # We'll mutate the module, so clone it
+  # 后面会修改该模块，所以先克隆一份
   ctx = module.context
   with ctx, module.operation.location as _:
     module_op = module.operation.clone(ip=False)
@@ -517,7 +523,7 @@ def _lower_mosaic_module_to_asm(
 
 
 def _get_device_type(module: ir.Module) -> str | None:
-  """Determines the device type based on the core_type annotations."""
+  """根据 core_type 注解判断设备类型。"""
   sparsecore_func_found = False
   tensorcore_func_found = False
 
@@ -654,7 +660,7 @@ def _lower_to_custom_call_config(
 ) -> CustomCallBackendConfig:
   device_type = _get_device_type(module)
   needs_hlo_passes = config.jax_mosaic_allow_hlo.value
-  # TC kernels always require layout passes.
+  # TC 内核始终需要布局 pass。
   needs_layout_passes = needs_layout_passes or not device_type
   lowered_module_asm, (
       has_communication,
@@ -731,7 +737,7 @@ def _lowered_to_custom_call_config(
           f"{collective_id=} in {kernel_name=} should be None when"
           " auto-assigning collective ids."
       )
-    else:  # override mode
+    else:  # 覆盖模式
       collective_id = None
   if has_custom_barrier:
     if (auto_assign_collective_id and ctx is not None
@@ -762,9 +768,9 @@ def _lowered_to_custom_call_config(
                 " collective ids:"
                 f" {ctx.module_context.pallas_collective_id_mapping}"
             )
-      else:  # Manually assigned collective ID.
-        # We need to check for a conflict between the manual collective id
-        # and the auto-assigned collective ids so far.
+      else:  # 手动指定的 collective ID。
+        # 需要检查手动指定的 collective id 与
+        # 目前已自动分配的 collective id 之间是否冲突。
         if (collective_id
             in ctx.module_context.pallas_collective_id_mapping.auto.values()):
           raise ValueError(
@@ -922,7 +928,7 @@ def as_tpu_kernel(
     _ir_version: int | None = None,
     opt_level: OptLevel | None = None,
 ) -> Callable[..., Any]:
-  """Turns an MLIR Mosaic kernel into a JAX-compatible function."""
+  """把 MLIR Mosaic 内核转换为与 JAX 兼容的函数。"""
   config = _lower_to_custom_call_config(
       module,
       vmem_limit_bytes=vmem_limit_bytes,
@@ -981,12 +987,12 @@ def lowered_as_tpu_kernel(
   ctx = lowered_module.context
   with ctx, lowered_module.operation.location as _:
     module_op = lowered_module.operation.clone(ip=False)
-    # Temporarily allow unregistered dialects for serialization.
+    # 为序列化临时允许未注册的方言（dialect）。
     prev_allow_unregistered_dialects = ctx.allow_unregistered_dialects
     ctx.allow_unregistered_dialects = True
-    # We hardcode a specific version both here and below, since this path is
-    # only used by some internal tests that don't need serialization, but we do
-    # need a concrete version on the module.
+    # 这里和下面都硬编码同一个版本号，因为这条路径只被少数
+    # 不需要序列化的内部测试使用，但模块上仍需要一个具体的
+    # 版本号。
     current_ir_version = 15
     try:
       pipeline = PassManager.parse(
@@ -1055,7 +1061,7 @@ def _as_jax_callable(
   out_avals = tuple(ty if isinstance(ty, core.ShapedArray) else
                     core.typeof(ty) for ty in out_type)
 
-  # We use jax.jit to make sure we hit the fast compilation cache.
+  # 我们使用 jax.jit 以确保命中快速编译缓存。
   def apply_kernel(*args):
     result = tpu_custom_call_p.bind(
         *args,

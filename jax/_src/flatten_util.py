@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：提供把数组组成的 pytree 展平成一维数组、并能还原回原结构的工具。
+# 对外主要暴露 `ravel_pytree` 与 `unravel_pytree`：按叶子顺序拼接所有数组叶子，
+# 并返回一个可调用对象，用于把相同长度的一维向量还原成结构相同的 pytree。
+# 当各叶子 dtype 不一致时会先做类型提升，并在还原时逐叶子转回原 dtype，
+# 因此展平结果对 dtype 是多态的；各 dtype 一致时则跳过转换以避免额外开销。
 
 from collections.abc import Iterable
 import numpy as np
@@ -28,21 +33,20 @@ Shapes: TypeAlias = tuple[tuple[int, ...], ...]
 
 
 def ravel_pytree(pytree: Any) -> tuple[Array, Callable[[Array], Any]]:
-  """Ravel (flatten) a pytree of arrays down to a 1D array.
+  """把由数组组成的 pytree 展平（ravel）成一维数组。
 
   Args:
-    pytree: a pytree of arrays and scalars to ravel.
+    pytree: 要展平的、由数组与标量组成的 pytree。
 
   Returns:
-    A pair where the first element is a 1D array representing the flattened and
-    concatenated leaf values, with dtype determined by promoting the dtypes of
-    leaf values, and the second element is a callable for unflattening a 1D
-    vector of the same length back to a pytree of the same structure as the
-    input ``pytree``. If the input pytree is empty (i.e. has no leaves) then as
-    a convention a 1D empty array of dtype float32 is returned in the first
-    component of the output.
+    一个二元组。第一个元素是表示展平并拼接后的叶子值的一维数组，其 dtype 由各
+    叶子值的 dtype 提升决定。
+    第二个元素是可调用对象，用于把相同长度的一维向量还原成与输入 ``pytree``
+    结构相同的 pytree。
+    如果输入 pytree 为空（即没有叶子），则按约定在输出的第一个分量返回一个
+    dtype 为 float32 的一维空数组。
 
-  For details on dtype promotion, see
+  关于 dtype 提升的细节，见
   https://docs.jax.dev/en/latest/type_promotion.html.
 
   """
@@ -67,15 +71,15 @@ def _ravel_list(lst: list[Any], /) -> tuple[Array, Callable[[Array], list[Any]]]
   sizes, shapes = unzip2((np.size(x), np.shape(x)) for x in lst)
 
   if all(dt == to_dtype for dt in from_dtypes):
-    # Skip any dtype conversion, resulting in a dtype-polymorphic `unravel`.
-    # See https://github.com/jax-ml/jax/issues/7809.
+    # 跳过任何 dtype 转换，从而得到 dtype 多态的 `unravel`。
+    # 参见 https://github.com/jax-ml/jax/issues/7809。
     del from_dtypes, to_dtype
     ravel = lambda e: lax.reshape(e, (np.size(e),))
     raveled = lax.concatenate([ravel(e) for e in lst], dimension=0)
     return raveled, HashablePartial(_unravel_list_single_dtype, sizes, shapes)
 
-  # When there is more than one distinct input dtype, we perform type
-  # conversions and produce a dtype-specific unravel function.
+  # 当存在多个不同的输入 dtype 时，我们执行类型转换，
+  # 并生成一个针对特定 dtype 的 unravel 函数。
   ravel = lambda e: lax.convert_element_type(e, to_dtype).ravel()
   raveled = lax.concatenate([ravel(e) for e in lst], dimension=0)
   unrav = HashablePartial(_unravel_list, sizes, shapes, from_dtypes, to_dtype)

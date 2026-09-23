@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：探测本机可用硬件，供 JAX 的后端初始化与平台选择使用。
+# 它通过 PCI 设备表识别 Google TPU 的版本与芯片数量，并检查 NVIDIA/AMD GPU、
+# 透明大页开关以及 /dev/shm 的大小。这些探测只读取 /sys、/dev 等路径与 KFD
+# 拓扑信息，不加载任何加速器运行时，因此可以在导入期安全调用。
+
 import enum
 import logging
 import os
@@ -29,10 +34,10 @@ _NVIDIA_GPU_DEVICES = [
 
 
 class TpuVersion(enum.IntEnum):
-  # TPU v2, v3
+  # TPU v2、v3
   v2 = 0
   v3 = 1
-  # No public name (plc)
+  # 无公开名称（plc）
   plc = 2
   # TPU v4
   v4 = 3
@@ -63,7 +68,7 @@ _TPU_PCI_DEVICE_IDS = {
 }
 
 def num_available_tpu_chips_and_device_id():
-  """Returns the device id and number of TPU chips attached through PCI."""
+  """返回通过 PCI 挂载的 TPU 芯片数量与设备 id。"""
   num_chips = 0
   tpu_version = None
   for vendor_path in glob.glob('/sys/bus/pci/devices/*/vendor'):
@@ -81,14 +86,14 @@ def num_available_tpu_chips_and_device_id():
 
 
 def has_visible_nvidia_gpu() -> bool:
-  """True if there's a visible nvidia gpu available on device, False otherwise."""
+  """若设备上存在可见的 NVIDIA GPU 则返回 True，否则返回 False。"""
 
   return any(os.path.exists(d) for d in _NVIDIA_GPU_DEVICES)
 
 
 def transparent_hugepages_enabled() -> bool:
-  # See https://docs.kernel.org/admin-guide/mm/transhuge.html for more
-  # information about transparent huge pages.
+  # 有关透明大页的更多信息，参见
+  # https://docs.kernel.org/admin-guide/mm/transhuge.html
   path = pathlib.Path('/sys/kernel/mm/transparent_hugepage/enabled')
   return path.exists() and path.read_text().strip() == '[always] madvise never'
 
@@ -97,25 +102,22 @@ logger = logging.getLogger(__name__)
 
 
 def num_available_amd_gpus(stop_at: int | None = None) -> int:
-  """Count AMD GPUs available via KFD kernel driver.
+  """统计通过 KFD 内核驱动可用的 AMD GPU 数量。
 
-  This function checks for the presence of AMD GPUs by examining KFD kernel
-  driver entities as a proxy. In WSL setups, if /dev/dxg exists, this check
-  hardcodes the result to 1 GPU for initialization gating. This approach
-  provides a good compromise between performance, reliability and simplicity.
-  Presence of such entities doesn't guarantee that the GPUs are usable
-  through HIP and PJRT, however, we can't do much better without spawning an
-  additional process with a potentially complicated setup to run actual HIP
-  code. And we don't want to initialize HIP right now inside the current
-  process, because doing so might spoil a proper initialization of the
-  rocprofiler-sdk later during PJRT startup.
+  本函数通过检查 KFD 内核驱动实体是否存在，作为判断 AMD GPU 是否可用
+  的代理手段。在 WSL 环境中若 /dev/dxg 存在，该检查会为初始化门控把
+  结果硬编码为 1 个 GPU。这一方案在性能、可靠性与简洁性之间取得了很好
+  的折中。这类实体存在并不保证 GPU 可以通过 HIP 与 PJRT 使用，然而如果
+  不额外启动一个设置可能相当复杂的进程来运行真正的 HIP 代码，我们也无
+  法做得更好。而且我们不想现在就在当前进程内初始化 HIP，因为这样做
+  可能破坏后续 PJRT 启动时 rocprofiler-sdk 的正常初始化。
 
   Args:
-    stop_at: If provided, stop counting once this many GPUs are found.
-             This allows early exit when only checking for thresholds.
+    stop_at: 若提供，则在找到这么多个 GPU 后停止计数。
+             这样在只检查阈值时可以提前退出。
 
   Returns:
-    The number of AMD GPUs detected (up to stop_at if provided).
+    检测到的 AMD GPU 数量（若提供了 stop_at，则上限为该值）。
   """
   try:
     if os.path.exists("/dev/dxg"):
@@ -126,10 +128,10 @@ def num_available_amd_gpus(stop_at: int | None = None) -> int:
       return 0
 
     gpu_count = 0
-    # the RE matches strings like "simd_count ##" and extracts the number ##
+    # 该正则在 "simd_count ##" 这类字符串中匹配并提取出数字 ##
     r_simd_count = re.compile(r"\bsimd_count\s+(\d+)\b", re.MULTILINE)
-    # we're using a non-zero simd_count as a trait of a GPU following the
-    # KFD implementation
+    # 参照 KFD 的实现，我们以非零的 simd_count 作为 GPU 的特征，
+    # 见下面的链接：
     # https://github.com/torvalds/linux/blob/ea1013c1539270e372fc99854bc6e4d94eaeff66/drivers/gpu/drm/amd/amdkfd/kfd_topology.c#L941
 
     for node in os.listdir(kfd_nodes_path):
@@ -140,7 +142,7 @@ def num_available_amd_gpus(stop_at: int | None = None) -> int:
 
       try:
         file_size = os.path.getsize(node_props_path)
-        # 16KB is more than a reasonable limit
+        # 16KB 已远超合理上限
         if file_size <= 0 or file_size > 16 * 1024:
           continue
 
@@ -165,10 +167,10 @@ def num_available_amd_gpus(stop_at: int | None = None) -> int:
 
 
 def get_shm_size_in_mb():
-  """Get /dev/shm size in MB.
+  """获取 /dev/shm 的大小，单位为 MB。
 
   Returns:
-    Size in MB if /dev/shm exists, None if it doesn't exist, 0 on error.
+    若 /dev/shm 存在则返回以 MB 为单位的大小，不存在则返回 None，出错返回 0。
   """
   try:
     shm_path = "/dev/shm"
@@ -176,7 +178,7 @@ def get_shm_size_in_mb():
       return 0
 
     stat = os.statvfs(shm_path)
-    # Total size in bytes
+    # 以字节为单位的总大小
     shm_size_bytes = stat.f_blocks * stat.f_frsize
     shm_size_mb = shm_size_bytes / (1024 * 1024)
 

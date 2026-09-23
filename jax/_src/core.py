@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# 文件职责：JAX 追踪（tracing）与中间表示的核心。
+# 定义 Tracer/Trace（追踪器与追踪层级）、AbstractValue/ShapedArray 等抽象值(aval)、
+# Jaxpr 与 JaxprEqn（含效果 effect 与调试信息），以及 Var/Atom/Literal 等 jaxpr 构件，
+# 并提供 trace_to_jaxpr、eval_jaxpr、new_ref 等基础设施。
+# 它是 jit/grad/vmap 等所有变换与降级（lowering）共同依赖的底座；公开 API 见 `jax.core`。
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque, namedtuple
@@ -121,15 +127,15 @@ class Jaxpr:
 
   @property
   def constvars(self) -> list[Var]:
-    # The constant inputs are exactly those with values attached; an input
-    # without an attached value is a plain invar.
+    # 常量输入恰好就是那些附带了值的输入；没有附加值
+    # 的输入是普通的 invar。
     return self._all_invars[: len(self._consts)]
 
   @property
   def consts(self) -> list[Any]:
     return self._consts
 
-  literals = consts  # legacy ClosedJaxpr name for consts
+  literals = consts  # consts 的旧 ClosedJaxpr 名称
 
   @property
   def num_consts(self) -> int:
@@ -137,8 +143,8 @@ class Jaxpr:
 
   @property
   def jaxpr(self) -> Jaxpr:
-    # Legacy accessor from the days of ClosedJaxpr, which wrapped a Jaxpr.
-    # TODO(dougalm): remove uses and delete.
+    # 来自 ClosedJaxpr 时代的旧访问器，ClosedJaxpr 曾包装一个 Jaxpr。
+    # TODO(dougalm): 移除用法并删除。
     return self
 
   @property
@@ -181,17 +187,16 @@ class Jaxpr:
       outvars: Sequence[Atom] | None = None,
       eqns: Sequence[JaxprEqn] | None = None,
       effects: Effects = no_effects,
-      # We want all calls to pass a DebugInfo object, but for backwards
-      # compatibility we have to allow calls when the debug_info
-      # is missing.
+      # 我们希望所有调用都传入 DebugInfo 对象，但为了向后兼容，
+      # 必须允许 debug_info 缺失时的调用。
       debug_info: DebugInfo = None,  # pyrefly: ignore[bad-function-definition]
       is_high: bool = False,
       consts: Sequence[Any] | None = None,
   ):
     if isinstance(constvars, Jaxpr):
-      # Legacy ClosedJaxpr(jaxpr, consts) construction: share `jaxpr`'s
-      # structure and attach `consts` as its constant argument values.
-      # TODO(dougalm): migrate callers and remove.
+      # 旧的 ClosedJaxpr(jaxpr, consts) 构造方式：共享 `jaxpr` 的
+      # 结构，并把 `consts` 附加为其常量参数值。
+      # TODO(dougalm): 迁移调用方并移除。
       jaxpr = constvars
       assert outvars is None and eqns is None and debug_info is None
       if consts is None:
@@ -221,7 +226,7 @@ class Jaxpr:
     debug_info = debug_info or lu._missing_debug_info("core.Jaxpr")
     debug_info = debug_info.resolve_result_paths()
     if constvars and not self._consts:
-      # Constvars without attached values are plain leading invars.
+      # 没有附加值的 constvars 就是普通的前导 invars。
       debug_info = _shift_arg_names(debug_info, len(constvars))
     self._debug_info = debug_info
     config.enable_checks.value and self._debug_info.assert_arg_names(len(self.invars))
@@ -246,9 +251,9 @@ class Jaxpr:
     return p.text(self.pretty_print(use_color=True))
 
   def with_consts(self, consts: Sequence[Any]) -> Jaxpr:
-    """Returns a copy of this jaxpr with `consts` attached as the values of
-    its first `len(consts)` inputs, which thereby become its constvars.
-    Shares all other structure."""
+    """返回此 jaxpr 的一个副本，其中把 `consts` 附加为其前
+    `len(consts)` 个输入的值，这些输入因而成为它的 constvars。
+    共享所有其它结构。"""
     consts = list(consts)
     assert len(consts) <= len(self._all_invars)
     new = Jaxpr.__new__(Jaxpr)
@@ -263,13 +268,13 @@ class Jaxpr:
     return new
 
   def map_jaxpr(self, f):
-    # Legacy ClosedJaxpr method: apply f to the jaxpr, keeping consts.
+    # 旧的 ClosedJaxpr 方法：把 f 应用到 jaxpr 上，并保留 consts。
     return Jaxpr(f(self), self.consts)
 
   def replace(self, **kwargs):
     if "jaxpr" in kwargs:
-      # Legacy ClosedJaxpr.replace(jaxpr=..., consts=...) form.
-      # TODO(dougalm): migrate callers and remove.
+      # 旧的 ClosedJaxpr.replace(jaxpr=..., consts=...) 形式。
+      # TODO(dougalm): 迁移调用方并移除。
       jaxpr = kwargs.pop("jaxpr")
       consts = kwargs.pop("consts", None)
       if kwargs:
@@ -281,8 +286,8 @@ class Jaxpr:
     if (kwargs.get('invars', self.invars) != self.invars or
         kwargs.get('outvars', self.outvars) != self.outvars):
       debug_default = debug_default.with_unknown_names()
-    # Replacing constvars invalidates the consts pairing, so unless new consts
-    # are given explicitly the result has no consts attached.
+    # 替换 constvars 会使 consts 的配对失效，因此除非显式给出新的
+    # consts，否则结果不会附加任何 consts。
     consts_default = () if "constvars" in kwargs else self.consts
     jaxpr = Jaxpr(
         constvars=kwargs.pop("constvars", self.constvars),
@@ -301,9 +306,9 @@ class Jaxpr:
 weakref_cache_key_types.add(Jaxpr)
 
 def _shift_arg_names(dbg: DebugInfo, delta: int) -> DebugInfo:
-  # Keep debug arg_names aligned with `invars` as the const/invar boundary
-  # moves: delta > 0 exposes that many constvars as invars (pad with unnamed
-  # entries), delta < 0 turns that many leading invars into constvars.
+  # 随着 const/invar 边界移动，保持调试用 arg_names 与 `invars` 对齐：
+  # delta > 0 会把这么多的 constvars 暴露为 invars（用无名条目填充），
+  # delta < 0 会把这么多的前导 invars 变成 constvars。
   if not delta or dbg.arg_names is None:
     return dbg
   if delta > 0:
@@ -322,39 +327,38 @@ def jaxprs_in_params(params) -> Iterator[Jaxpr]:
 
 
 def subjaxprs(jaxpr: Jaxpr) -> Iterator[Jaxpr]:
-  """Generator for all subjaxprs found in the params of jaxpr.eqns.
-  Does not descend recursively into the found subjaxprs.
+  """生成器，用于生成在 jaxpr.eqns 的 params 中找到的所有子 jaxpr。
+  不会递归下降到找到的子 jaxprs 中。
   """
   for eqn in jaxpr.eqns:
     yield from jaxprs_in_params(eqn.params)
 
 
-# ClosedJaxpr and Jaxpr have been merged into a single class: a Jaxpr carries
-# a possibly-empty list of constant argument values, `consts`. The name
-# ClosedJaxpr remains as an alias for callers that construct closed jaxprs via
-# ClosedJaxpr(jaxpr, consts) or use it in isinstance checks and annotations.
-# TODO(dougalm): migrate users and remove the alias.
+# ClosedJaxpr 和 Jaxpr 已经合并为单个类：Jaxpr 携带一个
+# 可能为空的常量参数值列表 `consts`。ClosedJaxpr 这个名字
+# 仍作为别名保留，供那些通过 ClosedJaxpr(jaxpr, consts) 构造
+# 封闭 jaxpr、或在 isinstance 检查和注解中使用它的调用方使用。
+# TODO(dougalm): 迁移这些调用方，并移除该别名。
 ClosedJaxpr = Jaxpr
 
 
 @curry
 def jaxpr_as_fun(closed_jaxpr: Jaxpr, *args):
-  # TODO(dougalm): remove this hack when we add contexts to jaxpr.
-  # debug_nans is sometimes disabled locally at the traceable level by ops that
-  # work with nans internally, like jnp.var. The right thing to do is to add
-  # contexts to our jaxpr representation so that we can capture these local
-  # context modifications. In the meantime, disabling the checks when we
-  # round-trip prevents those ops producing spurious errors.
+  # TODO(dougalm): 当我们给 jaxpr 添加上下文后，移除这个 hack。
+  # debug_nans 有时会在可追踪层面被那些内部处理 nan 的算子
+  # （如 jnp.var）局部禁用。正确的做法是给我们的 jaxpr
+  # 表示添加上下文，这样我们就能捕获这些局部上下文修改。
+  # 在此期间，在往返过程中禁用这些检查可以防止
+  # 那些算子产生虚假的错误。
   with config.debug_nans(False):
     return eval_jaxpr(closed_jaxpr, closed_jaxpr.consts, *args)
 
 
-# This context manager is fairly hot, because it is frequently called for every
-# jaxpr equation.
-# This context manager is implemented as a class with explicit __enter__ and
-# __exit__ methods since a @contextlib.contextmanager is significantly slower.
-# We also in effect fuse four other context managers into one, mostly to
-# save allocations.
+# 这个上下文管理器处于热点路径，因为它会针对每个 jaxpr 方程被频繁调用。
+# 这个上下文管理器被实现为一个带有显式 __enter__ 和 __exit__
+# 方法的类，因为 @contextlib.contextmanager 明显更慢。
+# 我们还实际上把另外四个上下文管理器融合为一个，主要是
+# 为了节省内存分配。
 class JaxprEqnContextManager:
   __slots__ = ['context', 'prev_compute_type', 'prev_threefry_partitionable',
                'prev_xla_metadata', 'prev_abstract_mesh',
@@ -428,7 +432,7 @@ class JaxprEqnContext:
         compute_type, threefry_partitionable, cur_abstract_mesh,
         remove_size_one_mesh_axis, xla_metadata)
 
-  # No __eq__ or __hash__: interned classes use object identity.
+  # 没有 __eq__ 或 __hash__：驻留的类使用对象标识。
 
   @property
   def manager(self):
@@ -442,7 +446,7 @@ class JaxprEqnContext:
             f"xla_metadata={self.xla_metadata})")
 
 
-@cache()  # Everything in the context is a trace cache key also.
+@cache()  # 上下文中的一切同样是追踪缓存键。
 def current_jaxpr_eqn_context():
   return JaxprEqnContext()
 
@@ -453,15 +457,15 @@ class JaxprEqn:
   params: dict[str, Any]
   effects: Effects
 
-  # The source_info.name_stack is always relative to the enclosing jaxpr (only)
-  # and does not include any name context from the caller of the jaxpr. A jaxpr
-  # might have multiple callers, after all.
-  # TODO(phawkins): update source_info.tracebacks to also be relative to the
-  # enclosing jaxpr.
+  # source_info.name_stack 始终（仅）相对于外层 jaxpr，
+  # 并且不包含来自 jaxpr 调用方的任何名称上下文。毕竟
+  # 一个 jaxpr 可能有多个调用方。
+  # TODO(phawkins): 把 source_info.tracebacks 也更新为相对于
+  # 外层 jaxpr。
   source_info: source_info_util.SourceInfo
   ctx: JaxprEqnContext
 
-  # It's slightly faster to use a class with __slots__ than a NamedTuple.
+  # 使用带 __slots__ 的类比使用 NamedTuple 略快一些。
   __slots__ = ['invars', 'outvars', 'primitive', 'params', 'effects',
                'source_info', 'ctx']
 
@@ -499,7 +503,7 @@ class JaxprEqn:
     )
 
 
-# TODO(mattjj): call typecheck rules here, so we don't form bad eqns
+# TODO(mattjj): 在这里调用类型检查规则，这样我们就不会形成错误的方程
 def new_jaxpr_eqn(invars, outvars, primitive, params, effects, source_info=None,
                   ctx=None) -> JaxprEqn:
   source_info = source_info or source_info_util.new_source_info()
@@ -538,27 +542,27 @@ class Var:
     return f'Var(id={id(self)}):{self.aval.str_short()}'
 
   def pretty_print(self, context: JaxprPpContext, *, print_dtype: bool = True):
-    del print_dtype  # unused
+    del print_dtype  # 未使用
     return f"{context.var_names[self]}"
 
 
 gensym = lambda: Var
 
-# In a jaxpr, `dropvar` can appear in place of a bound variable to indicate that
-# the assignment is dropped, i.e. that an expression's output value will never
-# be read. In that sense, `dropvar` is not a variable, but it is convenient to
-# treat it as a special case of one. Its `aval` is similarly inexact.
+# 在 jaxpr 中，`dropvar` 可以出现在绑定变量的位置上，以表示
+# 该赋值被丢弃，即某个表达式的输出值永远不会
+# 被读取。就此而言，`dropvar` 并不是一个变量，但把它
+# 当作变量的一个特例来处理很方便。它的 `aval` 同样是不精确的。
 class DropVar(Var):
   def __init__(self, aval: AbstractValue):
     super().__init__(aval)
   def __repr__(self): return '_'
   def pretty_print(self, context: JaxprPpContext, *, print_dtype: bool = True):
-    del context, print_dtype  # unused
+    del context, print_dtype  # 未使用
     return '_'
 
 @final
 class Literal:
-  # See https://docs.jax.dev/en/latest/internals/constants.html
+  # 参见 https://docs.jax.dev/en/latest/internals/constants.html
   __slots__ = ["val", "aval"]
 
   val: Any
@@ -582,7 +586,7 @@ class Literal:
   __hash__ = None
 
   def pretty_print(self, context: JaxprPpContext, *, print_dtype: bool = True):
-    del context  # unused
+    del context  # 未使用
     dtype = getattr(self.aval, 'dtype', None)
     if not np.shape(self.val):
       val_str = str(np.asarray(self.val).item())
@@ -596,19 +600,19 @@ class Literal:
   def __repr__(self):
     return f'Literal({self.val})'
 
-# The types of constants that can be used with core.Literal. Other constants
-# end up as `constvars`.
+# 可与 core.Literal 一起使用的常量类型。其它常量
+# 最终会成为 `constvars`。
 literalable_types: set[type] = set()
 literalable_scalar_types: set[type] = set()
 
 def is_literalable(x: Any, for_ad: bool = False) -> bool:
   x_type = type(x)
-  # Faster path for scalar types, which avoids an np.ndarray conversion.
+  # 标量类型的快速路径，可避免一次 np.ndarray 转换。
   if x_type in literalable_scalar_types:
     return True
 
-  # See https://docs.jax.dev/en/latest/internals/constants.html
-  # for_ad: we want to preserve under AD
+  # 参见 https://docs.jax.dev/en/latest/internals/constants.html
+  # for_ad: 我们希望在 AD 下保留
   if config.use_simplified_jaxpr_constants.value:
     from jax._src.array import ArrayImpl  # pyrefly: ignore[missing-import]
     do_lit_array = not for_ad
@@ -627,10 +631,10 @@ def is_hoistable(v: Literal) -> bool:
 
 @partial(weakref_lru_cache, trace_context_in_key=False)
 def jaxpr_const_args(jaxpr: Jaxpr) -> list[tuple[ArrayLike, AbstractValue]]:
-  # The non-scalar constants in core.Literal, in the entire Jaxpr,
-  # uniquified by id. These will be hoisted as const arguments to the functions
-  # in which they appear.
-  # See https://docs.jax.dev/en/latest/internals/constants.html
+  # 整个 Jaxpr 中 core.Literal 里的非标量常量，
+  # 按 id 去重。它们将作为 const 参数被提升到
+  # 它们所出现的函数中。
+  # 参见 https://docs.jax.dev/en/latest/internals/constants.html
   if not config.use_simplified_jaxpr_constants.value:
     return []
   consts_by_id: dict[int, tuple[ArrayLike, AbstractValue]] = {}
@@ -658,15 +662,15 @@ Atom = Var | Literal
 
 class Primitive:
   name: str
-  # set for multi-output primitives.
+  # 为多输出原语设置。
   multiple_results: bool = False
-  # set for call primitives processed in final style.
+  # 为以最终风格处理的 call 原语设置。
   call_primitive: bool = False
-  # set for ref primitives
+  # 为 ref 原语设置
   ref_primitive: bool = False
-  # set for primitives that can skip canonicalization of values
+  # 为可以跳过值规范化(canonicalization)的原语设置
   skip_canonicalization: bool = False
-  # set for primitives that allocate references
+  # 为分配引用的原语设置
   ref_allocating: bool = False
   is_effectful = None
 
@@ -679,6 +683,7 @@ class Primitive:
   def bind(self, *args, **params):
     canonical_args = []
     avals = []
+    # 这一段是 规范化 + 获取类型值 + 调整mesh(如果不对，reshard)
     for i, arg in enumerate(args):
       try:
         c_arg = dtypes.canonicalize_value(arg)
@@ -693,10 +698,10 @@ class Primitive:
           and not aval.sharding.mesh.empty):
         cur_mesh = mesh_lib.get_abstract_mesh()
         if cur_mesh != aval.sharding.mesh:
-          # TODO(yashkatariya): Casting to Explicit is not yet allowed. Maybe we
-          # need cast_and_slice_p for it since shape might change?
-          # Atleast 1 mesh axis should be Manual and all other axes should be
-          # Manual or Auto to allow casting.
+          # TODO(yashkatariya): 目前还不允许转换为 Explicit。也许我们
+          # 需要 cast_and_slice_p，因为形状可能会改变？
+          # 至少应有 1 个 mesh 轴是 Manual，且所有其它轴应是
+          # Manual 或 Auto，以允许转换。
           if cur_mesh._any_axis_manual and cur_mesh._are_all_axes_auto_or_manual:
             if aval.sharding.mesh.are_all_axes_auto:
               from jax._src.pjit import reshard  # pyrefly: ignore[missing-import]
@@ -715,9 +720,8 @@ class Primitive:
 
     args = canonical_args
 
-    # This is equivalent to "with take_current_trace()", but the bind() code
-    # is called frequently and it's slightly faster to avoid using a context
-    # manager object.
+    # 这等价于 "with take_current_trace()"，但 bind() 代码
+    # 被频繁调用，避免使用上下文管理器对象会略快一些。
     prev_trace = trace_ctx.trace
     trace_ctx.set_trace(None)
     try:
@@ -791,7 +795,7 @@ def _generic_effectful_abstract_eval(abstract_eval, prim):
     return abstract_eval(*args, **kwargs), {GenericEffect(prim)}
   return abstract_eval_
 
-# -------------------- lifting --------------------
+# -------------------- 提升 --------------------
 
 def eval_jaxpr(jaxpr: Jaxpr, consts, *args, propagate_source_info=True) -> list[Any]:
   def read(v: Atom) -> Any:
@@ -828,8 +832,8 @@ def check_avals_context_mesh(avals, prim_name):
           f" {type(a.memory_space)}")
     if cur_mesh.empty or a.sharding.mesh.empty:
       continue
-    # avals can have meshes with different axis_names so allow that in
-    # full auto mode.
+    # aval 可以带有 axis_names 各不相同的 mesh，因此
+    # 在全自动模式下允许这种情况。
     if a.sharding.mesh.are_all_axes_auto and cur_mesh.are_all_axes_auto:
       continue
     if a.sharding.mesh != cur_mesh:
@@ -839,22 +843,22 @@ def check_avals_context_mesh(avals, prim_name):
           " error occurs at source: "
           f" {source_info_util.summarize(source_info_util.current())}")
 
-# -------------------- tracing --------------------
+# -------------------- 追踪 --------------------
 
 class Trace:
   __slots__ = ("__weakref__", "_invalidated", "_weakref", "requires_low")
 
   def __init__(self):
     self._invalidated = False
-    # We frequently need a weakref to a trace, so let's precompute one.
+    # 我们经常需要某个追踪（Trace）的弱引用，所以预先计算一个。
     self._weakref = weakref.ref(self)
     self.requires_low = True
 
   def stage_value(self, val):
-    """Lifts a value into a trace.
+    """把一个值提升到某个追踪中。
 
-    Semantically equivalent to calling process_primitive on an identity
-    primitive, but may avoid, e.g., constructing a jaxpr equation."""
+    语义上等价于对 identity 原语调用 process_primitive，
+    但可能避免（例如）构造 jaxpr 方程。"""
     raise NotImplementedError("must override")
 
   def process_primitive(self, primitive, tracers, params, /):
@@ -881,11 +885,11 @@ class Trace:
            "to handle custom_vjp primitives")
     raise NotImplementedError(msg)
 
-  # TODO(dougalm): deprecate/delete
+  # TODO(dougalm): 弃用/删除
   def full_raise(self, x):
     return x
 
-  # TODO(dougalm): deprecate/delete
+  # TODO(dougalm): 弃用/删除
   @property
   def main(self):
     return getattr(self, "tag", None)
@@ -954,11 +958,11 @@ def _aval_property(name):
 
 
 if TYPE_CHECKING:
-  # We want Python type checkers to accept `some_tracer: jax.Array`, even though
-  # tracers can represent non-arrays. That is, ideally we would only accept that
-  # annotation when the Tracer instance has a ShapedArray aval, but we can't
-  # decide that at Python type checking time. So instead we're overly permissive
-  # and allow all Tracer instances to typecheck against a jax.Array annotation.
+  # 我们希望 Python 类型检查器能够接受 `some_tracer: jax.Array`，尽管
+  # 追踪器可以表示非数组。也就是说，理想情况下我们只应在 Tracer 实例
+  # 拥有 ShapedArray 抽象值(aval)时才接受该标注，但我们无法
+  # 在 Python 类型检查时做出这一判断。因此我们改为过度宽松，
+  # 允许所有 Tracer 实例都能通过 jax.Array 标注的类型检查。
   TracerBase = Array
   TracerMeta = StrictABCMeta
 else:
@@ -981,14 +985,14 @@ class Tracer[TraceType: Trace](TracerBase, metaclass=TracerMeta):
   size = _aval_property('size')
   shape = _aval_property('shape')
 
-  # dimension_as_value is frequently accessed, and we explicitly define it as
-  # None to avoid hitting the __getattr__ path, which constructs an error
-  # message (and is therefore slow).
+  # dimension_as_value 会被频繁访问，我们显式地将其定义为
+  # None，以避免走到 __getattr__ 路径，那条路径会构造一条错误
+  # 消息（因此很慢）。
   dimension_as_value = None
 
-  # We define __jax_array__ as a property to delegate to self.aval.__jax_array__
-  # if it exists (e.g., for avals like Flax NNX variables).
-  # This avoids hitting the slow __getattr__ path for tracers that don't have it.
+  # 我们将 __jax_array__ 定义为属性，以便在 self.aval.__jax_array__
+  # 存在时（例如对于 Flax NNX 变量这类 aval）委托给它。
+  # 这避免了对没有该属性的追踪器走到较慢的 __getattr__ 路径。
   @property
   def __jax_array__(self):
     m = getattr(self.aval, '__jax_array__', None)
@@ -1008,7 +1012,7 @@ class Tracer[TraceType: Trace](TracerBase, metaclass=TracerMeta):
   def __array__(self, *args, **kw):
     raise TracerArrayConversionError(self)
 
-  # helper for isinstance(tracer, jax.Array), here to avoid circular imports
+  # 用于 isinstance(tracer, jax.Array) 的辅助函数，放在这里以避免循环导入
   def _is_traced_array(self):
     return isinstance(self.aval, ShapedArray)
 
@@ -1028,7 +1032,7 @@ class Tracer[TraceType: Trace](TracerBase, metaclass=TracerMeta):
       f"The tobytes() method was called on {self._error_repr()}."
       f"{self._origin_msg()}")
 
-  # TODO(dougalm): deprecate/delete
+  # TODO(dougalm): 弃用/删除
   def full_lower(self):
     return self
 
@@ -1046,14 +1050,14 @@ class Tracer[TraceType: Trace](TracerBase, metaclass=TracerMeta):
     return self.aval._len(self)
 
   def to_concrete_value(self):
-    # Should return the concrete value if there is one, or else None.
+    # 如果存在具体值则应返回它，否则返回 None。
     return None
 
   @property
   def sharding(self):
-    # This attribute is part of the jax.Array API, but only defined on concrete arrays.
-    # Raising a ConcretizationTypeError would make sense, but for backward compatibility
-    # we raise an AttributeError so that hasattr() and getattr() work as expected.
+    # 该属性是 jax.Array API 的一部分，但只在具体数组上定义。
+    # 抛出 ConcretizationTypeError 是合理的，但为了向后兼容，
+    # 我们抛出 AttributeError，以便 hasattr() 和 getattr() 按预期工作。
     raise AttributeError(
         f"The 'sharding' attribute is not available on {self._error_repr()}."
         f"{self._origin_msg()}")
@@ -1067,9 +1071,9 @@ class Tracer[TraceType: Trace](TracerBase, metaclass=TracerMeta):
 
   @property
   def device(self):
-    # This attribute is part of the jax.Array API, but only defined on concrete arrays.
-    # Raising a ConcretizationTypeError would make sense, but for backward compatibility
-    # we raise an AttributeError so that hasattr() and getattr() work as expected.
+    # 该属性是 jax.Array API 的一部分，但只在具体数组上定义。
+    # 抛出 ConcretizationTypeError 是合理的，但为了向后兼容，
+    # 我们抛出 AttributeError，以便 hasattr() 和 getattr() 按预期工作。
     raise AttributeError(
       f"The 'device' attribute is not available on {self._error_repr()}."
       f"{self._origin_msg()}")
@@ -1087,7 +1091,7 @@ class Tracer[TraceType: Trace](TracerBase, metaclass=TracerMeta):
     return self.aval.at.fget(self)
 
   def get_referent(self) -> Any:
-    return self  # Override for object equivalence checking
+    return self  # 重写用于对象等价性检查
 
   def __bool__(self):
     if is_concrete(self): return bool(self.to_concrete_value())
@@ -1136,30 +1140,30 @@ class Tracer[TraceType: Trace](TracerBase, metaclass=TracerMeta):
       raise TypeError(f"Value of type {type(self)} is not convertible to integer index.")
     return self.aval._index(self)
 
-  # raises a useful error on attempts to pickle a Tracer.
+  # 在尝试 pickle 一个 Tracer 时抛出一条有用的错误。
   def __reduce__(self):
     raise ConcretizationTypeError(
       self, ("The error occurred in the __reduce__ method, which may "
              "indicate an attempt to serialize/pickle a traced value."))
 
-  # raises the better error message from ShapedArray
+  # 抛出 ShapedArray 提供的更好错误消息
   def __setitem__(self, key, value):
     if not hasattr(self.aval, "_setitem"):
       raise TypeError(f"Value of type {type(self)} is not indexable.")
     return self.aval._setitem(self, key, value)
 
-  # NumPy also only looks up special methods on classes.
+  # NumPy 也只在类上查找特殊方法。
   def __array_module__(self, types):
     if not hasattr(self.aval, "_array_module"):
       raise TypeError(f"Value of type {type(self)} is not compatible with the Array API.")
     return self.aval._array_module(self, types)
 
   def __getattr__(self, name):
-    # if the aval property raises an AttributeError, gets caught here
+    # 如果 aval 属性抛出 AttributeError，会在这里被捕获
     assert not config.enable_checks.value or name != "aval"
 
-    # These must raise AttributeError in the base class for backward compatibility.
-    # TODO(jakevdp): can we change this and make them raise NotImplementedError instead?
+    # 为了向后兼容，这些在基类中必须抛出 AttributeError。
+    # TODO(jakevdp): 我们能改掉这一点并让它们改为抛出 NotImplementedError 吗？
     if name in ["block_until_ready", "copy_to_host_async"]:
       raise AttributeError(
         f"The '{name}' method is not available on {self._error_repr()}."
@@ -1215,7 +1219,7 @@ class Tracer[TraceType: Trace](TracerBase, metaclass=TracerMeta):
   def _origin_msg(self) -> str:
     return ""
 
-  # Methods that are only valid for materialized arrays
+  # 仅对已实体化(materialized)数组有效的方法
   def addressable_data(self, index):
     raise ConcretizationTypeError(self,
       f"The addressable_data() method was called on {self._error_repr()}."
@@ -1272,8 +1276,8 @@ class Tracer[TraceType: Trace](TracerBase, metaclass=TracerMeta):
 
 _jax.set_tracer_class(Tracer)
 
-# these can be used to set up forwarding of properties and instance methods from
-# Tracer instances to the underlying avals
+# 这些可用于设置从 Tracer 实例到其底层 aval 的
+# 属性和实例方法转发
 aval_property = namedtuple("aval_property", ["fget"])
 aval_method = namedtuple("aval_method", ["fun"])
 
@@ -1300,31 +1304,30 @@ class EvalTrace(Trace):
         from jax.experimental.key_reuse._core import call_impl_with_key_reuse_checks  # pyrefly: ignore[missing-import]
         return call_impl_with_key_reuse_checks(primitive, primitive.impl, *args, **params)
       else:
-        # TODO(dougalm): delete. this shouldn't be necessary
+        # TODO(dougalm): 删除。这应该是不必要的
         args = map(full_lower, args)
         check_eval_args(args)
         return primitive.impl(*args, **params)
 
   def process_custom_jvp_call(self, primitive, fun, jvp, tracers, /, **_):
-    del primitive, jvp, _  # Unused.
+    del primitive, jvp, _  # 未使用。
     with set_current_trace(self):
       return fun.call_wrapped(*tracers)
 
   def process_custom_vjp_call(self, primitive, fun, fwd, bwd, tracers, /, **_):
-    del primitive, fwd, bwd, _  # Unused.
+    del primitive, fwd, bwd, _  # 未使用。
     with set_current_trace(self):
       return fun.call_wrapped(*tracers)
 
 class TraceTag:
-  # TODO: this works for surprisingly subtle reasons. Function transformations
-  # like `jvp_subtrace` are parameterized by a tag that identifies the set of
-  # pre-existing tracers we want to unpack during the transformation. A function
-  # defined in an outer scope can't have any closed-over traces, so the tag is
-  # irrelevant. A function defined in the current scope may have closed-over
-  # traces, but the tag will never change so we'll never get a spurious cache
-  # hit. The plan is to do away with `lu.cache` altogether, and use a simpler
-  # caching scheme that only caches top-level functions. Then we can remove this
-  # hack.
+  # TODO: 这之所以能工作，原因微妙得令人意外。像
+  # `jvp_subtrace` 这样的函数变换由一个 tag 参数化，该 tag 标识出
+  # 我们希望在变换过程中解开(unpack)的那组既存追踪器。在外层作用域中
+  # 定义的函数不可能有任何闭包捕获的追踪，因此该 tag 无关紧要。在当前
+  # 作用域中定义的函数可能有闭包捕获的追踪，但该 tag 永远不会改变，
+  # 所以我们永远不会遇到虚假的缓存命中。计划是完全去掉 `lu.cache`，
+  # 并采用一种只缓存顶层函数的更简单的缓存方案。那时我们就可以
+  # 移除这个 hack。
   def __hash__(self):
     return hash(TraceTag)
   def __eq__(self, other):
@@ -1398,13 +1401,13 @@ class AxisEnv:
 eval_trace = EvalTrace()
 top_axis_env = AxisEnv(FrozenDict({}), frozenset(), frozenset())
 
-# Weak reference to the trace state. This is included in, e.g., the jit key.
+# 对追踪状态的弱引用。例如它会被包含在 jit key 中。
 trace_state = config_ext.Config(
     'trace_state', eval_trace._weakref, include_in_jit_key=True)
 
-# A strong reference to the trace state. This should not be included in any
-# jit or cache keys, but we need a thread-local strong reference to ensure it
-# remains alive.
+# 对追踪状态的强引用。它不应被包含在任何
+# jit 或缓存键中，但我们需要一个线程局部强引用来确保它
+# 保持存活。
 trace_state_strong_ref = config_ext.Config(
   'trace_state_strong_ref', eval_trace, include_in_jit_key=False,
   include_in_trace_context=False)
@@ -1522,7 +1525,7 @@ class AddSpmdAxisNamesContextManager:
 
 add_spmd_axis_names = AddSpmdAxisNamesContextManager
 
-# TODO(yashkatariya): Remove this once vmap handles mesh contexts correctly.
+# TODO(yashkatariya): 等 vmap 能正确处理 mesh 上下文后删除这里。
 class AddExplicitMeshAxisNamesContextManager:
   __slots__ = ['prev', 'axis_names']
 
@@ -1540,7 +1543,7 @@ class AddExplicitMeshAxisNamesContextManager:
 
 add_explicit_mesh_axis_names = AddExplicitMeshAxisNamesContextManager
 
-# TODO(yashkatariya): Remove this once vmap handles mesh contexts correctly.
+# TODO(yashkatariya): 等 vmap 能正确处理 mesh 上下文后删除这里。
 class RemoveExplicitMeshAxisNamesContextManager:
   __slots__ = ['prev', 'axis_names']
 
@@ -1567,7 +1570,7 @@ def trace_state_clean() -> bool:
   return trace_ctx.is_empty() or trace_ctx.is_top_level()
 
 def reset_trace_state() -> bool:
-  """Resets the global trace state and returns True if it was already clean."""
+  """重置全局追踪状态，如果它原本就是干净的则返回 True。"""
   if not trace_ctx.is_top_level():
     trace_ctx.reset()
     return False
@@ -1598,13 +1601,13 @@ def ensure_no_leaks(trace:Trace):
 
 
 def maybe_find_leaked_tracers(trace: Trace) -> list[Tracer]:
-  """Find the leaked tracers holding a reference to the Trace
+  """查找持有对 Trace 引用的泄漏追踪器
   """
   if not getattr(threading.current_thread(), 'pydev_do_not_trace', True):
     warnings.warn(TRACER_LEAK_DEBUGGER_WARNING)
-  # Trigger garbage collection to filter out unreachable objects that are alive
-  # only due to cyclical dependencies. (We don't care about unreachable leaked
-  # tracers since they can't interact with user code and cause a problem.)
+  # 触发垃圾回收，以过滤掉仅因循环依赖而存活的不可达对象。
+  # （我们不关心不可达的泄漏追踪器，因为它们无法与用户代码
+  # 交互并造成问题。）
   gc.collect()
   tracers = list(filter(lambda x: isinstance(x, Tracer), gc.get_referrers(trace)))
   return tracers
@@ -1613,7 +1616,7 @@ def leaked_tracer_error(name: str, t, tracers: list[Tracer]) -> Exception:
   assert tracers
   why = partial(_why_alive, {id(tracers)})
   msgs = []
-  for tracer in tracers:  # not a genexpr: it'd be gc-visible and self-report
+  for tracer in tracers:  # 不用生成器表达式：它会被 gc 看到，并把自身也报告为引用者
     chain = why(tracer)
     label = f'<{type(tracer).__name__} {id(tracer)}>'
     chain += ''.join(f'\n{label} is referred to by {h}' for h in
@@ -1627,11 +1630,11 @@ def leaked_tracer_error(name: str, t, tracers: list[Tracer]) -> Exception:
                    + '\n\n'.join(msgs) + '\n')
 
 def _held_in_frame_locals(x, ignore_ids: set[int]) -> list[str]:
-  """Find live stack frames whose locals refer to (or contain) x.
+  """查找活跃的栈帧，其局部变量引用（或包含）x。
 
-  On CPython 3.11+, executing functions' frames are usually not gc-tracked
-  objects, so references held by their locals are invisible to gc.get_referrers
-  and hence to _why_alive. Walk the current stack directly instead.
+  在 CPython 3.11+ 上，正在执行的函数的帧通常不是 gc 跟踪的对象，
+  因此其局部变量持有的引用对 gc.get_referrers 不可见，
+  对 _why_alive 也不可见。改为直接遍历当前栈。
   """
   skip_codes = (leaked_tracer_error.__code__, _held_in_frame_locals.__code__)
   holders = []
@@ -1667,18 +1670,18 @@ def _why_alive(ignore_ids: set[int], x: Any) -> str:
   child, lines, seen = x, [], set()
   while (id(child) not in seen and type(child) is not types.ModuleType
          and parents(child)):
-    parent = parents(child)[0]  # just pick one parent
+    parent = parents(child)[0]  # 只挑一个父对象
 
-    # For namespaces (like modules and class instances) and closures, the
-    # references may form a simple chain: e.g. instance refers to its own
-    # __dict__ which refers to child, or function refers to its __closure__
-    # which refers to cells which refer to child. In these cases, we can provide
-    # a more intuitive description by collapsing the chain into a single
-    # parent->child jump. We do that by setting `parent` here to be a
-    # grandparent (or great-grandparent) of `child`, and then handling that case
-    # in _why_alive_container_info. See example:
+    # 对于命名空间（如模块和类实例）以及闭包，这些引用
+    # 可能形成一条简单链：例如实例引用它自己的 __dict__，
+    # 而 __dict__ 又引用 child；或者函数引用它的 __closure__，
+    # 后者引用各个 cell，cell 再引用 child。在这些情况下，
+    # 我们可以把这条链折叠成一次父->子跳转，从而给出
+    # 更直观的描述。做法是：在这里把 `parent` 设为 `child` 的
+    # 祖父（或曾祖父），然后在 _why_alive_container_info 中
+    # 处理该情形。参见示例：
     #  https://github.com/jax-ml/jax/pull/13022#discussion_r1008456599
-    # To prevent this collapsing behavior, just comment out this code block.
+    # 要阻止这种折叠行为，只需注释掉这个代码块。
     try:
       if (isinstance(parent, dict) and
           getattr(parents(parent)[0], '__dict__', None) is parents(child)[0]):
@@ -1686,8 +1689,8 @@ def _why_alive(ignore_ids: set[int], x: Any) -> str:
       elif type(parent) is types.CellType:
         parent = parents(parents(parent)[0])[0]
     except IndexError:
-      pass  # a referrer list can be empty, e.g. a container held only by a
-            # live frame's local, since gc.get_referrers can't see live frames
+      pass  # 引用者列表可能为空，例如某个容器只被
+            # 活跃栈帧的局部变量持有，因为 gc.get_referrers 看不到活跃栈帧
 
     line = f'<{type(child).__name__} {id(child)}> is referred to by '
     lines.append(line + _why_alive_container_info(parent, id(child)))
@@ -1725,22 +1728,22 @@ def _why_alive_container_info(container, obj_id) -> str:
 
 @contextmanager
 def ensure_compile_time_eval():
-  """Context manager to ensure evaluation at trace/compile time (or error).
+  """上下文管理器，确保在追踪/编译期完成求值（否则报错）。
 
-  Some JAX APIs like :func:`jax.jit` and :func:`jax.lax.scan` involve staging,
-  i.e., delaying the evaluation of numerical expressions (like :mod:`jax.numpy`
-  function applications) so that instead of performing those computations
-  eagerly while evaluating the corresponding Python expressions, their
-  computation is carried out separately, e.g. after optimized compilation. But
-  this delay can be undesirable. For example, numerical values might be needed
-  to evaluate Python control flow and so their evaluation cannot be delayed. As
-  another example, it may be beneficial to ensure compile time evaluation (or
-  "constant folding") for performance reasons.
+  一些 JAX API（如 :func:`jax.jit` 和 :func:`jax.lax.scan`）
+  涉及暂存，即延迟数值表达式的求值（如 :mod:`jax.numpy`
+  函数调用），这样，这些计算就不是在求值相应的
+  Python 表达式时即时执行，而是被单独进行，
+  例如在优化编译之后。但这种延迟可能并不理想。
+  例如，求值 Python 控制流时可能需要数值，
+  因此不能延迟对它们的求值。
+  再举一个例子，出于性能原因，确保编译期求值
+  （或“常量折叠”）可能是有益的。
 
-  This context manager ensures that JAX computations are evaluated eagerly. If
-  eager evaluation is not possible, a ``ConcretizationTypeError`` is raised.
+  该上下文管理器确保 JAX 计算被即时执行(eager)。如果
+  无法即时求值，则会抛出 ``ConcretizationTypeError``。
 
-  Here's a contrived example::
+  下面是一个人为构造的示例::
 
     import jax
     import jax.numpy as jnp
@@ -1751,12 +1754,12 @@ def ensure_compile_time_eval():
         y = jnp.sin(3.0)
         z = jnp.sin(y)
         z_positive = z > 0
-      if z_positive:  # z_positive is usable in Python control flow
+      if z_positive:  # z_positive 可用于 Python 控制流
         return jnp.sin(x)
       else:
         return jnp.cos(x)
 
-  Here's a real-world example from https://github.com/jax-ml/jax/issues/3974::
+  下面是一个来自 https://github.com/jax-ml/jax/issues/3974 的真实示例::
 
     import jax
     import jax.numpy as jnp
@@ -1770,8 +1773,8 @@ def ensure_compile_time_eval():
       x2 = jnp.sum(y2) * x
       return x2
 
-  A similar behavior can often be achieved simply by 'hoisting' the constant
-  expression out of the corresponding staging API::
+  类似的行为通常可以简单地通过把常量表达式“提升”到
+  相应的暂存 API 之外来实现::
 
     y = random.randint(random.key(0), (1000,1000), 0, 100)
 
@@ -1781,7 +1784,7 @@ def ensure_compile_time_eval():
       x2 = jnp.sum(y2)*x
       return x2
 
-  But in some cases it can be more convenient to use this context manager.
+  但在某些情况下，使用这个上下文管理器可能更方便。
   """
   with config.eager_constant_folding(True):
     yield
@@ -1791,7 +1794,7 @@ def eval_context():
   with set_current_trace(eval_trace):
     yield
 
-# TODO(dougalm): deprecate/delete
+# TODO(dougalm): 弃用/删除
 def full_lower(val):
   if isinstance(val, Tracer):
     return val.full_lower()
@@ -1817,7 +1820,7 @@ def definitely_equal(x, y):
   except InconclusiveDimensionOperation:
     return False
 
-# -------------------- abstract values --------------------
+# -------------------- 抽象值 --------------------
 
 class AbstractValue:
   __slots__: list[str] = []
@@ -1832,7 +1835,7 @@ class AbstractValue:
   def to_ct_aval(self) -> AbstractValue:
     raise NotImplementedError("must override")
 
-  # TODO(dougalm): deprecate this alias
+  # TODO(dougalm): 弃用这个别名
   def at_least_vspace(self):
     return self.to_tangent_aval()
 
@@ -1899,7 +1902,7 @@ class AbstractValue:
 InputType = tuple[AbstractValue, ...]
 OutputType = tuple[AbstractValue, ...]
 
-# For use in typing annotations to denote either a Tracer or a `valid_jaxtype`.
+# 用于类型标注，表示一个 Tracer 或一个 `valid_jaxtype`。
 Value = Any
 
 def valid_jaxtype(x) -> bool:
@@ -1921,10 +1924,10 @@ def mem_kind_to_space(mem_kind: str | None) -> MemorySpace:
 
 
 def mem_space_to_kind(mem_space: Any) -> str:
-  """Converts a memory space to its corresponding XLA memory kind string.
+  """将内存空间转换为其对应的 XLA memory kind 字符串。
 
-  Supports standard MemorySpace enums and custom memory spaces that define
-  `memory_kind` property.
+  支持标准的 MemorySpace 枚举值，以及定义了 `memory_kind` 属性的自定义
+  内存空间。
   """
   if isinstance(mem_space, MemorySpace):
     if mem_space == MemorySpace.Device:
@@ -1948,17 +1951,16 @@ def update_aval_with_sharding(aval, sharding, mat=None):
   return aval if mat is None else aval.update(manual_axis_type=mat)
 
 
-# We have two flavors of abstractification APIs here which each used to have
-# their own separate implementation. Now they're effectively the same, with the
-# following differences:
+# 这里有两套抽象化 API，它们过去各自有独立的实现。现在它们实际上
+# 是等价的，区别如下：
 #
-# - typeof returns avals for valid array-like objects, including tracers.
-# - shaped_abstractify is like typeof, but also accepts duck-typed arrays.
+# - typeof 为合法的类数组对象（包括追踪器）返回 aval。
+# - shaped_abstractify 类似于 typeof，但也接受鸭子类型的数组。
 #
 
 def shaped_abstractify(x):
   typ = type(x)
-  if (aval_fn := pytype_aval_mappings.get(typ)):  # fast path
+  if (aval_fn := pytype_aval_mappings.get(typ)):  # 快速路径
     return aval_fn(x)
   for t in typ.__mro__[1:]:
     if (aval_fn := pytype_aval_mappings.get(t)):
@@ -1983,14 +1985,14 @@ def shaped_abstractify(x):
       "does not have a dtype attribute")
 
 
-# TODO(phawkins): the return type should be AbstractValue.
+# TODO(phawkins): 返回类型应该是 AbstractValue。
 def typeof(x: Any) -> Any:
-  """Return the JAX type (i.e. :class:`AbstractValue`) of the input.
+  """返回输入的 JAX 类型（即 :class:`AbstractValue`）。
 
-  Raises a ``TypeError`` if ``x`` is not a valid JAX type.
+  如果 ``x`` 不是合法的 JAX 类型，则抛出 ``TypeError``。
   """
   typ = type(x)
-  if (aval_fn := pytype_aval_mappings.get(typ)):  # fast path
+  if (aval_fn := pytype_aval_mappings.get(typ)):  # 快速路径
     return aval_fn(x)
   for t in typ.__mro__[1:]:
     if (aval_fn := pytype_aval_mappings.get(t)):
@@ -2031,7 +2033,7 @@ def concretization_function_error(fun, suggest_astype=False):
   return error
 
 def concrete_or_error(force: Any, val: Any, context=""):
-  """Like force(val), but gives the context in the error message."""
+  """类似于 force(val)，但会在错误信息中给出上下文。"""
   if force is None:
     force = lambda x: x
   if isinstance(val, Tracer):
@@ -2044,32 +2046,28 @@ def concrete_or_error(force: Any, val: Any, context=""):
     return force(val)
 
 def concrete_dim_or_error(val: Any, context=""):
-  """Like concrete_or_error(operator.index), allowing symbolic dimensions."""
+  """类似于 concrete_or_error(operator.index)，但允许符号维度。"""
   if is_symbolic_dim(val):
     return val
   else:
     return concrete_or_error(operator.index, val, context=context)
 
-### Extended dtypes
+### 扩展 dtype
 #
-# Extended dtypes are JAX-specific dtypes that allow us to represent logical
-# arrays of element types that do not have an obvious direct correspondence
-# to ("physical") arrays of basic types in a compiler. In particular, their
-# element types differ from those of XLA and NumPy (e.g. int32). These dtypes
-# are only known to JAX. Their implementation is determined by:
-# a) an object representing the extended dtype, accessible via the `dtype`
-#    attribute on corresponding JAX arrays and, internally, on avals such
-#    as ShapedArrays that correspond to such JAX arrays;
-# b) a set of rules, available via a private attribute on the extended dtype
-#    object in (a).
-# The rules in (b) tell JAX internals how to ground out the element
-# type for interaction with the compiler and runtime, e.g. when lowering
-# to the compiler's language.
+# 扩展 dtype 是 JAX 特有的 dtype，用于表示逻辑数组，这些数组的元素类型
+# 在编译器中并没有显而易见的直接对应的基本类型（“物理”）数组。特别地，其元素类型
+# 与 XLA 和 NumPy 的元素类型（例如 int32）不同。这些 dtype 只有 JAX 知道。
+# 它们的实现由以下两部分决定：
+# a) 一个表示该扩展 dtype 的对象，可通过相应 JAX 数组上的 `dtype` 属性访问，
+#    在内部也可通过对应于这类 JAX 数组的 aval（例如 ShapedArray）访问；
+# b) 一组规则，可通过 (a) 中扩展 dtype 对象的私有属性获得。
+# (b) 中的规则告诉 JAX 内部代码如何将元素类型落地（ground out），以便与编译器
+# 和运行时交互，例如在降级到编译器语言时。
 
 @overload
 def physical_aval(aval: ShapedArray) -> ShapedArray:
   ...
-@overload                       # TODO(frostig): remove this case
+@overload                       # TODO(frostig): 删除这种情况
 def physical_aval(aval: AbstractValue) -> AbstractValue:
   ...
 
@@ -2099,7 +2097,7 @@ def _dtype_object(dtype):
   return dtype if isinstance(dtype, _dtype_object_types) else np.dtype(dtype)
 
 def _canonicalize_dimension(dim: DimSize) -> DimSize:
-  # Dimensions are most commonly integral (by far), so we check that first.
+  # 维度绝大多数情况下是整数（且远超其他情况），所以我们先检查这一情况。
   try:
     return operator.index(dim)
   except TypeError as e:
@@ -2110,13 +2108,13 @@ def _canonicalize_dimension(dim: DimSize) -> DimSize:
     raise type_error
 
 def canonicalize_shape(shape: Shape, context: str="") -> tuple[Any, ...]:
-  """Canonicalizes and checks for errors in a user-provided shape value.
+  """规范化用户提供的 shape 值，并检查其中的错误。
 
   Args:
-    shape: a Python value that represents a shape.
+    shape: 表示一个 shape 的 Python 值。
 
   Returns:
-    A tuple of canonical dimension values.
+    由规范化后的维度值组成的元组。
   """
   if isinstance(shape, int):
     shape = shape,
@@ -2127,13 +2125,13 @@ def canonicalize_shape(shape: Shape, context: str="") -> tuple[Any, ...]:
   raise _invalid_shape_error(shape, context)
 
 def canonicalize_dim(d: DimSize, context: str="") -> DimSize:
-  """Canonicalizes and checks for errors in a user-provided shape dimension value.
+  """规范化用户提供的 shape 维度值，并检查其中的错误。
 
   Args:
-    d: a Python value that represents a dimension.
+    d: 表示一个维度的 Python 值。
 
   Returns:
-    A canonical dimension value.
+    规范化后的维度值。
   """
   return canonicalize_shape((d,), context)[0]
 
@@ -2165,8 +2163,8 @@ class MemorySpace(enum.Enum):
   def __repr__(self):
     return f"MemorySpace.{self.name}"
 
-  # For reasons passing my understanding Enum.__hash__ hashes the name string.
-  # Use an object identity hash instead.
+  # 出于我无法理解的原因，Enum.__hash__ 会对名称字符串做哈希。
+  # 这里改用基于对象标识的哈希。
   __hash__ = object.__hash__
 
 
@@ -2187,7 +2185,7 @@ def getu(aval, kind=UnreducedKind.sum):
       if (aval_k := aval.sharding.spec.unreduced_kind) is not kind:
         raise ValueError(f'Expected unreduced_kind={kind} but got {aval_k}')
     return out_u
-  # Revise this after partial manual unreduced is supported
+  # 在支持部分手动 unreduced 之后修改这里
   assert not aval.mat.unreduced
   assert not aval.sharding.spec.unreduced
   return frozenset()
@@ -2197,7 +2195,7 @@ def getr(aval):
     return aval.mat.reduced
   if aval.sharding.mesh.are_all_axes_explicit:
     return aval.sharding.spec.reduced
-  # Revise this after partial manual reduced is supported
+  # 在支持部分手动 reduced 之后修改这里
   assert not aval.mat.reduced
   assert not aval.sharding.spec.reduced
   return frozenset()
@@ -2215,7 +2213,7 @@ def _make_lengths_same(sharding, ndim):
 
 def modify_spec_for_auto_manual(spec, mesh) -> P:
   new_spec: list[Any] = []
-  # PartitionSpec can only mention mesh axes that are Explicit.
+  # PartitionSpec 只能提及 Explicit 类型的 mesh 轴。
   for s in spec.partitions:
     if s is None:
       new_spec.append(s)
@@ -2264,13 +2262,13 @@ def _check_divisibility(sharding, shape):
 @cache(max_size=4096,
        trace_context_in_key=lambda: config.remove_size_one_mesh_axis_from_type.value)
 def get_sharding(sharding, shape):
-  """Modifies and checks the sharding.
+  """修改并检查分片。
 
-  Some modifications/checks include:
-    * Making the length of specs the same as ndim
-    * If a mesh axis is mentioned in pspec is Auto/Manual, replace it with None
-    * Checking for len(spec)-ndim match
-    * Checking if the mesh is an AbstractMesh.
+  其中一些修改/检查包括：
+    * 使 spec 的长度与 ndim 相同
+    * 如果 pspec 中提及的某个 mesh 轴是 Auto/Manual，则将其替换为 None
+    * 检查 len(spec) 与 ndim 是否匹配
+    * 检查 mesh 是否为 AbstractMesh。
   """
   ndim = len(shape)
   if sharding is None:
@@ -2369,8 +2367,8 @@ class ManualAxisType:
   @staticmethod
   @weak_value_interner
   def _create(varying, unreduced, reduced, unreduced_kind):
-    # We cannot modify the arguments within the interned function, but we are
-    # free to throw an exception.
+    # 我们不能修改驻留函数内部的参数，但可以
+    # 自由地抛出异常。
     _check_mat(varying, unreduced, reduced, unreduced_kind)
     obj = object.__new__(ManualAxisType)
     object.__setattr__(obj, 'varying', varying)
@@ -2388,7 +2386,7 @@ class ManualAxisType:
       unreduced_kind = UnreducedKind.sum
     return cls._create(varying, unreduced, reduced, unreduced_kind)
 
-  # No __eq__ or __hash__: interned classes use object identity.
+  # 没有 __eq__ 或 __hash__：驻留类使用对象标识。
 
   def __repr__(self):
     return (f"ManualAxisType(varying={self.varying}, "
@@ -2437,7 +2435,7 @@ def _empty_sharding(ndim):
 
 @immutable
 class ShapedArray(AbstractValue):
-  # inherits slots from parent
+  # 从父类继承 slots
   __slots__ = ['shape', 'dtype', 'weak_type', 'sharding', 'manual_axis_type',
                'memory_space', 'layout', '_stripped_weak_type', '__weakref__']
   array_abstraction_level = 2
@@ -2479,12 +2477,12 @@ class ShapedArray(AbstractValue):
       sharding = get_sharding(sharding, shape)
       # https://docs.jax.dev/en/latest/notebooks/shard_map.html#tracking-how-values-vary-over-manual-mesh-axes-and-check-vma-true
       manual_axis_type = get_mat(manual_axis_type, sharding.mesh)
-    # See description of https://github.com/jax-ml/jax/pull/30556
+    # 参见 https://github.com/jax-ml/jax/pull/30556 的说明
     memory_space = get_memory_space(memory_space)
     return cls._create(shape, dtype, weak_type, sharding, manual_axis_type,
                        memory_space, layout)
 
-  # Interned types don't need __eq__ or __hash__.
+  # 驻留类型不需要 __eq__ 或 __hash__。
 
   @property
   def mat(self):
@@ -2556,7 +2554,7 @@ class ShapedArray(AbstractValue):
     try:
       return self.shape[0]
     except IndexError as err:
-      raise TypeError("len() of unsized object") from err  # same as numpy error
+      raise TypeError("len() of unsized object") from err  # 与 numpy 报错相同
 
   def update_manual_axis_type(self, mat):
     mat = get_mat(mat, self.sharding.mesh)
@@ -2576,9 +2574,9 @@ class ShapedArray(AbstractValue):
   def strip_weak_type(self) -> AbstractValue:
     if not self.weak_type:
       return self
-    # _stripped_weak_type is not protected by a lock, but the access should be
-    # safe because ShapedArray values are interned: if two threads race to set
-    # the value it will be the same object.
+    # _stripped_weak_type 不受锁保护，但访问应该是
+    # 安全的，因为 ShapedArray 值是驻留的：如果两个线程竞争设置
+    # 该值，得到的将是同一个对象。
     val = self._stripped_weak_type
     if val is None:
       val = self.update_weak_type(False)
@@ -2586,7 +2584,7 @@ class ShapedArray(AbstractValue):
     return val
 
   def nospec(self, mesh, check_vma, all_names) -> P:
-    # TODO(mattjj, yashkatariya): should use newly all_names in check_vma path?
+    # TODO(mattjj, yashkatariya): 在 check_vma 路径中是否应该使用新的 all_names？
     sh_names = (order_wrt_mesh(mesh, self.mat.varying)
                 if check_vma else all_names)
     u_names = self.mat.unreduced if check_vma else frozenset()
@@ -2648,7 +2646,7 @@ def order_wrt_mesh(mesh, x):
 
 def _vma_ur_str(mat, spec_unreduced, spec_reduced, u_kind, mesh):
   vma = mat.varying
-  # TODO(yashkatariya): Diff between explicit unreduced and manual unreduced
+  # TODO(yashkatariya): 显式 unreduced 与手动 unreduced 之间的差异
   unreduced = mat.unreduced | spec_unreduced
   reduced = mat.reduced | spec_reduced
   if not vma and not unreduced and not reduced:
@@ -2676,7 +2674,7 @@ def primal_sharding_to_cotangent_sharding(sharding):
 
 ############################## pvary #################################
 
-# Invariant -> Variant no-op cast
+# Invariant -> Variant 的空操作转换
 def pvary(x, axis_name):
   axes = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
   if not axis_name:
@@ -2687,8 +2685,8 @@ def pvary(x, axis_name):
   new_axes = axes if cur_mesh.empty else order_wrt_mesh(cur_mesh, axes)
   assert set(new_axes) == set(axes)
   del axes
-  # TODO(yashkatariya): Remove this handling and remove_size_one_mesh_axis_from_type
-  # generally from JAX.
+  # TODO(yashkatariya): 移除这一处理，并从 JAX 中彻底移除
+  # remove_size_one_mesh_axis_from_type。
   if config.remove_size_one_mesh_axis_from_type.value and not cur_mesh.empty:
     new_axes = tuple(i for i in new_axes if cur_mesh.shape[i] != 1)
     if not new_axes:
@@ -2699,7 +2697,7 @@ pvary_p = Primitive('pvary')
 
 ####################### reduced_vary_cast #############################
 
-# Reduced -> Varying no-op cast
+# Reduced -> Varying 的空操作转换
 def reduced_vary_cast(x, axis_name):
   axes = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
   if not axis_name:
@@ -2738,7 +2736,7 @@ def insert_reduced_reshard(args):
   cur_mesh = mesh_lib.get_abstract_mesh()
   if not cur_mesh.are_all_axes_explicit:
     return args
-  # TODO(yashkatariya): Handle >2 args too
+  # TODO(yashkatariya): 也要处理多于 2 个参数的情况
   if len(args) != 2:
     return args
   in_reduced = [aval.sharding.spec.reduced
@@ -2773,8 +2771,8 @@ def auto_insert_reshard(*args):
   for arg, src_vma, src_reduced in zip(args, in_vma, in_reduced):
     if (isinstance(typeof(arg), ShapedArray) and
         (rest_vma := out_vma - src_vma)):
-      # TODO(yashkatariya): Handle partial reduced_vary_cast and partial pvary.
-      # Will need more changes to pvary to allow such partialness.
+      # TODO(yashkatariya): 处理部分 reduced_vary_cast 和部分 pvary。
+      # 需要对 pvary 做更多修改才能支持这种部分性。
       if src_reduced == rest_vma:
         out.append(
             reduced_vary_cast(arg, tuple(n for n in out_vma if n in rest_vma)))
@@ -2824,16 +2822,16 @@ class RefMeta(type):
             isinstance(inst, Tracer) and isinstance(inst.aval, AbstractRef))
 
 class Ref(metaclass=RefMeta):
-  """Mutable array reference.
+  """可变的数组引用。
 
-  In most cases this should not be constructed directly, but rather
-  via :func:`jax.ref.new_ref`. For examples of how this can be
-  used, refer to the `Ref guide`_.
+  在大多数情况下不应直接构造它，而应
+  通过 :func:`jax.ref.new_ref` 构造。有关如何使用它的示例，
+  请参阅 `Ref guide`_。
 
   .. _Ref guide: https://docs.jax.dev/en/latest/array_refs.html
   """
   _aval: AbstractValue
-  _refs: PyTree  # list of ArrayRefImpl
+  _refs: PyTree  # ArrayRefImpl 的列表
 
   def __init__(self, aval, refs):
     from jax._src.state.types import AbstractRef  # pyrefly: ignore[missing-import]
@@ -2846,20 +2844,20 @@ class Ref(metaclass=RefMeta):
       return f"Ref({self._refs})"
     return "Ref" + repr(self._refs._buf)[5:]
 
-  # forward type-level info to aval
+  # 将类型层面的信息转发给 aval
   aval = property(lambda self: self._aval)
   shape = property(lambda self: self._aval.shape)
   size = property(lambda self: self._aval.size)
   ndim = property(lambda self: len(self._aval.shape))
   dtype = property(lambda self: self._aval.dtype)
 
-  # get operations from aval, munging the name
+  # 从 aval 获取操作，并改写名称
   def __getitem__(self, idx): return self._aval._getitem(self, idx)  # pyrefly: ignore[missing-attribute]
   def __setitem__(self, idx, x): return self._aval._setitem(self, idx, x)  # pyrefly: ignore[missing-attribute]
   def __len__(self) -> int: return self._aval._len(self)  # pyrefly: ignore[missing-attribute]
   def addupdate(self, x, idx=()): return self._aval._addupdate(self, idx, x)  # pyrefly: ignore[missing-attribute]
 
-  # some attributes/methods only work for lojax refs
+  # 某些属性/方法仅对 lojax 引用有效
   sharding = property(lambda self: self._refs._buf.sharding)
   format = property(lambda self: self._refs._buf.format)
   committed = _committed = property(lambda self: True)
@@ -2870,7 +2868,7 @@ class Ref(metaclass=RefMeta):
 
 class ArrayRefImpl:
   _aval: AbstractValue
-  _buf: Array  # mutable field
+  _buf: Array  # 可变字段
 
   def __init__(self, aval, buf):
     from jax._src.state.types import AbstractRef  # pyrefly: ignore[missing-import]
@@ -2891,20 +2889,20 @@ effects.remat_allowed_effects.add_type(InternalMutableArrayEffect)
 
 def new_ref(init_val: Any, *, memory_space: Any = None, kind: Any = None,
             pin: bool = False):
-  """Create a mutable array reference with initial value ``init_val``.
+  """创建一个初值为 ``init_val`` 的可变数组引用。
 
-  For more discussion, see the `Ref guide`_.
+  更多讨论请参阅 `Ref guide`_。
 
   Args:
-    init_val: A :class:`jax.Array` representing the initial state
-      of the buffer.
-    memory_space: An optional memory space attribute for the Ref.
-    kind: An optional string indicating the mutation semantics under
-      rematerialization.
-    pin: Whether to lower the ref to a pinned buffer in HLO.
+    init_val: 一个 :class:`jax.Array`，表示缓冲区的初始
+      状态。
+    memory_space: 可选的 Ref 内存空间属性。
+    kind: 可选的字符串，指示重物化（rematerialization）下的
+      变更语义。
+    pin: 是否在 HLO 中把该 ref 降级为 pinned 缓冲区。
 
   Returns:
-    A :class:`jax.ref.Ref` containing a reference to a mutable buffer.
+    一个 :class:`jax.ref.Ref`，其中包含对可变缓冲区的引用。
 
   .. _Ref guide: https://docs.jax.dev/en/latest/array_refs.html
   """
@@ -2925,8 +2923,8 @@ ref_p.to_lojax = _ref_to_lojax
 @ref_p.def_effectful_abstract_eval
 def _ref_abstract_eval(init_aval, *, memory_space: Any, kind: Any, pin: bool):
   from jax._src.state.types import AbstractRef  # pyrefly: ignore[missing-import]
-  # If no memory space is specified, use the memory space of the initial value
-  # but we make sure to reset it to Device because the Ref owns the memory space
+  # 如果未指定内存空间，则使用初始值的内存空间，
+  # 但我们确保将其重置为 Device，因为该 Ref 拥有该内存空间
   if (memory_space is None
       and isinstance(init_aval, ShapedArray)):
     if init_aval.memory_space is not MemorySpace.Device:
@@ -2948,7 +2946,7 @@ def _ref_impl(init_val, *, memory_space: Any, kind: Any, pin: bool):
   aval = AbstractRef(typeof(init_val), kind=kind)
   return Ref(aval, ArrayRefImpl(aval, _array_copy(init_val)))
 
-# TODO(mattjj,dougalm): merge with ref_p
+# TODO(mattjj,dougalm): 与 ref_p 合并
 def empty_ref(ty, memory_space=None, pin=False):
   aval = shaped_abstractify(ty)
   return empty_ref_p.bind(ty=aval, memory_space=memory_space, pin=pin)
@@ -2974,9 +2972,9 @@ def _empty_ref_abstract_eval(*, ty, memory_space, pin):
           {internal_mutable_array_effect})
 
 
-# TODO(mattjj,dougalm): merge with freeze_p
+# TODO(mattjj,dougalm): 与 freeze_p 合并
 def free_ref(ref: Ref):
-  """Invalidate a given reference."""
+  """使给定的引用失效。"""
   free_ref_p.bind(ref)
   return ()
 
@@ -2988,8 +2986,8 @@ free_ref_p.ref_primitive = True
 
 @free_ref_p.def_effectful_abstract_eval
 def _free_ref_abstract_eval(ref_aval):
-  # No effects, but there is a custom DCE rule that prevents free_ref from
-  # being DCE'd.
+  # 没有效果，但存在一个自定义的 DCE 规则，它阻止 free_ref
+  # 被 DCE 消除。
   return (), {}
 
 
@@ -2998,16 +2996,16 @@ def _free_ref_impl(ref):
   return ()
 
 def freeze(ref: Ref) -> Array:
-  """Invalidate a given reference and return its final value.
+  """使给定的引用失效并返回其最终值。
 
-  For more information about mutable array references, refer to the
-  `Ref guide`_.
+  有关可变数组引用的更多信息，请参阅
+  `Ref guide`_。
 
   Args:
-    ref: A :class:`jax.ref.Ref` object.
+    ref: 一个 :class:`jax.ref.Ref` 对象。
 
   Returns:
-    A :class:`jax.Array` containing the contents of ``ref``.
+    一个 :class:`jax.Array`，包含 ``ref`` 的内容。
 
   Examples:
     >>> import jax
@@ -3057,14 +3055,13 @@ class AbstractToken(AbstractValue):
   def to_ct_aval(self): return self
 abstract_token: AbstractToken = AbstractToken()
 
-# Singleton shaped array used by all abstract tokens when shape/dtype is needed.
+# 当需要形状/数据类型时，所有抽象 token 共用的单例 ShapedArray。
 def get_token_aval():
   return ShapedArray((0,), np.dtype(np.bool_), sharding=None)
 
-# Concrete token object
+# 具体 token 对象
 class Token:
-  # The underlying data wrapped by the token, could be used to threaded in and
-  # out of computations to build up data dependency.
+  # token 包装的底层数据，可以传入和传出计算，从而构建数据依赖。
   _buf: Array
   def __init__(self, buf):
     self._buf = buf
@@ -3129,23 +3126,23 @@ class AbstractFuture(AbstractValue):
     return self.manual_axis_type
 
 
-### Operations on shapes and dimension sizes.
+### 对形状和维度大小的操作。
 
 @set_module("jax.errors")
 class InconclusiveDimensionOperation(Exception):
-  """Raised when we cannot conclusively compute with symbolic dimensions."""
+  """当无法对符号维度进行确定性计算时抛出。"""
 
 def is_symbolic_dim(v: Any) -> bool:
-  """Checks if a value is a symbolic dimension used for shape polymorphism.
+  """检查某个值是否是为形状多态而使用的符号维度。
 
-  This should be used very rarely, because symbolic dimensions overload all
-  operators, and should just work.
+  这应当极少使用，因为符号维度重载了所有运算符，
+  本应直接可用。
   """
   return getattr(v, "dimension_as_value", None) is not None
 
 def is_constant_dim(d: DimSize) -> bool:
-  # Whether the dimension is a static integer constant.
-  # Try using a fast path for non-concrete Tracers.
+  # 该维度是否为静态整数常量。
+  # 对非具体（non-concrete）的 Tracer 尝试使用快速路径。
   if isinstance(d, Tracer) and not is_concrete(d):
     return False
   try:
@@ -3158,27 +3155,27 @@ def is_dim(v: Any) -> bool:
   return is_symbolic_dim(v) or is_constant_dim(v)
 
 def is_constant_shape(s: Shape) -> bool:
-  # Whether the shape is a static constant.
+  # 形状是否为静态常量。
   return all(is_constant_dim(d) for d in s)
 
 def definitely_equal_one_of_dim(d1: DimSize, dlist: Sequence[DimSize]) -> bool:
   return any(definitely_equal(d1, d) for d in dlist)
 
 def definitely_equal_shape(s1: Shape, s2: Shape) -> bool:
-  """Check that two shapes are guaranteed to be element-wise equal.
+  """检查两个形状是否保证逐元素相等。
 
-  In presence of dynamic shapes may return False even when the shapes may
-  be equal at runtime.
+  在存在动态形状时，即使这些形状在运行时可能相等，
+  也可能返回 False。
   """
   return (len(s1) == len(s2) and
           all(unsafe_map(definitely_equal, s1, s2)))
 
 def divide_shape_sizes(s1: Shape, s2: Shape) -> DimSize:
-  """Returns an integer "i" s.t., i * size(s2) == size(s1).
-  Raises InconclusiveDimensionOperation if there is no such integer."""
+  """返回一个整数 "i"，使得 i * size(s2) == size(s1)。
+  如果不存在这样的整数，则抛出 InconclusiveDimensionOperation。"""
   sz1 = math.prod(s1)
   sz2 = math.prod(s2)
-  if definitely_equal(sz1, sz2):  # Takes care of sz1 and sz2 being 0
+  if definitely_equal(sz1, sz2):  # 处理 sz1 和 sz2 为 0 的情况
     return 1
   q, r = divmod(sz1, sz2)
   if isinstance(r, Tracer) or r != 0:
@@ -3204,7 +3201,7 @@ def _cancel_divide(num, denom):
   for a in denom:
     i = next((i for i, b in enumerate(num) if definitely_equal(a, b)), None)
     if i is None:
-      break  # couldn't cancel
+      break  # 无法约去
     del num[i]
   else:
     return math.prod(num)
@@ -3213,25 +3210,25 @@ def is_empty_shape(s: Shape) -> bool:
   return any(definitely_equal(d, 0) for d in s)
 
 def dilate_dim(d: DimSize, dilation: DimSize) -> DimSize:
-  """max(0, 1 + dilation * (d - 1)).
+  """max(0, 1 + dilation * (d - 1))。
 
-  Assumes dilation >= 1.
+  假定 dilation >= 1。
   """
-  if definitely_equal(dilation, 1):  # fast path
+  if definitely_equal(dilation, 1):  # 快速路径
     return d
   return max_dim(1 + dilation * (d - 1), 0)
 
 def stride_dim(d: DimSize, window_size: DimSize, window_stride: DimSize) -> DimSize:
   """max(0, (d - window_size) // window_stride + 1)
 
-  If d < window_size, returns 0.
-  We assume window_size >= 1 and window_stride >= 1.
+  如果 d < window_size，则返回 0。
+  我们假定 window_size >= 1 且 window_stride >= 1。
   """
-  # If d < window_size then (d - window_size) // window_stride < 0
+  # 如果 d < window_size，那么 (d - window_size) // window_stride < 0
   return max_dim((d - window_size) // window_stride + 1, 0)
 
 def min_dim(d1: DimSize, d2: DimSize) -> DimSize:
-  """Like min(d1, d2) but for both constant and symbolic dimensions."""
+  """类似于 min(d1, d2)，但适用于常量和符号维度。"""
   d1_is_constant = is_constant_dim(d1)
   if d1_is_constant and is_constant_dim(d2):
     return min(d1, d2)
@@ -3243,7 +3240,7 @@ def min_dim(d1: DimSize, d2: DimSize) -> DimSize:
     return d1.min(d2)
 
 def max_dim(d1: DimSize, d2: DimSize) -> DimSize:
-  """Like max(d1, d2) but for both constant and symbolic dimensions."""
+  """类似于 max(d1, d2)，但适用于常量和符号维度。"""
   d1_is_constant = is_constant_dim(d1)
   if d1_is_constant and is_constant_dim(d2):
       return max(d1, d2)
@@ -3255,13 +3252,13 @@ def max_dim(d1: DimSize, d2: DimSize) -> DimSize:
     return d1.max(d2)
 
 def dimension_as_value(d: DimSize):
-  """Turns a dimension size into a JAX array.
-     This is the identity function for constant dimensions.
+  """将维度大小转换为 JAX 数组。
+     对于常量维度，这是恒等函数。
 
-     Has the same abstract value as Python constants.
+     其抽象值与 Python 常量相同。
      """
   if isinstance(d, (int, Tracer, np.int32, np.int64)): return d
-  # For shape_poly._DimPolynomial
+  # 用于 shape_poly._DimPolynomial
   m = getattr(d, "dimension_as_value", None)
   if m is not None: return m()
   return operator.index(d)
@@ -3270,22 +3267,22 @@ def canonicalize_slice(
     s: slice,
     axis_size: DimSize
   ) -> tuple[DimSize, DimSize, DimSize]:
-  """Computes the start index, step, and size of the slice `x[s]`.
+  """计算切片 `x[s]` 的起始索引、步长和大小。
 
-  This is similar to `s.indices(axis_size)`, except that it returns
-  `(start, step, size)`, and it works when the slice and/or the
-  `axis_size` are symbolic.
+  这与 `s.indices(axis_size)` 类似，区别在于它返回
+  `(start, step, size)`，并且当切片和/或
+  `axis_size` 是符号值时它也能工作。
 
-  See https://numpy.org/doc/stable/user/basics.indexing.html#slicing-and-striding
+  参见 https://numpy.org/doc/stable/user/basics.indexing.html#slicing-and-striding
   """
   def convert_to_index(d: DimSize) -> DimSize:
-    # Convert np.array and jax.Array to int, leave symbolic dimensions alone
+    # 将 np.array 和 jax.Array 转换为 int，保留符号维度不变
     try:
       return operator.index(d)
     except:
       return d
 
-  # Must resolve statically if step is {<0, ==0, >0}
+  # 如果 step 属于 {<0, ==0, >0}，则必须静态解析
   step = convert_to_index(s.step) if s.step is not None else 1
   try:
     if step == 0:
@@ -3335,10 +3332,10 @@ class SomeTracer:
   def __repr__(self): return "[dynamic]"
 
 def replace_tracer_for_error_message(obj):
-  # TODO(mattjj): Many ideas for improving this.  Crawl the stack and see if
-  # there are user variables whose value is == to this object?  Or search
-  # parameters of functions being transformed, at least?  Or at least assign
-  # short unique ids to them?
+  # TODO(mattjj): 有很多改进的想法。遍历栈看看是否
+  # 有用户变量的值 == 这个对象？或者至少搜索
+  # 正在被变换的函数的参数？或者至少为它们分配
+  # 简短且唯一的 id？
   if isinstance(obj, Tracer):
     return SomeTracer()
   else:
@@ -3346,28 +3343,28 @@ def replace_tracer_for_error_message(obj):
 
 def evaluate_shape(shape: Shape, dim_vars: Sequence[str],
                    *dim_values: Array) -> Sequence[Array]:
-  """Evaluates a shape possibly containing non-constants.
+  """对可能包含非常量的 shape 求值。
 
   Args:
-    shape: the shape to evaluate.
-    dim_vars: the dimension variables names that may appear in `shape`.
-    dim_values: the dimension values corresponding to `dim_vars`.
+    shape: 待求值的 shape。
+    dim_vars: 可能出现在 `shape` 中的维度变量名。
+    dim_values: 与 `dim_vars` 对应的维度值。
 
   Returns:
-     a tuple of JAX values corresponding to `shape`, of type
-     `dim_value_dtype`.
+     与 `shape` 对应的 JAX 值组成的元组，其类型为
+     `dim_value_dtype`。
   """
   env = dict(zip(dim_vars, dim_values))
   def eval_one_dim(d: DimSize):
     try:
       return operator.index(d)
     except:
-      # Is a _DimExpr
+      # 是一个 _DimExpr
       return d._evaluate(env)  # pyrefly: ignore[missing-attribute]
   return tuple(eval_one_dim(d) for d in shape)
 
 def dim_value_dtype():
-  """The dtype to be used for dimension values."""
+  """用于维度值的 dtype。"""
   return dtypes.default_int_dtype()
 
 def dim_constant(ct: int):
@@ -3381,24 +3378,24 @@ def dim_constant(ct: int):
 def dim_value_aval() -> AbstractValue:
   return ShapedArray((), dim_value_dtype(), weak_type=True, sharding=None)
 
-# ------------------- Call -------------------
+# ------------------- 调用 -------------------
 
-# eval_jaxpr_p is a call-like primitive parameterized by a jaxpr rather than a
-# Python callable: applying it evaluates the jaxpr, and staging it out is O(1),
-# emitting a single eqn that keeps its identity under retracing. Its
-# transformation rules live in partial_eval.py and lax/eval_jaxpr.py.
+# eval_jaxpr_p 是一个类似 call 的原语，它由 jaxpr 而非
+# Python 可调用对象参数化：应用它会求值该 jaxpr，将其暂存出去是 O(1) 的，
+# 只生成一个方程，该方程在重新追踪时保持不变。它的
+# 变换规则位于 partial_eval.py 和 lax/eval_jaxpr.py 中。
 eval_jaxpr_p = Primitive('eval_jaxpr')
 eval_jaxpr_p.multiple_results = True
 eval_jaxpr_p.def_impl(lambda *args, call_jaxpr, **_: jaxpr_as_fun(call_jaxpr)(*args))
 eval_jaxpr_p.def_effectful_abstract_eval(
     lambda *_, call_jaxpr, **__: (call_jaxpr.out_avals, positional_effects(call_jaxpr)))
 
-# Aliases for the deleted final-style call primitives, for downstream code that
-# matches on these names when interpreting jaxprs.
+# 已删除的 final 风格 call 原语的别名，供在解释 jaxpr 时
+# 按这些名称进行匹配的下游代码使用。
 call_p = closed_call_p = eval_jaxpr_p
 
 
-# ------------------- Map -------------------
+# ------------------- 映射 -------------------
 
 def mapped_aval(size: AxisSize, axis, aval: AbstractValue) -> AbstractValue:
   from jax._src.hijax import HiType  # pyrefly: ignore[missing-import]
@@ -3413,7 +3410,7 @@ def mapped_aval(size: AxisSize, axis, aval: AbstractValue) -> AbstractValue:
 def mapped_leading_aval(size, aval) -> AbstractValue:
   return mapped_aval(size, aval.leading_axis_spec(), aval)
 
-# TODO(yashkatariya): take axis data
+# TODO(yashkatariya): 接收轴数据
 def unmapped_aval(size: AxisSize, axis: int | None,
                   aval: AbstractValue, explicit_mesh_axis=None) -> AbstractValue:
   from jax._src.hijax import HiType  # pyrefly: ignore[missing-import]
@@ -3462,12 +3459,11 @@ aval_mapping_handlers: dict[type, AvalMapHandlerPair] = {
     AbstractToken: (lambda _, __, a: a, lambda _, __, ____, a: a)
 }
 
-# When a mapped function is given no axis name, we generate a name object based
-# on the id of the function object. Collisions aren't important because this
-# name can't be used in collectives, as user code never gets a ref to this
-# object. We don't want to use the function object itself because that might
-# persist references to the function object.
-# TODO(mattjj): revisit this unique axis name strategy
+# 当被映射的函数没有给出轴名时，我们基于函数对象的 id 生成
+# 一个名称对象。冲突并不重要，因为这个名称无法在集合通信中
+# 使用，用户代码永远拿不到对该对象的引用。我们不想使用函数
+# 对象本身，因为那可能会持久保留对函数对象的引用。
+# TODO(mattjj): 重新审视这个唯一轴名策略
 @total_ordering
 class _TempAxisName:
 
@@ -3489,7 +3485,7 @@ class _TempAxisName:
 
 @dataclass(frozen=True, slots=True)
 class NamedAxisEffect(effects.Effect):
-  """A side-effect introducing a new named axis into the current scope."""
+  """一种将新的命名轴引入当前作用域的副作用。"""
   name: AxisName
 
 effects.control_flow_allowed_effects.add_type(NamedAxisEffect)
@@ -3519,13 +3515,13 @@ def replace_jaxpr_effects(jaxpr: Jaxpr, effects: Effects):
 def _replace_jaxpr_effects(jaxpr: Jaxpr, effects: frozenset[Effect]):
   return jaxpr.replace(effects=set(effects))
 
-# ------------------- Jaxpr checking -------------------
+# ------------------- jaxpr 检查 -------------------
 
 def typecheck(aval: AbstractValue, x) -> bool:
   return typecompat(aval, typeof(x))
 
 def typecompat(aval_ref: AbstractValue, aval: AbstractValue) -> bool:
-  """Determine whether `aval` conforms to `aval_ref`. Ignores weak_type."""
+  """判断 `aval` 是否符合 `aval_ref`。忽略 weak_type。"""
   try:
     return typematch(aval_ref, aval)
   except TypeError:
@@ -3533,7 +3529,7 @@ def typecompat(aval_ref: AbstractValue, aval: AbstractValue) -> bool:
 
 def typematch(t1: AbstractValue, t2: AbstractValue,
               no_dtype_check: bool = False) -> bool:
-  """Determine whether `t1` and `t2` are equivalent. Ignores weak_type."""
+  """判断 `t1` 和 `t2` 是否等价。忽略 weak_type。"""
   t1 = t1.normalize()
   t2 = t2.normalize()
   from jax._src.state.types import AbstractRef  # pyrefly: ignore[missing-import]
@@ -3544,7 +3540,7 @@ def typematch(t1: AbstractValue, t2: AbstractValue,
       return cmp_shape_shd_mat_memsp(t1, t2)
     return t1.dtype == t2.dtype and cmp_shape_shd_mat_memsp(t1, t2)
   elif isinstance(t1, AbstractRef) and isinstance(t2, AbstractRef):
-    # We want to use the regular typecheck for ShapedArray here.
+    # 这里我们想对 ShapedArray 使用常规的类型检查。
     return (typematch(t1.inner_aval, t2.inner_aval, no_dtype_check) and
             (t1.memory_space is None or t2.memory_space is None or
              t1.memory_space == t2.memory_space))
@@ -3552,8 +3548,8 @@ def typematch(t1: AbstractValue, t2: AbstractValue,
     return False
 
 def cmp_shape_shd_mat_memsp(t1, t2):
-  # TODO(yashkatariya): Expand this to Manual and Auto mode.
-  # See https://github.com/jax-ml/jax/issues/26474
+  # TODO(yashkatariya): 将其扩展到 Manual 和 Auto 模式。
+  # 参见 https://github.com/jax-ml/jax/issues/26474
   t1_mesh, t2_mesh = t1.sharding.mesh, t2.sharding.mesh
   if not t1_mesh.empty and not t2_mesh.empty:
     if t1_mesh._any_axis_explicit or t2_mesh._any_axis_explicit:
@@ -3575,7 +3571,7 @@ def aval_mismatch_extra(a1: AbstractValue, a2: AbstractValue) -> str:
       mismatches.append('the shapes do not match')
     if a1.mat != a2.mat:
       mismatches.append('the manual axis types do not match')
-    # TODO(yashkatariya,mattjj): add check for sharding-in-types mismatch
+    # TODO(yashkatariya,mattjj): 添加对类型中分片（sharding-in-types）不匹配的检查
 
     if len(mismatches) == 0:
       return ''
@@ -3599,21 +3595,21 @@ def _check_closed_call(_, *in_atoms, call_jaxpr, **__):
 custom_typechecks[eval_jaxpr_p] = _check_closed_call
 
 def check_jaxpr(jaxpr: Jaxpr):
-  """Checks well-formedness of a jaxpr.
+  """检查 jaxpr 的良构性。
 
-  Specifically, check that:
-  - variables that are read are bound beforehand
-  - variables are typed equally throughout a jaxpr
-  - variable type annotations are compatible with their binding expression
+  具体来说，检查：
+  - 被读取的变量此前已经绑定
+  - 同一变量在整个 jaxpr 中类型保持一致
+  - 变量的类型标注与其绑定表达式兼容
 
-  Raises `JaxprTypeError` if `jaxpr` is determined invalid. Returns `None`
-  otherwise.
+  如果判定 `jaxpr` 无效，则抛出 `JaxprTypeError`。否则
+  返回 `None`。
   """
   @functools.cache
   def ctx_factory():
     ctx = JaxprPpContext(_dropvars(jaxpr))
     pp_settings = JaxprPpSettings()
-    try: pp_jaxpr(jaxpr, ctx, pp_settings)  # side-effect on ctx, build variable names
+    try: pp_jaxpr(jaxpr, ctx, pp_settings)  # 对 ctx 产生副作用，构建变量名
     except: pass
     return ctx, pp_settings
 
@@ -3631,9 +3627,9 @@ def check_jaxpr(jaxpr: Jaxpr):
     msg = "\n\n".join([msg, "while checking jaxpr:", jaxpr_str])
     raise JaxprTypeError(msg) from None
 
-  # Run key reuse checker after validating jaxpr:
+  # 在验证 jaxpr 之后运行键复用检查器：
   if config.debug_key_reuse.value:
-    # Import here to avoid circular imports
+    # 在此处导入以避免循环导入
     from jax.experimental.key_reuse._core import check_key_reuse_jaxpr  # pyrefly: ignore[missing-import]
     check_key_reuse_jaxpr(jaxpr)
 
@@ -3656,16 +3652,16 @@ def _check_jaxpr(
   env: dict[Var, Atom] = {}
 
   def read(x: Atom) -> Atom:
-    # Check the type annotation is itself well-typed.
+    # 检查类型标注本身是良类型的。
     check_type(ctx_factory, env, x.aval)
     if isinstance(x, Var):
-      # Check the variable is in-scope and consistently typed.
+      # 检查变量在作用域内且类型一致。
       if x not in env:
         ctx, _ = ctx_factory()
         raise JaxprTypeError(f"Variable '{x.pretty_print(ctx)}' not defined")
       return env[x]
     elif isinstance(x, Literal):
-      # Check that the literal matches its type annotation.
+      # 检查字面量与其类型标注匹配。
       if not typecheck(x.aval, x.val):
         ctx, _ = ctx_factory()
         raise JaxprTypeError(
@@ -3677,45 +3673,45 @@ def _check_jaxpr(
 
   def write(v: Var, aval: AbstractValue) -> None:
     assert isinstance(v, Var), "syntactically invalid jaxpr"
-    # Check the type annotation of the binder is itself well-typed.
+    # 检查绑定者的类型标注本身是良类型的。
     check_type(ctx_factory, env, v.aval)
-    # Check that the variable is not already bound.
+    # 检查该变量尚未被绑定。
     if v in env:
       ctx, _ = ctx_factory()
       raise JaxprTypeError(f"Variable '{v.pretty_print(ctx)}' already bound")
-    # Check that the computed type is consistent with the binder annotation.
+    # 检查计算出的类型与绑定者标注一致。
     if not typematch(v.aval, aval):
       ctx, _ = ctx_factory()
       raise JaxprTypeError(
           f"Value for variable '{v.pretty_print(ctx)}' inconsistently typed "
           f"as {pp_aval(aval, ctx)} for let-binder of type {pp_aval(v.aval, ctx)}")
 
-    # If the variable is not a DropVar, add it to the environment.
+    # 如果变量不是 DropVar，则将其加入环境。
     if not isinstance(v, DropVar):
       env[v] = v
 
-  # # Don't return refs
+  # # 不要返回 ref
   if config.mutable_array_checks.value:
     from jax._src.state.types import AbstractRef  # pyrefly: ignore[missing-import]
     for v in jaxpr.outvars:
       if isinstance(v.aval, AbstractRef):
         raise JaxprTypeError("returned a ref!")
 
-  # Check type annotations on lambda binders.
+  # 检查 lambda 绑定者上的类型标注。
   for v in it.chain(jaxpr.constvars, jaxpr.invars):
     check_type(ctx_factory, env, v.aval)
     write(v, v.aval)
 
-  # Check each eqn.
+  # 检查每个方程。
   input_vars = set(it.chain(jaxpr.constvars, jaxpr.invars))
   mut_arrays = set()
   for eqn_idx, eqn in enumerate(jaxpr.eqns):
     prim = eqn.primitive
     try:
       in_atoms = map(read, eqn.invars)
-      in_avals = [x.aval for x in in_atoms]  # use in_atoms for dyn shapes
+      in_avals = [x.aval for x in in_atoms]  # 对动态 shape 使用 in_atoms
 
-      # Compute the type of the primitive application.
+      # 计算该原语应用的类型。
       with eqn.ctx.manager:
         if prim in custom_typechecks:
           out_type, eqn_effects = custom_typechecks[prim](
@@ -3723,8 +3719,8 @@ def _check_jaxpr(
         else:
           out_type, eqn_effects = check_eqn(prim, in_avals, eqn.params)
 
-      # Check the computed effect type matches the eqn's annotation, and is
-      # included in the jaxpr's annotation.
+      # 检查计算出的效果类型与方程的标注匹配，并且
+      # 包含在 jaxpr 的标注中。
       if prim.ref_primitive:
         if prim.ref_allocating:
           outvar, = eqn.outvars
@@ -3746,14 +3742,14 @@ def _check_jaxpr(
                 "Invalid `JaxprInputEffect`: must be present in jaxpr. "
                 f"{eff} is not in {jaxpr.effects}.")
         elif isinstance(eff, NamedAxisEffect):
-          # It is valid for a primitive to discharge the named axis effect.
+          # 原语可以合法地消解（discharge）命名轴效果。
           continue
         elif eff not in jaxpr.effects:
           raise JaxprTypeError("Equation effect not present in jaxpr effects. "
                                f"Equation effect: {eff}. "
                                f"Jaxpr effects: {jaxpr.effects}")
 
-      # Check out_type matches the let-binders' annotation (after substitution).
+      # 检查 out_type 与 let 绑定者的标注匹配（替换之后）。
       foreach(write, eqn.outvars, out_type)
 
     except JaxprTypeError as e:
@@ -3764,14 +3760,14 @@ def _check_jaxpr(
                          f"from source: {src}"])
       raise JaxprTypeError(msg, eqn_idx) from None
 
-  # Check there are no output refs
-  # TODO(mattjj): improve this error message
+  # 检查没有输出 ref
+  # TODO(mattjj): 改进这条错误信息
   if config.mutable_array_checks.value:
     from jax._src.state.types import AbstractRef  # pyrefly: ignore[missing-import]
     for v in jaxpr.outvars:
       if isinstance(v.aval, AbstractRef): raise TypeError("returned ref")
 
-  # TODO(mattjj): include output type annotation on jaxpr and check it here
+  # TODO(mattjj): 在 jaxpr 上包含输出类型标注并在此处检查它
   foreach(read, jaxpr.outvars)
 
 def check_type(
@@ -3779,7 +3775,7 @@ def check_type(
     env: dict[Var, Atom],
     ty: AbstractValue,
   ) -> None:
-  return  # Except in above case(s), all syntactic forms are valid
+  return  # 除上述情况外，所有语法形式都是有效的
 
 def check_eqn(prim, in_avals, params):
   for jaxpr in jaxprs_in_params(params):
@@ -3800,11 +3796,11 @@ def _check_call(ctx_factory, prim, in_atoms, params):
                          f"operands cannot call jaxpr with "
                          f"{len(call_jaxpr.invars)} inputs")
 
-  # Check `call_jaxpr` can be applied to in_atoms.
+  # 检查 `call_jaxpr` 是否可以应用到 in_atoms。
   env: dict[Var, Atom] = {}
   for v, x in zip(call_jaxpr.invars, in_atoms):
     if not typecompat(v.aval, x.aval):
-      # TODO(mattjj): vars in error message are confusing b/c of Var.__repr__
+      # TODO(mattjj): 由于 Var.__repr__，错误消息中的变量令人困惑
       raise JaxprTypeError(f"Call primitive {prim} passes operand {x} of type "
                            f"{x.aval} to jaxpr expecting type "
                            f"{v.aval}")
@@ -3849,14 +3845,14 @@ def _check_sharding(sharding, shape):
 
 @set_module("jax")
 class ShapeDtypeStruct:
-  """A container for the shape, dtype, and other static attributes of an array.
+  """用于保存数组的形状、dtype 以及其他静态属性的容器。
 
-  ``ShapeDtypeStruct`` is often used in conjunction with :func:`jax.eval_shape`.
+  ``ShapeDtypeStruct`` 通常与 :func:`jax.eval_shape` 配合使用。
 
   Args:
-    shape: a sequence of integers representing an array shape
-    dtype: a dtype-like object
-    sharding: (optional) a :class:`jax.Sharding` object
+    shape: 表示数组形状的整数序列
+    dtype: 一个类似 dtype 的对象
+    sharding: （可选）一个 :class:`jax.Sharding` 对象
   """
   __slots__ = ["shape", "dtype", "_sharding", "_dll", "weak_type",
                "manual_axis_type", "is_ref", "_memory_space"]
@@ -3911,8 +3907,8 @@ class ShapeDtypeStruct:
   def __setattr__(self, name, value):
     if hasattr(self, name):
       if getattr(self, name) == value:
-        # This can happen if two threads race, for example if two threads
-        # are trying to hash the same SDS instance.
+        # 这可能发生在两个线程竞争时，例如两个线程
+        # 试图对同一个 SDS 实例求哈希。
         return
       raise RuntimeError(
           f"Cannot reassign attributes ({name}) of immutable ShapeDtypeStruct"
@@ -3949,8 +3945,8 @@ class ShapeDtypeStruct:
   @property
   def sharding(self):
     if isinstance(self._sharding, P):
-      # TODO(yashkatariya): Maybe use `get_abstract_mesh()` here but switch
-      # on `core.trace_state_clean()`?
+      # TODO(yashkatariya): 也许可以在这里使用 `get_abstract_mesh()`，但要根据
+      # `core.trace_state_clean()` 来切换？
       cur_mesh = mesh_lib.get_concrete_mesh()
       if cur_mesh.empty:
         raise TypeError(
@@ -3969,7 +3965,7 @@ class ShapeDtypeStruct:
     try:
       return self.shape[0]
     except IndexError as e:
-      raise TypeError("len() of unsized object") from e  # same as numpy error
+      raise TypeError("len() of unsized object") from e  # 与 numpy 的报错相同
 
   def __repr__(self):
     sh = f", sharding={self.sharding}" if self.sharding is not None else ""
@@ -4040,7 +4036,7 @@ def _canonicalize_sds(sds):
 pytype_aval_mappings[ShapeDtypeStruct] = _sds_aval_mapping
 dtypes.register_canonicalize_value_handler(ShapeDtypeStruct, _canonicalize_sds)
 
-# ------------------- Jaxpr printed representation -------------------
+# ------------------- Jaxpr 打印表示 -------------------
 
 def pp_toplevel_jaxpr(jaxpr_to_print: Jaxpr, *,
                       source_info: bool = False,
@@ -4056,7 +4052,7 @@ def pp_toplevel_jaxpr(jaxpr_to_print: Jaxpr, *,
         name_stack=name_stack,
         print_effects=print_effects)
 
-    # Compute how many times each jaxpr is used.
+    # 统计每个 jaxpr 被使用的次数。
     names = defaultdict[Jaxpr, str](lambda: "jaxpr")
     jaxpr_counts = Counter[Jaxpr]()
     s = deque([jaxpr_to_print])
@@ -4066,7 +4062,7 @@ def pp_toplevel_jaxpr(jaxpr_to_print: Jaxpr, *,
       if jaxpr is not jaxpr_to_print and len(jaxpr.eqns) > 10:
         jaxpr_counts[jaxpr] += 1
       for eqn in jaxpr.eqns:
-        # TODO(slebedev): Come up with a more elaborate heuristic for name=.
+        # TODO(slebedev): 为 name= 想出一个更精细的启发式规则。
         name = eqn.params.get("name")
         if name is None:
           s.extend(jaxprs_in_params(eqn.params))
@@ -4076,8 +4072,8 @@ def pp_toplevel_jaxpr(jaxpr_to_print: Jaxpr, *,
           s.append(subjaxpr)
           names.setdefault(subjaxpr, name)
 
-    # Pull jaxprs occurring more than once to the top-level, making sure
-    # that their names are unique.
+    # 把出现多次的 jaxpr 提到顶层，并确保
+    # 它们的名称是唯一的。
     name_counts = Counter[str]()
     shared = []
     for jaxpr, c in jaxpr_counts.items():
@@ -4117,11 +4113,11 @@ def _encode_digits_alphabetic(n: int) -> str:
     s = chr(97 + i % 26) + s
   return s
 
-# A JaxprPpContext allows globally unique variable names within nested Jaxprs.
+# JaxprPpContext 允许在嵌套的 Jaxpr 中使用全局唯一的变量名。
 class JaxprPpContext:
   var_names: defaultdict[Var, str]
-  # Shared jaxprs are those that are used multiple times and are printed first.
-  shared_jaxprs: MutableMapping[Jaxpr, str]  # maps shared jaxpr to its name
+  # 共享 jaxpr 指那些被多次使用、并且会最先打印的 jaxpr。
+  shared_jaxprs: MutableMapping[Jaxpr, str]  # 将共享 jaxpr 映射到其名称
   shared_jaxpr_names: MutableSet[str]
 
   def __init__(self, var_names: dict | None = None) -> None:
@@ -4135,14 +4131,14 @@ class JaxprPpContext:
   def suggest_same_var_names(self,
                              for_vars: Sequence[Atom],
                              like_vars: Sequence[Atom]) -> None:
-    """Suggests the names for `for_vars` to match those of `like_vars`.
+    """建议 `for_vars` 的名称，使其与 `like_vars` 的名称一致。
 
-    `for_vars` are distinct Vars, and are aliased with `like_vars`.
+    `for_vars` 是互不相同的 Var，并被作为 `like_vars` 的别名。
     """
     used_like_vars: set[Var] = set()
     if len(for_vars) != len(like_vars):
-      # The mismatch can happen if a primitive containing a subjaxpr is invoked
-      # with the wrong number of arguments, e.g., when printing an invalid Jaxpr.
+      # 当调用带有 subjaxpr 的原语时传入的参数个数有误，例如打印一个无效的
+      # Jaxpr 时，就可能出现这种不匹配。
       return
     for for_v, like_v in zip(for_vars, like_vars):
       if (isinstance(like_v, Var) and
@@ -4253,7 +4249,7 @@ def pp_jaxpr_skeleton(jaxpr: Jaxpr, eqns_fn, context: JaxprPpContext,
     pp.text("("), pp_vars(jaxpr.outvars, context, separator=","),
     pp.text(")" if len(jaxpr.outvars) != 1 else ",)")])
   if settings.print_effects:
-    # TODO(sharadmv): render an entire signature here
+    # TODO(sharadmv): 在此渲染完整的签名
     eff_text = [pp.text(" : { ")]
     for i, eff in enumerate(jaxpr.effects):
       if i > 0:
@@ -4334,10 +4330,10 @@ def pp_effect(effect: Effect, context: JaxprPpContext) -> pp.Doc:
     return effect._pretty_print(context)
   return pp.text(str(effect))
 
-# ------------------- Jaxpr util -------------------
+# ------------------- Jaxpr 工具 -------------------
 
 def last_used(jaxpr: Jaxpr) -> dict[Var, JaxprEqn | None]:
-  """Returns a mapping from every var in jaxpr to what equation uses it last."""
+  """返回一个从 jaxpr 中每个变量到最后一个使用它的方程的映射。"""
   last_used: dict[Var, JaxprEqn | None] = {
       v: None for v in jaxpr.outvars if not isinstance(v, Literal)}
   for eqn in reversed(jaxpr.eqns):
@@ -4348,13 +4344,13 @@ def last_used(jaxpr: Jaxpr) -> dict[Var, JaxprEqn | None]:
 
 def clean_up_dead_vars(eqn: JaxprEqn, env: dict[Var, Any],
                        last_used: dict[Var, JaxprEqn | None]):
-  """Remove all eqn.invars from env if eqn is the last time they were used."""
+  """若 eqn 是这些变量最后一次被使用的地方，则从 env 中移除所有 eqn.invars。"""
   for v in {v for v in eqn.invars if not isinstance(v, Literal)}:
     if last_used[v] is eqn:
-      # Delete ref to variable when it is no longer needed by next equations.
+      # 当变量不再被后续方程需要时，删除对它的引用。
       del env[v]
 
-# Used in shard_map for converting avals
+# 在 shard_map 中用于转换 aval
 shard_aval_handlers = {}
 unshard_aval_handlers = {}
 
@@ -4377,11 +4373,11 @@ def unshard_aval(mesh, check_vma, spec, aval: AbstractValue
   raise NotImplementedError(f"Unsupported aval type: {type(aval)}")
 
 
-# ----------------- external APIs for querying tracing context -----------------
+# ----------------- 用于查询追踪上下文的外部 API -----------------
 
-# TODO(dougalm, jakevdp): expose these via jax.extend
+# TODO(dougalm, jakevdp): 通过 jax.extend 暴露这些接口
 
-# Comparable object for checking whether JAX's trace state has changed.
+# 用于检查 JAX 的追踪状态是否发生变化的可比较对象。
 class OpaqueTraceState:
   def __init__(self, trace_ref):
     self._trace_ref = trace_ref
@@ -4406,7 +4402,7 @@ def unsafe_am_i_under_a_jit() -> bool:
 def unsafe_am_i_under_a_vmap() -> bool:
   return 'BatchTrace' in str(unsafe_get_trace_stack(trace_ctx.trace))
 
-# TODO(douglam): deprecate/delete
+# TODO(douglam): 弃用/删除
 def find_top_trace(_):
   return unsafe_get_current_trace()
 
@@ -4423,6 +4419,6 @@ def unsafe_get_trace_stack(trace):
 def unsafe_get_axis_names() -> list[Any]:
   return list(trace_ctx.axis_env.axis_sizes)
 
-# TODO(douglam): deprecate/delete
+# TODO(douglam): 弃用/删除
 def axis_frame(axis_name):
   return trace_ctx.axis_env.axis_size(axis_name)

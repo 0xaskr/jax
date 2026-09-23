@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：定义 JAX 中描述数组如何在设备间分布的分片（sharding）抽象。
+# `Sharding` 是面向用户的基类，规定 `device_set`、`is_fully_replicated`、
+# `is_fully_addressable`、`num_devices`、`memory_kind` 等必须由子类实现的接口，
+# 并给出 `addressable_devices_indices_map`、`devices_indices_map`、`shard_shape`、
+# `is_equivalent_to` 等默认实现；模块还提供把分片转换为 XLA HLO / sdy 表示、
+# 比较两个分片是否等价，以及计算并缓存“设备到索引映射”和分片形状的辅助函数。
+
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -44,7 +51,7 @@ def _addressable_devices_indices_map(
 @cache(max_size=4096, trace_context_in_key=False)
 def common_devices_indices_map(
     s: Sharding, global_shape: Shape) -> Mapping[Device, Index]:
-  s.shard_shape(global_shape)  # raises a good error message
+  s.shard_shape(global_shape)  # 抛出信息友好的错误
   hlo_sharding = s._to_xla_hlo_sharding(len(global_shape))
   if (xc.OpSharding.Type.UNREDUCED in hlo_sharding.subgroup_types() or
       hlo_sharding.is_unreduced()):
@@ -92,50 +99,50 @@ def common_is_equivalent_to(s1: Sharding, s2: Sharding, ndim: int,
 
 @use_cpp_class(xc.Sharding)
 class Sharding:
-  """Describes how a :class:`jax.Array` is laid out across devices.
+  """描述 :class:`jax.Array` 如何布局到各个设备上。
   """
 
-  # Abstract methods below that subclasses should implement.
+  # 以下为抽象方法，应由子类实现。
   @property
   def device_set(self) -> set[Device]:
-    """The set of devices that this :class:`Sharding` spans.
+    """该 :class:`Sharding` 所跨越的设备集合。
 
-    In multi-controller JAX, the set of devices is global, i.e., includes
-    non-addressable devices from other processes.
+    在多控制器 JAX 中，设备集合是全局的，即包含
+    来自其他进程的不可寻址设备。
     """
     raise NotImplementedError('Subclasses should implement this method.')
 
   @property
   def is_fully_replicated(self) -> bool:
-    """Is this sharding fully replicated?
+    """该分片是否完全复制？
 
-    A sharding is fully replicated if each device has a complete copy of the
-    entire data.
+    如果每个设备都拥有整个数据的完整副本，
+    则该分片是完全复制的。
     """
     raise NotImplementedError('Subclasses should implement this method.')
 
   @property
   def is_fully_addressable(self) -> bool:
-    """Is this sharding fully addressable?
+    """该分片是否完全可寻址？
 
-    A sharding is fully addressable if the current process can address all of
-    the devices named in the :class:`Sharding`. ``is_fully_addressable`` is
-    equivalent to "is_local" in multi-process JAX.
+    如果当前进程能够寻址 :class:`Sharding` 中列出的所有设备，
+    则该分片就是完全可寻址的。``is_fully_addressable``
+    等价于多进程 JAX 中的 "is_local"。
     """
     raise NotImplementedError('Subclasses should implement this method.')
 
   @property
   def num_devices(self) -> int:
-    """Number of devices that the sharding contains."""
+    """该分片包含的设备数量。"""
     raise NotImplementedError('Subclasses should implement this method.')
 
   @property
   def memory_kind(self) -> str | None:
-    """Returns the memory kind of the sharding."""
+    """返回该分片的内存种类。"""
     raise NotImplementedError('Subclasses should implement this method.')
 
   def with_memory_kind(self, kind: str) -> Sharding:
-    """Returns a new Sharding instance with the specified memory kind."""
+    """返回具有指定内存种类的新 `Sharding` 实例。"""
     raise NotImplementedError('Subclasses should implement this method')
 
   @property
@@ -154,7 +161,7 @@ class Sharding:
     raise NotImplementedError('Subclasses should implement this method.')
 
   #############################################################################
-  # Default implementations below that all subclasses will inherit.
+  # 以下为所有子类都会继承的默认实现。
 
   @property
   def _is_concrete(self) -> bool:
@@ -162,10 +169,10 @@ class Sharding:
 
   @functools.cached_property
   def addressable_devices(self) -> set[Device]:
-    """The set of devices in the :class:`Sharding` that are addressable by the
-       current process.
+    """该 :class:`Sharding` 中可被当前进程寻址的
+       设备集合。
     """
-    # Add a fast path for single controller runtimes.
+    # 为单控制器运行时添加快速路径。
     if xb.process_count() == 1:
       return self.device_set
     return {d for d in self.device_set
@@ -173,18 +180,18 @@ class Sharding:
 
   def addressable_devices_indices_map(
       self, global_shape: Shape) -> Mapping[Device, Index | None]:
-    """A mapping from addressable devices to the slice of array data each contains.
+    """从可寻址设备到各设备所含数组数据切片的映射。
 
-    ``addressable_devices_indices_map`` contains that part of
-    ``device_indices_map`` that applies to the addressable devices.
+    ``addressable_devices_indices_map`` 包含
+    ``device_indices_map`` 中适用于可寻址设备的那部分。
     """
     return _addressable_devices_indices_map(self, global_shape)
 
   def devices_indices_map(self, global_shape: Shape) -> Mapping[Device, Index]:
-    """Returns a mapping from devices to the array slices each contains.
+    """返回从设备到各设备所含数组切片的映射。
 
-    The mapping includes all global devices, i.e., including
-    non-addressable devices from other processes.
+    该映射包含所有全局设备，即包含
+    来自其他进程的不可寻址设备。
     """
     return common_devices_indices_map(self, global_shape)
 
@@ -199,17 +206,17 @@ class Sharding:
     return tuple(self._internal_device_list.addressable_device_list)
 
   def shard_shape(self, global_shape: Shape) -> Shape:
-    """Returns the shape of the data on each device.
+    """返回每个设备上数据的形状。
 
-    The shard shape returned by this function is calculated from
-    ``global_shape`` and the properties of the sharding.
+    该函数返回的分片形状由
+    ``global_shape`` 与分片自身的属性计算得到。
     """
     return _common_shard_shape(self, global_shape)
 
   def is_equivalent_to(self: Sharding, other: Sharding, ndim: int) -> bool:
-    """Returns ``True`` if two shardings are equivalent.
+    """若两个分片等价则返回 ``True``。
 
-    Two shardings are equivalent if they place the same logical array shards on
-    the same devices.
+    如果两个分片把相同的逻辑数组分片放置在
+    相同的设备上，则它们是等价的。
     """
     return common_is_equivalent_to(self, other, ndim)

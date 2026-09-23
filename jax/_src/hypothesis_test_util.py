@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：为 JAX 的 hypothesis 属性测试提供分片支持与统一配置。
+# hypothesis 默认把整个测试函数当作单个测试，无法被 Bazel/多线程的测试
+# 分片机制拆分；本模块包装 hypothesis 的内部测试，按方法签名的确定性哈希
+# 把每个生成的示例分派到某个分片，从而让慢速属性测试也能并行展开。
+# 它还注册并加载 "deterministic" / "interactive" 两个配置档，并抑制若干
+# 在 JAX 测试环境下无意义的健康检查，供各测试模块经 `jtu` 基类使用。
+
 import functools
 import hashlib
 import itertools
@@ -44,7 +51,7 @@ _TEST_TOTAL_SHARDS = int(os.environ.get("TEST_TOTAL_SHARDS", "1"))
 
 
 def hypothesis_inner_test_shard(inner_test, args, kwargs, total_shards):
-  """Returns the expected shard index for a generated Hypothesis example."""
+  """返回为某个生成的 Hypothesis 示例预期的分片索引。"""
   text_repr = reflection.repr_call(inner_test, args, kwargs)
   test_hash = int(hashlib.md5(text_repr.encode()).hexdigest(), 16)
   return test_hash % total_shards
@@ -65,20 +72,20 @@ def _shard_aware_hypothesis_inner_test(inner_test):
     if total_shards == 1:
       return inner_test(*args, **kwargs)
 
-    # If we have already encountered a failure in this test case execution,
-    # assume we are in shrinking/explain phase, which won't work with sharding.
+    # 如果本次测试用例执行中已经遇到过失败，就假定我们正处于收缩/解释阶段，
+    # 该阶段无法与分片配合工作。
     if getattr(self, "_hypothesis_failed", False):
       return inner_test(*args, **kwargs)
 
     mod = hypothesis_inner_test_shard(inner_test, args, kwargs, total_shards)
     if mod != global_shard_idx:
-      # We don't call `googletest.skip` here because skipping within hypothesis
-      # will skip the *entire* test, not just the current example.
+      # 这里不调用 `googletest.skip`，因为在 hypothesis 内部跳过会跳过*整个*
+      # 测试，而不只是当前示例。
       return None
     else:
       try:
         return inner_test(*args, **kwargs)
-      # Skipped tests aren't failures and don't trigger shrinking phase.
+      # 被跳过的测试不算失败，也不会触发收缩阶段。
       except (hp_errors.UnsatisfiedAssumption, unittest.SkipTest):
         raise
       except Exception:
@@ -89,11 +96,11 @@ def _shard_aware_hypothesis_inner_test(inner_test):
 
 
 def _shard_aware_test(test, shard_index):
-  """Wraps a non-Hypothesis test to skip on the wrong shard.
+  """包装一个非 Hypothesis 测试，使其在错误的分片上被跳过。
 
-  HypothesisShardedTestLoader bypasses absltest's normal round-robin sharding,
-  so non-Hypothesis tests inside a HypothesisShardedTestCase would otherwise
-  run on every shard. This wrapper reimplements round-robin at the method level.
+  `HypothesisShardedTestLoader` 绕过了 absltest 常规的轮转分片，因此
+  `HypothesisShardedTestCase` 中的非 Hypothesis 测试原本会在每个分片上运行。
+  这个包装器在方法层级上重新实现了轮转。
   """
 
   @functools.wraps(test)
@@ -117,11 +124,11 @@ def _apply_sharding_to_tests(test_runner):
       if detection.is_hypothesis_test(test):
         handle = test.hypothesis
         assert isinstance(handle, hp.core.HypothesisHandle)
-        # `@given(..., data())` is not supported because:
-        # - Sharding requires known values for all drawn parameters.
-        # - The test body must be called given the sharding.
-        # - Using `data()`, some or all parameters are not known until the test
-        #   body is called.
+        # 不支持 `@given(..., data())`，原因如下：
+        # - 分片要求所有抽取的参数都是已知值。
+        # - 必须在给定分片的情况下调用测试主体。
+        # - 使用 `data()` 时，部分或全部参数要到调用测试主体
+        #   时才可知。
         for val in handle._given_kwargs.values():
           if isinstance(val, hps_internal_core.DataStrategy):
             raise ValueError(
@@ -133,31 +140,31 @@ def _apply_sharding_to_tests(test_runner):
             handle.inner_test
         )
       else:
-        # If the tests are not hypothesis tests (or we are not sharding
-        # hypothesis tests), we can just assign them to shards in a round-robin
-        # fashion.
+        # 如果这些测试不是 hypothesis 测试（或者我们不对
+        # hypothesis 测试做分片），我们只需以轮转方式把它们
+        # 分配到各分片即可。
         if _TEST_TOTAL_SHARDS > 1:
           shard_index = next(shards_index_iter)
           setattr(test_runner, name, _shard_aware_test(test, shard_index))
 
 
 class HypothesisShardedTestCase(jtu.JaxTestCase):
-  """Runs Hypothesis tests in a sharded manner.
+  """以分片方式运行 Hypothesis 测试。
 
-  The way hypothesis works is that it will run the same test function with
-  different arguments, and it will run the same test function with the same
-  arguments multiple times.
+  hypothesis 的工作方式是：它会使用不同的参数来运行同一个
+  测试函数，并且还会使用相同的参数把同一个测试函数重复
+  运行多次。
 
-  This makes it difficult for Bazel test sharding to work, as the test loader
-  sees the test function as a single test — and will schedule it to a single
-  shard. So a hypothesis test with 300 examples will run on a single shard, and
-  will take a long time.
+  这使 Bazel 测试分片难以生效，因为测试加载器把该测试函数视为
+  单个测试——于是会把它调度到单个分片上。这样一来，一个含
+  300 个示例的 hypothesis 测试就只会运行在一个分片上，耗时
+  很长。
 
-  This class works around this by running each hypothesis test on every single
-  shard, and then filtering out the tests that don't belong to the current
-  shard.
+  本类绕开这个问题的方式是：在每个分片上都运行
+  每个 hypothesis 测试，然后过滤掉那些不属于
+  当前分片的测试。
 
-  Must be combined with `HypothesisShardedTestLoader`.
+  必须与 `HypothesisShardedTestLoader` 配合使用。
   """
 
   _thread_shard_index: int = 0
@@ -170,10 +177,10 @@ class HypothesisShardedTestCase(jtu.JaxTestCase):
 
 
 class HypothesisShardedTestLoader(JaxTestLoader):
-  """A TestLoader that bypasses method-level sharding.
+  """一个绕过方法级分片的 `TestLoader`。
 
-  Used with `jtu.HypothesisShardedTestCase` to implement inner-test sharding
-  for slow hypothesis tests.
+  与 `jtu.HypothesisShardedTestCase` 配合使用，为较慢的 hypothesis 测试
+  实现内层测试分片。
   """
 
   def getTestCaseNames(self, testCaseClass):
@@ -209,36 +216,36 @@ class HypothesisShardedTestLoader(JaxTestLoader):
 
 
 def hypothesis_is_thread_safe() -> bool:
-  """Returns True if the installed hypothesis version is thread-safe.
+  """如果安装的 hypothesis 版本是线程安全的，则返回 True。
 
-  Hypothesis versions >= 6.136.9 are thread-safe.
+  Hypothesis 6.136.9 及以上的版本是线程安全的。
   """
   return tuple(int(x) for x in hp.__version__.split(".")) >= (6, 136, 9)
 
 
 def setup_hypothesis(max_examples=30) -> None:
-  """Sets up the hypothesis profiles.
+  """设置 hypothesis 的各配置档。
 
-  Sets up the hypothesis testing profiles, and selects the one specified by
-  the ``JAX_HYPOTHESIS_PROFILE`` environment variable (or the
-  ``--jax_hypothesis_profile`` configuration.
+  设置 hypothesis 测试配置档，并选用由 ``JAX_HYPOTHESIS_PROFILE``
+  环境变量（或 ``--jax_hypothesis_profile`` 配置项）所指定的
+  那一个。
 
   Args:
-    max_examples: the maximum number of hypothesis examples to try, when using
-      the default "deterministic" profile.
+    max_examples: 使用默认的 "deterministic" 配置档时，尝试的 hypothesis
+      示例数量上限。
   """
-  # In our tests we often use subclasses with slightly different class variables
-  # to generate whole suites of parameterized tests, but this approach does not
-  # work well with Hypothesis databases, which use some function of the method
-  # identity to generate keys. But, if the method is defined in a superclass,
-  # all subclasses share the same key. This key collision can lead to confusing
-  # false positives in other health checks.
+  # 在我们的测试中，经常使用类变量略有不同的子类，
+  # 来生成整套参数化测试，但这种方式不能很好地
+  # 与 Hypothesis 数据库配合，因为后者会用方法标识的某种
+  # 函数来生成键。但是，如果方法定义在超类中，
+  # 所有子类就会共享同一个键。这种键冲突可能导致
+  # 在其他健康检查中出现令人困惑的误报。
   #
-  # Still, as far as I understand, for as long as we don't use the example
-  # database, it should be perfectly safe to suppress this health check. This
-  # seems simpler than rewriting our tests that trigger this behavior. See
-  # the end of https://github.com/HypothesisWorks/hypothesis/issues/3446 for
-  # more context.
+  # 不过据我所知，只要我们不使用示例数据库，
+  # 抑制这项健康检查就应该是完全安全的。这似乎
+  # 比改写那些会触发该行为的测试更简单。更多
+  # 背景见 https://github.com/HypothesisWorks/hypothesis/issues/3446
+  # 的末尾。
   suppressed_checks = []
   if hasattr(hp.HealthCheck, "differing_executors"):
     suppressed_checks.append(hp.HealthCheck.differing_executors)
@@ -260,7 +267,7 @@ def setup_hypothesis(max_examples=30) -> None:
       max_examples=1,
       report_multiple_bugs=False,
       verbosity=hp.Verbosity.verbose,
-      # Don't try and shrink
+      # 不要尝试做收缩
       phases=(
           hp.Phase.explicit,
           hp.Phase.reuse,

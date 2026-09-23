@@ -11,14 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：`jax/_src/api.py` 是 JAX 面向用户的变换与工具层，负责把内部变换包装成
+# `jax.jit` / `jax.grad` / `jax.vmap` / `jax.jvp` / `jax.jacfwd` / `jax.jacrev` /
+# `jax.hessian` / `jax.linearize` 等公开 API，并处理 Python 容器（pytree）形式的参数与
+# 输出。它同时承担这些 API 的选项校验、缓存与追踪边界管理（`api_boundary` 统一包装
+# 并复现报错），并注册 NaN/Inf 调试钩子；它位于用户层与 `pjit`、`ad`、`batching`、
+# `partial_eval`、`pxla` 等解释器之间，是 JAX 变换语义对外的统一入口。
 
-"""JAX user-facing transformations and utilities.
+"""JAX 面向用户的变换与工具。
 
-The transformations here mostly wrap internal transformations, providing
-convenience flags to control behavior and handling Python containers of
-arguments and outputs. The Python containers handled are pytrees (see
-tree_util.py), which include nested tuples/lists/dicts, where the leaves are
-arrays.
+这里的变换大多是对内部变换的包装，提供便于控制行为的选项，并处理 Python 容器形式的
+参数与输出。所处理的 Python 容器是 pytree（见 tree_util.py），其中包含嵌套的
+tuple/list/dict，其叶子为数组。
 """
 from __future__ import annotations
 
@@ -98,14 +102,14 @@ zip, unsafe_zip = safe_zip, zip
 ShapeDtypeStruct = core.ShapeDtypeStruct
 
 class Inline(enum.Enum):
-  """Enumeration specifying inlining behavior for nested jitted functions.
+  """枚举，用于指定嵌套 jit 函数的内联行为。
 
   Values:
-    JAX_EARLY: Inlined during JAX tracing into enclosing JAXPRs.
-    JAX_LATE: Inlined during during JAX to MLIR lowering.
-    XLA_EARLY: Preserved in MLIR and marked for early inlining by the XLA compiler.
-    XLA_LATE: Preserved in MLIR and marked for late inlining by the XLA compiler.
-    AUTO: Automatic inlining policy determined by JAX and XLA.
+    JAX_EARLY: 在 JAX 追踪期间内联到外层 JAXPR 中。
+    JAX_LATE: 在 JAX 到 MLIR 的降级期间内联。
+    XLA_EARLY: 保留在 MLIR 中，并标记为由 XLA 编译器尽早内联。
+    XLA_LATE: 保留在 MLIR 中，并标记为由 XLA 编译器推迟内联。
+    AUTO: 由 JAX 与 XLA 自动决定的内联策略。
   """
   JAX_EARLY = "jax_early"
   JAX_LATE = "jax_late"
@@ -115,7 +119,7 @@ class Inline(enum.Enum):
 
 @api_boundary
 def _nan_check_posthook(fun, args, kwargs, output):
-  """Hook function called by the C++ jit/pmap to perform NaN checking."""
+  """由 C++ 版 jit/pmap 调用的钩子函数，用于执行 NaN 检查。"""
   buffers = []
   for leaf in tree_leaves(output):
     if hasattr(leaf, "addressable_shards"):
@@ -129,11 +133,11 @@ def _nan_check_posthook(fun, args, kwargs, output):
       f = fun._fun
       if getattr(f, '_apply_primitive', False):
         raise FloatingPointError(f"invalid value ({e.ty}) encountered in {f.__qualname__}") from None
-      # compiled_fun can only raise in this case
+      # 这种情况下只有 compiled_fun 会抛出异常
       api_util.maybe_recursive_nan_check(e, f, args, kwargs)
       raise AssertionError("Unreachable") from e
     else:
-      # TODO(emilyaf): Shouldn't need this fallback.
+      # TODO(emilyaf): 不应该需要这个回退。
       raise
 
 _post_hook_state = config_ext.Config[Callable | None](
@@ -163,7 +167,7 @@ config.debug_infs._add_hooks(_update_debug_special_global,
 float0 = dtypes.float0
 
 class NotSpecified:
-  """Sentinel for use in jax.jit"""
+  """供 jax.jit 使用的哨兵值"""
   def __repr__(self):
     return "<not-specified>"
 
@@ -215,106 +219,78 @@ def jit(
   inline: bool | Inline = False,
   compiler_options: dict[str, Any] | None = None,
 ) -> pjit.JitWrapped | Callable[[Callable], pjit.JitWrapped]:
-  """Sets up ``fun`` for just-in-time compilation with XLA.
+  """为 ``fun`` 设置基于 XLA 的即时编译。
 
   Args:
-    fun: Function to be jitted. ``fun`` should be a pure function.
-      The arguments and return value of ``fun`` should be arrays, scalar, or
-      (nested) standard Python containers (tuple/list/dict) thereof. Positional
-      arguments indicated by ``static_argnums`` can be any hashable type. Static
-      arguments are included as part of a compilation cache key, which is why
-      hash and equality operators must be defined. JAX keeps a weak reference to
-      ``fun`` for use as a compilation cache key, so the object ``fun`` must be
-      weakly-referenceable. Starting in JAX v0.8.1, when ``fun`` is omitted,
-      the return value will be a partially-evaluated function to allow the
-      decorator factory pattern (see Examples below).
-    in_shardings: optional, a :py:class:`Sharding` or pytree with
-      :py:class:`Sharding` leaves and structure that is a tree prefix of the
-      positional arguments tuple to ``fun``. If provided, the positional
-      arguments passed to ``fun`` must have shardings that are compatible with
-      ``in_shardings`` or an error is raised, and the compiled computation has
-      input shardings corresponding to ``in_shardings``. If not provided, the
-      compiled computation's input shardings are inferred from argument
-      shardings.
-    out_shardings: optional, a :py:class:`Sharding` or pytree with
-      :py:class:`Sharding` leaves and structure that is a tree prefix of the
-      output of ``fun``. If provided, it has the same effect as applying
-      :py:func:`jax.lax.with_sharding_constraint` to the output of ``fun``.
-    static_argnums: optional, an int or collection of ints that specify which
-      positional arguments to treat as static (trace- and compile-time
-      constant).
+    fun: 要 jit 的函数。``fun`` 应当是纯函数。
+      ``fun`` 的参数与返回值应当是数组、标量，或它们构成的（嵌套）标准 Python 容器
+      （tuple/list/dict）。由 ``static_argnums`` 指定的位置参数可以是任意可哈希类型。
+      静态参数会作为编译缓存键的一部分，因此必须定义哈希与相等运算符。JAX 会持有
+      ``fun`` 的弱引用以用作编译缓存键，所以对象 ``fun`` 必须是可弱引用的。从 JAX
+      v0.8.1 起，若省略 ``fun``，返回值将是一个部分求值的函数，以支持装饰器工厂
+      写法（见下方 Examples）。
+    in_shardings: 可选，一个 :py:class:`Sharding`，或叶子为 :py:class:`Sharding` 的
+      pytree，其结构是 ``fun`` 位置参数元组的树前缀。若提供，传给 ``fun`` 的位置参数
+      其分片必须与 ``in_shardings`` 兼容，否则会抛出错误，且编译后的计算具有与
+      ``in_shardings`` 对应的输入分片。若不提供，编译后计算的输入分片由参数的分片
+      推断得到。
+    out_shardings: 可选，一个 :py:class:`Sharding`，或叶子为 :py:class:`Sharding` 的
+      pytree，其结构是 ``fun`` 输出的树前缀。若提供，其效果等同于对 ``fun`` 的输出
+      应用 :py:func:`jax.lax.with_sharding_constraint`。
+    static_argnums: 可选，一个 int 或 int 的集合，指定哪些位置参数被视为静态
+      （追踪期与编译期常量）。
 
-      Static arguments should be hashable, meaning both ``__hash__`` and
-      ``__eq__`` are implemented, and immutable. Otherwise, they can be arbitrary
-      Python objects. Calling the jitted function with different values for
-      these constants will trigger recompilation. Arguments that are not
-      array-like or containers thereof must be marked as static.
+      静态参数应当可哈希，即同时实现了 ``__hash__`` 与 ``__eq__``，并且不可变。除此
+      之外，它们可以是任意 Python 对象。用不同的值调用这些常量会使 jit 后的函数重新
+      编译。不属于类数组对象或其容器的参数必须标记为静态。
 
-      If neither ``static_argnums`` nor ``static_argnames`` is provided, no
-      arguments are treated as static. If ``static_argnums`` is not provided but
-      ``static_argnames`` is, or vice versa, JAX uses
-      :code:`inspect.signature(fun)` to find any positional arguments that
-      correspond to ``static_argnames``
-      (or vice versa). If both ``static_argnums`` and ``static_argnames`` are
-      provided, ``inspect.signature`` is not used, and only actual
-      parameters listed in either ``static_argnums`` or ``static_argnames`` will
-      be treated as static.
-    static_argnames: optional, a string or collection of strings specifying
-      which named arguments to treat as static (compile-time constant). See the
-      comment on ``static_argnums`` for details. If not
-      provided but ``static_argnums`` is set, the default is based on calling
-      ``inspect.signature(fun)`` to find corresponding named arguments.
-    donate_argnums: optional, collection of integers to specify which positional
-      argument buffers can be overwritten by the computation and marked deleted
-      in the caller. It is safe to donate argument buffers if you no longer need
-      them once the computation has started. In some cases XLA can make use of
-      donated buffers to reduce the amount of memory needed to perform a
-      computation, for example recycling one of your input buffers to store a
-      result. You should not reuse buffers that you donate to a computation; JAX
-      will raise an error if you try to. By default, no argument buffers are
-      donated.
+      若 ``static_argnums`` 与 ``static_argnames`` 都未提供，则没有参数被视为静态。
+      若未提供 ``static_argnums`` 但提供了 ``static_argnames``，或反之，JAX 会用
+      :code:`inspect.signature(fun)` 找出与 ``static_argnames`` 对应的位置参数
+      （或反之）。若 ``static_argnums`` 与 ``static_argnames`` 都提供，则不会使用
+      ``inspect.signature``，只有 ``static_argnums`` 或 ``static_argnames`` 中实际
+      列出的参数才会被视为静态。
+    static_argnames: 可选，一个字符串或字符串的集合，指定哪些具名参数被视为静态
+      （编译期常量）。详见 ``static_argnums`` 的说明。若未提供但设置了
+      ``static_argnums``，则默认通过调用 ``inspect.signature(fun)`` 找出对应的具名
+      参数。
+    donate_argnums: 可选，int 的集合，指定哪些位置参数的缓冲区可被计算覆写并在调用方
+      标记为已删除。若计算开始后你不再需要这些参数缓冲区，那么捐赠它们是安全的。
+      在某些情况下，XLA 可以利用捐赠的缓冲区来减少执行计算所需的内存量，例如回收
+      某个输入缓冲区来存放结果。你不应再使用已捐赠给计算的缓冲区；若这样做 JAX 会
+      抛出错误。默认不捐赠任何参数缓冲区。
 
-      If neither ``donate_argnums`` nor ``donate_argnames`` is provided, no
-      arguments are donated. If ``donate_argnums`` is not provided but
-      ``donate_argnames`` is, or vice versa, JAX uses
-      :code:`inspect.signature(fun)` to find any positional arguments that
-      correspond to ``donate_argnames``
-      (or vice versa). If both ``donate_argnums`` and ``donate_argnames`` are
-      provided, ``inspect.signature`` is not used, and only actual
-      parameters listed in either ``donate_argnums`` or ``donate_argnames`` will
-      be donated.
+      若 ``donate_argnums`` 与 ``donate_argnames`` 都未提供，则不捐赠任何参数。
+      若未提供 ``donate_argnums`` 但提供了 ``donate_argnames``，或反之，JAX 会用
+      :code:`inspect.signature(fun)` 找出与 ``donate_argnames`` 对应的位置参数
+      （或反之）。若 ``donate_argnums`` 与 ``donate_argnames`` 都提供，则不会使用
+      ``inspect.signature``，只有 ``donate_argnums`` 或 ``donate_argnames`` 中实际
+      列出的参数才会被捐赠。
 
-      For more details on buffer donation see the
-      `FAQ <https://docs.jax.dev/en/latest/faq.html#buffer-donation>`_.
-    donate_argnames: optional, a string or collection of strings specifying
-      which named arguments are donated to the computation. See the
-      comment on ``donate_argnums`` for details. If not
-      provided but ``donate_argnums`` is set, the default is based on calling
-      ``inspect.signature(fun)`` to find corresponding named arguments.
-    keep_unused: optional boolean. If `False` (the default), arguments that JAX
-      determines to be unused by `fun` *may* be dropped from resulting compiled
-      XLA executables. Such arguments will not be transferred to the device nor
-      provided to the underlying executable. If `True`, unused arguments will
-      not be pruned.
-    device: This is an experimental feature and the API is likely to change.
-      Optional, the Device the jitted function will run on. (Available devices
-      can be retrieved via :py:func:`jax.devices`.) The default is inherited
-      from XLA's DeviceAssignment logic and is usually to use
-      ``jax.devices()[0]``.
-    backend: This is an experimental feature and the API is likely to change.
-      Optional, a string representing the XLA backend: ``'cpu'``, ``'gpu'``, or
-      ``'tpu'``.
-    inline: Optional boolean or :class:`jax.Inline` instance specifying
-      the inlining policy for nested jitted functions. Can be passed as a boolean
-      (``True`` for ``jax.Inline.JAX_EARLY``, ``False`` for ``jax.Inline.AUTO``)
-      or a :class:`jax.Inline` enum member. Default ``False`` (``jax.Inline.AUTO``).
+      关于缓冲区捐赠的更多细节见
+      `FAQ <https://docs.jax.dev/en/latest/faq.html#buffer-donation>`_。
+    donate_argnames: 可选，一个字符串或字符串的集合，指定哪些具名参数被捐赠给计算。
+      详见 ``donate_argnums`` 的说明。若未提供但设置了 ``donate_argnums``，则默认通过
+      调用 ``inspect.signature(fun)`` 找出对应的具名参数。
+    keep_unused: 可选布尔值。若为 `False`（默认值），JAX 判定为 `fun` 未使用的参数
+      *可能* 会从生成的编译后 XLA 可执行文件中被丢弃。这类参数既不会被传输到设备，
+      也不会提供给底层可执行文件。若为 `True`，未使用的参数不会被剪除。
+    device: 这是实验性特性，API 很可能会变化。
+      可选，jit 后函数将在其上运行的设备。（可用设备可通过 :py:func:`jax.devices`
+      获取。）默认值继承自 XLA 的 DeviceAssignment 逻辑，通常等价于使用
+      ``jax.devices()[0]``。
+    backend: 这是实验性特性，API 很可能会变化。
+      可选，表示 XLA 后端的字符串：``cpu``、``gpu`` 或 ``tpu``。
+    inline: 可选，布尔值或 :class:`jax.Inline` 实例，指定嵌套 jit 函数的内联策略。
+      可传布尔值（``True`` 表示 ``jax.Inline.JAX_EARLY``，``False`` 表示
+      ``jax.Inline.AUTO``），也可传 :class:`jax.Inline` 枚举成员。默认为 ``False``
+      （即 ``jax.Inline.AUTO``）。
 
   Returns:
-    A wrapped version of ``fun``, set up for just-in-time compilation.
+    经过包装的 ``fun`` 版本，已设置好即时编译。
 
   Examples:
-    In the following example, ``selu`` can be compiled into a single fused kernel
-    by XLA:
+    在下面的例子中，``selu`` 可被 XLA 编译成一个融合 kernel：
 
     >>> import jax
     >>>
@@ -328,8 +304,7 @@ def jit(
     [-0.54485  0.27744 -0.29255 -0.91421 -0.62452 -0.24748
     -0.85743 -0.78232  0.76827  0.59566 ]
 
-    Starting in JAX v0.8.1, :func:`jit` supports the decorator factory pattern
-    for specifying optional keywords:
+    从 JAX v0.8.1 起，:func:`jit` 支持用装饰器工厂写法来指定可选关键字参数：
 
     >>> @jax.jit(static_argnames=['n'])
     ... def g(x, n):
@@ -340,8 +315,7 @@ def jit(
     >>> g(jnp.arange(4), 3)
     Array([   0,    1,  256, 6561], dtype=int32)
 
-    For compatiblity with older JAX versions, a common pattern is to use
-    :func:`functools.partial`:
+    为兼容较旧的 JAX 版本，一种常见写法是使用 :func:`functools.partial`：
 
     >>> from functools import partial
     >>>
@@ -366,31 +340,26 @@ def jit(
     return pjit.make_jit(fun, **kwds)
 
 if not TYPE_CHECKING:
-  # TODO(slebedev): This ought to be a decorator, but it seems it makes
-  # pytype ignore the overloads
+  # TODO(slebedev): 这里本应当是一个装饰器，但那样似乎会让
+  # pytype 忽略这些重载
   jit = api_boundary(jit, repro_api_name="jax.jit")
 
 
 @contextmanager
 def disable_jit(disable: bool = True):
-  """Context manager that disables :py:func:`jit` behavior under its dynamic context.
+  """上下文管理器，在其动态上下文中禁用 :py:func:`jit` 行为。
 
-  For debugging, it is useful to have a mechanism that disables :py:func:`jit`
-  everywhere in a dynamic context. Note that this not only disables explicit
-  uses of :func:`jit` by the user, but will also remove any implicit JIT compilation
-  used by the JAX library: this includes implicit JIT computation of `body` and
-  `cond` functions passed to higher-level primitives like :func:`~jax.lax.scan` and
-  :func:`~jax.lax.while_loop`, JIT used in implementations of :mod:`jax.numpy` functions,
-  and any other case where :func:`jit` is used within an API's implementation.
-  Note however that even under `disable_jit`, individual primitive operations
-  will still be compiled by XLA as in normal eager op-by-op execution.
+  调试时，有一个能在动态上下文中到处禁用 :py:func:`jit` 的机制很有用。注意这不仅会禁用
+  用户对 :func:`jit` 的显式使用，还会移除 JAX 库使用的任何隐式 JIT 编译：这包括
+  传给 :func:`~jax.lax.scan` 与 :func:`~jax.lax.while_loop` 等高阶原语的 `body` 与
+  `cond` 函数的隐式 JIT 计算、:mod:`jax.numpy` 函数实现中使用的 JIT，以及任何在 API
+  实现内部使用 :func:`jit` 的情形。但请注意，即使在 `disable_jit` 下，单个原语运算
+  仍会像普通的逐运算即时执行那样由 XLA 编译。
 
-  Values that have a data dependence on the arguments to a jitted function are
-  traced and abstracted. For example, an abstract value may be a
-  :py:class:`ShapedArray` instance, representing the set of all possible arrays
-  with a given shape and dtype, but not representing one concrete array with
-  specific values. You might notice those if you use a benign side-effecting
-  operation in a jitted function, like a print:
+  与 jit 函数的参数存在数据依赖的值会被追踪并抽象化。例如，抽象值可以是
+  :py:class:`ShapedArray` 实例，它表示所有具有给定形状与数据类型的可能数组的集合，
+  而不表示某个具有具体值的具体数组。如果你在 jit 函数中使用良性的带副作用操作
+  （例如打印），就可能见到这类抽象值：
 
   >>> import jax
   >>>
@@ -404,11 +373,9 @@ def disable_jit(disable: bool = True):
   Value of y is JitTracer(int32[3])
   [5 7 9]
 
-  Here ``y`` has been abstracted by :py:func:`jit` to a :py:class:`ShapedArray`,
-  which represents an array with a fixed shape and type but an arbitrary value.
-  The value of ``y`` is also traced. If we want to see a concrete value while
-  debugging, and avoid the tracer too, we can use the :py:func:`disable_jit`
-  context manager:
+  这里 ``y`` 已被 :py:func:`jit` 抽象为 :py:class:`ShapedArray`，它表示一个形状与类型
+  固定但取值任意的数组。``y`` 的取值同样被追踪。如果我们想在调试时看到具体值并同时
+  避开追踪器，可以使用 :py:func:`disable_jit` 上下文管理器：
 
   >>> import jax
   >>>
@@ -427,35 +394,28 @@ def grad(fun: Callable, argnums: int | Sequence[int] = 0,
          has_aux: bool = False, holomorphic: bool = False,
          allow_int: bool = False,
          reduce_axes: Sequence[AxisName] = ()) -> Callable:
-  """Creates a function that evaluates the gradient of ``fun``.
+  """创建一个求 ``fun`` 梯度的函数。
 
   Args:
-    fun: Function to be differentiated. Its arguments at positions specified by
-      ``argnums`` should be arrays, scalars, or standard Python containers.
-      Argument arrays in the positions specified by ``argnums`` must be of
-      inexact (i.e., floating-point or complex) type. It
-      should return a scalar (which includes arrays with shape ``()`` but not
-      arrays with shape ``(1,)`` etc.)
-    argnums: Optional, integer or sequence of integers. Specifies which
-      positional argument(s) to differentiate with respect to (default 0).
-    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the
-      first element is considered the output of the mathematical function to be
-      differentiated and the second element is auxiliary data. Default False.
-    holomorphic: Optional, bool. Indicates whether ``fun`` is promised to be
-      holomorphic. If True, inputs and outputs must be complex. Default False.
-    allow_int: Optional, bool. Whether to allow differentiating with
-      respect to integer valued inputs. The gradient of an integer input will
-      have a trivial vector-space dtype (float0). Default False.
+    fun: 要被微分的函数。由 ``argnums`` 指定位置上的参数应当是数组、标量，或标准
+      Python 容器。由 ``argnums`` 指定位置上的参数数组必须是非精确（即浮点或复数）
+      类型。它应当返回标量（包括形状为 ``()`` 的数组，但不包括形状为 ``(1,)`` 等
+      的数组）。
+    argnums: 可选，int 或 int 序列。指定对哪些位置参数求导（默认 0）。
+    has_aux: 可选，bool。表示 ``fun`` 是否返回一个二元组，其第一个元素被视为要微分
+      的数学函数的输出，第二个元素是辅助数据。默认 False。
+    holomorphic: 可选，bool。表示 ``fun`` 是否被保证为全纯。若为 True，输入与输出
+      必须是复数。默认 False。
+    allow_int: 可选，bool。是否允许对整数值的输入求导。整数输入的梯度将具有平凡的
+      向量空间数据类型（float0）。默认 False。
 
   Returns:
-    A function with the same arguments as ``fun``, that evaluates the gradient
-    of ``fun``. If ``argnums`` is an integer then the gradient has the same
-    shape and type as the positional argument indicated by that integer. If
-    argnums is a tuple of integers, the gradient is a tuple of values with the
-    same shapes and types as the corresponding arguments. If ``has_aux`` is True
-    then a pair of (gradient, auxiliary_data) is returned.
+    一个与 ``fun`` 参数相同的函数，用于求 ``fun`` 的梯度。若 ``argnums`` 是整数，
+    梯度与该整数所指定位置参数的形状与类型相同。若 argnums 是整数元组，梯度是一个
+    值的元组，其形状与类型与对应的参数相同。若 ``has_aux`` 为 True，则返回
+    （梯度, 辅助数据）二元组。
 
-  For example:
+  例如：
 
   >>> import jax
   >>>
@@ -495,32 +455,25 @@ def value_and_grad(fun: Callable, argnums: int | Sequence[int] = 0,
                    has_aux: bool = False, holomorphic: bool = False,
                    allow_int: bool = False, reduce_axes: Sequence[AxisName] = ()
   ) -> Callable[..., tuple[Any, Any]]:
-  """Create a function that evaluates both ``fun`` and the gradient of ``fun``.
+  """创建一个同时求 ``fun`` 及其梯度的函数。
 
   Args:
-    fun: Function to be differentiated. Its arguments at positions specified by
-      ``argnums`` should be arrays, scalars, or standard Python containers. It
-      should return a scalar (which includes arrays with shape ``()`` but not
-      arrays with shape ``(1,)`` etc.)
-    argnums: Optional, integer or sequence of integers. Specifies which
-      positional argument(s) to differentiate with respect to (default 0).
-    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the
-      first element is considered the output of the mathematical function to be
-      differentiated and the second element is auxiliary data. Default False.
-    holomorphic: Optional, bool. Indicates whether ``fun`` is promised to be
-      holomorphic. If True, inputs and outputs must be complex. Default False.
-    allow_int: Optional, bool. Whether to allow differentiating with
-      respect to integer valued inputs. The gradient of an integer input will
-      have a trivial vector-space dtype (float0). Default False.
+    fun: 要被微分的函数。由 ``argnums`` 指定位置上的参数应当是数组、标量，或标准
+      Python 容器。它应当返回标量（包括形状为 ``()`` 的数组，但不包括形状为 ``(1,)``
+      等的数组）。
+    argnums: 可选，int 或 int 序列。指定对哪些位置参数求导（默认 0）。
+    has_aux: 可选，bool。表示 ``fun`` 是否返回一个二元组，其第一个元素被视为要微分
+      的数学函数的输出，第二个元素是辅助数据。默认 False。
+    holomorphic: 可选，bool。表示 ``fun`` 是否被保证为全纯。若为 True，输入与输出
+      必须是复数。默认 False。
+    allow_int: 可选，bool。是否允许对整数值的输入求导。整数输入的梯度将具有平凡的
+      向量空间数据类型（float0）。默认 False。
 
   Returns:
-    A function with the same arguments as ``fun`` that evaluates both ``fun``
-    and the gradient of ``fun`` and returns them as a pair (a two-element
-    tuple). If ``argnums`` is an integer then the gradient has the same shape
-    and type as the positional argument indicated by that integer. If argnums is
-    a sequence of integers, the gradient is a tuple of values with the same
-    shapes and types as the corresponding arguments. If ``has_aux`` is True
-    then a tuple of ((value, auxiliary_data), gradient) is returned.
+    一个与 ``fun`` 参数相同的函数，它同时求 ``fun`` 与 ``fun`` 的梯度并以二元组
+    （两元素元组）返回。若 ``argnums`` 是整数，梯度与该整数所指定位置参数的形状与
+    类型相同。若 argnums 是整数序列，梯度是一个值的元组，其形状与类型与对应的参数
+    相同。若 ``has_aux`` 为 True，则返回 ((值, 辅助数据), 梯度) 元组。
   """
   from jax._src.lax import lax as lax_internal  # pyrefly: ignore[missing-import]
 
@@ -635,12 +588,10 @@ def fwd_and_bwd(
     fun: Callable, argnums: int | Sequence[int], has_aux: bool = False,
     jitted: bool = True,
 ) -> tuple[Callable, Callable]:
-  """Creates functions ``fwd`` and ``bwd`` corresponding to the forward and
-  backward pass of a given function ``fun``. The forward function ``fwd(*args)``
-  functionally behaves much like ``y, fun_vjp = jax.vjp(fun, *args)``, but allows
-  reuse of the backward function ``bwd`` across multiple iterations, which is
-  useful to avoid recompilation when the forward and backward do not end up in a
-  single jitted function:
+  """创建与给定函数 ``fun`` 的前向和反向传播相对应的函数 ``fwd`` 与 ``bwd``。前向函数
+  ``fwd(*args)`` 在功能上很像 ``y, fun_vjp = jax.vjp(fun, *args)``，但允许在多次迭代
+  中复用反向函数 ``bwd``，这在前向与反向最终没有落在同一个 jit 函数中时有助于避免
+  重新编译：
 
   >>> import jax
   >>>
@@ -662,29 +613,24 @@ def fwd_and_bwd(
   ...
 
   Args:
-    fun: Function to produce a forward and backward of.
-    argnums: Integer or sequence of integers. Specifies which positional argument(s)
-      to differentiate with respect to.
-    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the
-     first element is considered the output of the mathematical function to be
-     differentiated and the second element is auxiliary data. Default False.
-    jitted: Optional, bool. Indicates whether to return the ``jax.jit`` of
-      forward and backward. Note that jit-ing only the backward but not the
-      forward will result in the backward recompiling on every invocation, so we
-      default to jit-ing both.
+    fun: 要生成其前向与反向的函数。
+    argnums: 整数或整数序列。指定对哪些位置参数求导。
+    has_aux: 可选，bool。表示 ``fun`` 是否返回一个二元组，其第一个元素被视为要微分
+     的数学函数的输出，第二个元素是辅助数据。默认 False。
+    jitted: 可选，bool。表示是否返回前向与反向的 ``jax.jit``。注意只对反向而不对前向
+      做 jit 会导致反向在每次调用时重新编译，因此我们默认对两者都做 jit。
 
   Returns:
-    The two functions, ``fwd`` and ``bwd``.
+    两个函数，``fwd`` 与 ``bwd``。
 
-    If ``has_aux`` is ``False``, ``fwd(*primals)`` returns a tuple
-    ``(primals_out, residuals)``, where ``primals_out`` is ``fun(*primals)``.
-    If ``has_aux`` is ``True``, returns a ``(primals_out, residuals, aux)`` tuple
-    where ``aux`` is the auxiliary data returned by ``fun``.
+    若 ``has_aux`` 为 ``False``，``fwd(*primals)`` 返回元组
+    ``(primals_out, residuals)``，其中 ``primals_out`` 即 ``fun(*primals)``。
+    若 ``has_aux`` 为 ``True``，则返回 ``(primals_out, residuals, aux)`` 元组，
+    其中 ``aux`` 是 ``fun`` 返回的辅助数据。
 
-    ``bwd`` is a function from ``residuals`` and a cotangent vector with the same
-    shape as ``primals_out`` to a tuple of cotangent vectors with the same number
-    and shapes as the ``primals`` designated by ``argnums``, representing the
-    vector-Jacobian product of ``fun`` evaluated at ``primals``.
+    ``bwd`` 是一个函数，它接收 ``residuals`` 以及与 ``primals_out`` 形状相同的余切
+    向量，返回一个余切向量元组，其个数与形状与 ``argnums`` 指定的 ``primals`` 相同，
+    表示 ``fun`` 在 ``primals`` 处求值的向量-雅可比乘积。
   """
   check_callable(fun)
   argnums = _ensure_index(argnums)
@@ -705,22 +651,22 @@ def fwd_and_bwd(
 @partial(api_boundary, repro_api_name="jax.jacfwd")
 def jacfwd(fun: Callable, argnums: int | Sequence[int] = 0,
            has_aux: bool = False, holomorphic: bool = False) -> Callable:
-  """Jacobian of ``fun`` evaluated column-by-column using forward-mode AD.
+  """使用前向模式 AD 逐列求值的 ``fun`` 的 Jacobian（雅可比矩阵）。
 
   Args:
-    fun: Function whose Jacobian is to be computed.
-    argnums: Optional, integer or sequence of integers. Specifies which
-      positional argument(s) to differentiate with respect to (default ``0``).
-    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the
-      first element is considered the output of the mathematical function to be
-      differentiated and the second element is auxiliary data. Default False.
-    holomorphic: Optional, bool. Indicates whether ``fun`` is promised to be
-      holomorphic. Default False.
+    fun: 需要计算其 Jacobian 的函数。
+    argnums: 可选，整数或整数序列。
+      指定对哪些位置参数求导（默认为 ``0``）。
+    has_aux: 可选，bool。指示 ``fun`` 是否返回一个二元组，
+      其中第一个元素被视为待求导的数学函数的输出，
+      第二个元素是辅助数据。默认为 False。
+    holomorphic: 可选，bool。
+      指示 ``fun`` 是否保证为全纯。默认为 False。
 
   Returns:
-    A function with the same arguments as ``fun``, that evaluates the Jacobian of
-    ``fun`` using forward-mode automatic differentiation. If ``has_aux`` is True
-    then a pair of (jacobian, auxiliary_data) is returned.
+    一个与 ``fun`` 具有相同参数的函数，它使用前向模式自动微分计算
+    ``fun`` 的 Jacobian。如果 ``has_aux`` 为 True，
+    则返回 (jacobian, auxiliary_data) 二元组。
 
   >>> import jax
   >>> import jax.numpy as jnp
@@ -791,25 +737,25 @@ def _check_output_dtype_jacfwd(holomorphic, x):
 def jacrev(fun: Callable, argnums: int | Sequence[int] = 0,
            has_aux: bool = False, holomorphic: bool = False,
            allow_int: bool = False) -> Callable:
-  """Jacobian of ``fun`` evaluated row-by-row using reverse-mode AD.
+  """使用反向模式 AD 逐行求值的 ``fun`` 的 Jacobian（雅可比矩阵）。
 
   Args:
-    fun: Function whose Jacobian is to be computed.
-    argnums: Optional, integer or sequence of integers. Specifies which
-      positional argument(s) to differentiate with respect to (default ``0``).
-    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the
-      first element is considered the output of the mathematical function to be
-      differentiated and the second element is auxiliary data. Default False.
-    holomorphic: Optional, bool. Indicates whether ``fun`` is promised to be
-      holomorphic. Default False.
-    allow_int: Optional, bool. Whether to allow differentiating with
-      respect to integer valued inputs. The gradient of an integer input will
-      have a trivial vector-space dtype (float0). Default False.
+    fun: 需要计算其 Jacobian 的函数。
+    argnums: 可选，整数或整数序列。
+      指定对哪些位置参数求导（默认为 ``0``）。
+    has_aux: 可选，bool。指示 ``fun`` 是否返回一个二元组，
+      其中第一个元素被视为待求导的数学函数的输出，
+      第二个元素是辅助数据。默认为 False。
+    holomorphic: 可选，bool。
+      指示 ``fun`` 是否保证为全纯。默认为 False。
+    allow_int: 可选，bool。是否允许对整数值输入求导。
+      整数输入的梯度具有平凡的向量空间数据类型
+      （float0）。默认为 False。
 
   Returns:
-    A function with the same arguments as ``fun``, that evaluates the Jacobian of
-    ``fun`` using reverse-mode automatic differentiation. If ``has_aux`` is True
-    then a pair of (jacobian, auxiliary_data) is returned.
+    一个与 ``fun`` 具有相同参数的函数，它使用反向模式自动微分计算
+    ``fun`` 的 Jacobian。如果 ``has_aux`` 为 True，
+    则返回 (jacobian, auxiliary_data) 二元组。
 
   >>> import jax
   >>> import jax.numpy as jnp
@@ -849,7 +795,7 @@ def jacrev(fun: Callable, argnums: int | Sequence[int] = 0,
 
 def jacobian(fun: Callable, argnums: int | Sequence[int] = 0,
              has_aux: bool = False, holomorphic: bool = False, allow_int: bool = False) -> Callable:
-  """Alias of :func:`jax.jacrev`."""
+  """是 :func:`jax.jacrev` 的别名。"""
   return jacrev(fun, argnums=argnums, has_aux=has_aux, holomorphic=holomorphic, allow_int=allow_int)
 
 
@@ -860,24 +806,24 @@ _check_output_dtype_jacrev = partial(_check_output_dtype_revderiv, "jacrev")
 @partial(api_boundary, repro_api_name="jax.hessian")
 def hessian(fun: Callable, argnums: int | Sequence[int] = 0,
             has_aux: bool = False, holomorphic: bool = False) -> Callable:
-  """Hessian of ``fun`` as a dense array.
+  """以稠密数组形式给出的 ``fun`` 的 Hessian（黑塞矩阵）。
 
   Args:
-    fun: Function whose Hessian is to be computed.  Its arguments at positions
-      specified by ``argnums`` should be arrays, scalars, or standard Python
-      containers thereof. It should return arrays, scalars, or standard Python
-      containers thereof.
-    argnums: Optional, integer or sequence of integers. Specifies which
-      positional argument(s) to differentiate with respect to (default ``0``).
-    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the
-      first element is considered the output of the mathematical function to be
-      differentiated and the second element is auxiliary data. Default False.
-    holomorphic: Optional, bool. Indicates whether ``fun`` is promised to be
-      holomorphic. Default False.
+    fun: 需要计算其 Hessian 的函数。其位于 ``argnums``
+      指定位置的参数应为数组、标量，或由它们构成的标准 Python 容器。
+      它应返回数组、标量，或由它们构成的标准 Python 容器。
+    argnums: 可选，整数或整数序列。
+      指定对哪些位置参数求导（默认为 ``0``）。
+    has_aux: 可选，bool。
+      指示 ``fun`` 是否返回一个二元组，
+      其中第一个元素被视为待求导的数学函数的输出，
+      第二个元素是辅助数据。默认为 False。
+    holomorphic: 可选，bool。
+      指示 ``fun`` 是否保证为全纯。默认为 False。
 
   Returns:
-    A function with the same arguments as ``fun``, that evaluates the Hessian of
-    ``fun``.
+    一个与 ``fun`` 具有相同参数的函数，
+    它计算 ``fun`` 的 Hessian。
 
   >>> import jax
   >>>
@@ -886,12 +832,12 @@ def hessian(fun: Callable, argnums: int | Sequence[int] = 0,
   [[   6.   -2.]
    [  -2. -480.]]
 
-  :py:func:`hessian` is a generalization of the usual definition of the Hessian
-  that supports nested Python containers (i.e. pytrees) as inputs and outputs.
-  The tree structure of ``jax.hessian(fun)(x)`` is given by forming a tree
-  product of the structure of ``fun(x)`` with a tree product of two copies of
-  the structure of ``x``. A tree product of two tree structures is formed by
-  replacing each leaf of the first tree with a copy of the second. For example:
+  :py:func:`hessian` 是通常 Hessian 定义的一种推广，
+  它支持以嵌套 Python 容器（即 pytree）作为输入和输出。
+  ``jax.hessian(fun)(x)`` 的树结构由 ``fun(x)``
+  的结构与 ``x`` 的结构的两份副本的树乘积构成。
+  两个树结构的树乘积的构成方式是：
+  把第一个树的每个叶子替换为第二个树的一份副本。例如：
 
   >>> import jax.numpy as jnp
   >>> f = lambda dct: {"c": jnp.power(dct["a"], dct["b"])}
@@ -905,22 +851,22 @@ def hessian(fun: Callable, argnums: int | Sequence[int] = 0,
                'b': Array([[[0.      , 0.      ], [0.      , 0.      ]],
                            [[0.      , 0.      ], [0.      , 3.843624]]], dtype=float32)}}}
 
-  Thus each leaf in the tree structure of ``jax.hessian(fun)(x)`` corresponds to
-  a leaf of ``fun(x)`` and a pair of leaves of ``x``. For each leaf in
-  ``jax.hessian(fun)(x)``, if the corresponding array leaf of ``fun(x)`` has
-  shape ``(out_1, out_2, ...)`` and the corresponding array leaves of ``x`` have
-  shape ``(in_1_1, in_1_2, ...)`` and ``(in_2_1, in_2_2, ...)`` respectively,
-  then the Hessian leaf has shape ``(out_1, out_2, ..., in_1_1, in_1_2, ...,
-  in_2_1, in_2_2, ...)``. In other words, the Python tree structure represents
-  the block structure of the Hessian, with blocks determined by the input and
-  output pytrees.
+  因此，``jax.hessian(fun)(x)`` 树结构中的每个叶子对应于
+  ``fun(x)`` 的一个叶子与 ``x`` 的一对叶子。
+  对于 ``jax.hessian(fun)(x)`` 中的每个叶子，如果 ``fun(x)``
+  中对应的数组叶子形状为 ``(out_1, out_2, ...)``，而 ``x``
+  中对应的数组叶子形状分别为 ``(in_1_1, in_1_2, ...)`` 和
+  ``(in_2_1, in_2_2, ...)``，那么该 Hessian 叶子的形状为
+  ``(out_1, out_2, ..., in_1_1, in_1_2, ..., in_2_1, in_2_2, ...)``。
+  换句话说，Python 树结构表示 Hessian 的分块结构，
+  其中分块由输入和输出 pytree 决定。
 
-  In particular, an array is produced (with no pytrees involved) when the
-  function input ``x`` and output ``fun(x)`` are each a single array, as in the
-  ``g`` example above. If ``fun(x)`` has shape ``(out1, out2, ...)`` and ``x``
-  has shape ``(in1, in2, ...)`` then ``jax.hessian(fun)(x)`` has shape
-  ``(out1, out2, ..., in1, in2, ..., in1, in2, ...)``. To flatten pytrees into
-  1D vectors, consider using :py:func:`jax.flatten_util.flatten_pytree`.
+  特别地，当函数输入 ``x`` 和输出 ``fun(x)`` 各为单个数组时
+  （不涉及任何 pytree），得到的就是一个数组，如上面的 ``g`` 例子所示。
+  如果 ``fun(x)`` 的形状为 ``(out1, out2, ...)``，``x`` 的形状为
+  ``(in1, in2, ...)``，那么 ``jax.hessian(fun)(x)`` 的形状为
+  ``(out1, out2, ..., in1, in2, ..., in1, in2, ...)``。要把 pytree
+  展平为一维向量，可以考虑使用 :py:func:`jax.flatten_util.flatten_pytree`。
   """
   return jacfwd(jacrev(fun, argnums, has_aux=has_aux, holomorphic=holomorphic),
                 argnums, has_aux=has_aux, holomorphic=holomorphic)
@@ -972,14 +918,14 @@ def _possible_downcast(x, example, spec):
       x, dtype, weak_type, sharding=sharding)
 
 def _unravel_array_into_pytree(pytree, axis, example, arr, specs):
-  """Unravel an array into a PyTree with a given structure.
+  """把数组拆解（unravel）为具有给定结构的 PyTree。
   Args:
-      pytree: The pytree that provides the structure.
-      axis: The parameter axis is either -1, 0, or 1.  It controls the
-        resulting shapes.
-      example: If specified, cast the components to the matching dtype/weak_type,
-        or else use the pytree leaf type if example is None.
-      arr: The array to be unraveled.
+      pytree: 提供结构的 pytree。
+      axis: 参数 axis 取值为 -1、
+        0 或 1。它控制结果的形状。
+      example: 如果指定，则把各分量转换为匹配的 dtype/weak_type，
+        否则在 example 为 None 时使用 pytree 叶子的类型。
+      arr: 待拆解的数组。
   """
   leaves, treedef = tree_flatten(pytree)
   specs, _ = tree_flatten(specs)
@@ -1009,60 +955,60 @@ def vmap[F: Callable](
     spmd_axis_name: AxisName | tuple[AxisName, ...] | None = None,
     sum_match: bool = False
     ) -> F:
-  """Vectorizing map. Creates a function which maps ``fun`` over argument axes.
+  """向量化映射。创建一个把 ``fun`` 映射到参数轴上的函数。
 
   Args:
-    fun: Function to be mapped over additional axes.
-    in_axes: An integer, None, or sequence of values specifying which input
-      array axes to map over.
+    fun: 要在额外轴上映射的函数。
+    in_axes: 一个整数、None，或值的序列，
+      指定要映射哪些输入数组轴。
 
-      If each positional argument to ``fun`` is an array, then ``in_axes`` can
-      be an integer, a None, or a tuple of integers and Nones with length equal
-      to the number of positional arguments to ``fun``. An integer or ``None``
-      indicates which array axis to map over for all arguments (with ``None``
-      indicating not to map any axis), and a tuple indicates which axis to map
-      for each corresponding positional argument. Axis integers must be in the
-      range ``[-ndim, ndim)`` for each array, where ``ndim`` is the number of
-      dimensions (axes) of the corresponding input array.
+      如果 ``fun`` 的每个位置参数都是数组，
+      那么 ``in_axes`` 可以是整数、None，或由整数和 None
+      组成的元组，其长度等于 ``fun`` 的位置参数个数。
+      整数或 ``None`` 表示为所有参数映射哪个数组轴
+      （``None`` 表示不映射任何轴），
+      而元组表示为每个对应的位置参数映射哪个轴。
+      轴整数必须在每个数组的 ``[-ndim, ndim)``
+      范围内，其中 ``ndim`` 是相应输入数组的维度（轴）数。
 
-      If the positional arguments to ``fun`` are container (pytree) types, ``in_axes``
-      must be a sequence with length equal to the number of positional arguments to
-      ``fun``, and for each argument the corresponding element of ``in_axes`` can
-      be a container with a matching pytree structure specifying the mapping of its
-      container elements. In other words, ``in_axes`` must be a container tree prefix
-      of the positional argument tuple passed to ``fun``. See this link for more detail:
+      如果 ``fun`` 的位置参数是容器（pytree）类型，
+      ``in_axes`` 必须是长度等于 ``fun`` 位置参数个数的序列，
+      并且对每个参数，``in_axes`` 中对应的元素可以是具有匹配
+      pytree 结构的容器，用来指定其容器元素的映射方式。
+      换句话说，``in_axes`` 必须是由传给 ``fun``
+      的位置参数元组构成的容器树前缀。更多细节见以下链接：
       https://docs.jax.dev/en/latest/pytrees.html#applying-optional-parameters-to-pytrees
 
-      Either ``axis_size`` must be provided explicitly, or at least one
-      positional argument must have ``in_axes`` not None. The sizes of the
-      mapped input axes for all mapped positional arguments must all be equal.
+      必须显式提供 ``axis_size``，
+      或者至少有一个位置参数的 ``in_axes`` 不为 None。
+      所有被映射的位置参数，其映射输入轴的大小必须全部相等。
 
-      Arguments passed as keywords are always mapped over their leading axis
-      (i.e. axis index 0).
+      以关键字形式传入的参数总是沿其首轴
+      （即轴索引 0）映射。
 
-      See below for examples.
+      示例见下文。
 
-    out_axes: An integer, None, or (nested) standard Python container
-      (tuple/list/dict) thereof indicating where the mapped axis should appear
-      in the output. All outputs with a mapped axis must have a non-None
-      ``out_axes`` specification (but see ``sum_match`` below). Axis integers
-      must be in the range ``[-ndim, ndim)`` for each output array, where
-      ``ndim`` is the number of dimensions (axes) of the array returned by the
-      :func:`vmap`-ed function, which is one more than the number of dimensions
-      (axes) of the corresponding array returned by ``fun``.
-    axis_name: Optional, a hashable Python object used to identify the mapped
-      axis so that parallel collectives can be applied.
-    axis_size: Optional, an integer indicating the size of the axis to be
-      mapped. If not provided, the mapped axis size is inferred from arguments.
-    sum_match: Optional, a boolean (default ``False``) changing how outputs
-      with an ``out_axes`` specification of ``None`` are handled. By default,
-      it is an error if such an output varies along the mapped axis. With
-      ``sum_match=True``, such outputs are instead summed over the mapped
-      axis; outputs that do not vary along the mapped axis are returned
-      unchanged, as usual. This is useful in automatic differentiation
-      contexts, because summing over a mapped axis is the transpose of
-      broadcasting along it.
-      For example:
+    out_axes: 一个整数、None，或由它们构成的（嵌套）
+      标准 Python 容器（tuple/list/dict），
+      指示映射轴应出现在输出中的位置。
+      所有带映射轴的输出都必须有非
+      None 的 ``out_axes`` 指定（但请参见下面的
+      ``sum_match``）。对于每个输出数组，轴整数必须在
+      ``[-ndim, ndim)`` 范围内，其中 ``ndim`` 是被
+      :func:`vmap` 处理的函数所返回数组的维度（轴）数，
+      它比 ``fun`` 返回的相应数组的维度（轴）数多一。
+    axis_name: 可选，一个可哈希的 Python 对象，
+      用于标识被映射的轴，以便应用并行集合通信。
+    axis_size: 可选，一个整数，指示要映射的轴的大小。
+      如果未提供，则根据参数推断映射轴的大小。
+    sum_match: 可选，一个布尔值（默认为 ``False``），改变
+      ``out_axes`` 指定为 ``None`` 的输出的处理方式。
+      默认情况下，如果这类输出沿映射轴发生变化，
+      就会报错。当 ``sum_match=True`` 时，
+      这类输出改为沿映射轴求和；不沿映射轴变化的输
+      出照常原样返回。这在自动微分场景中很有用，
+      因为沿映射轴求和正是沿该轴广播的转置。
+      例如：
 
       >>> from jax import vmap
       >>> import jax.numpy as jnp
@@ -1070,13 +1016,13 @@ def vmap[F: Callable](
       Array(6., dtype=float32)
 
   Returns:
-    Batched/vectorized version of ``fun`` with arguments that correspond to
-    those of ``fun``, but with extra array axes at positions indicated by
-    ``in_axes``, and a return value that corresponds to that of ``fun``, but
-    with extra array axes at positions indicated by ``out_axes``.
+    ``fun`` 的批处理/向量化版本，其参数与 ``fun`` 的参数对应，
+    但在 ``in_axes`` 指示的位置上带有额外的数组轴；
+    其返回值与 ``fun`` 的返回值对应，
+    但在 ``out_axes`` 指示的位置上带有额外的数组轴。
 
-  For example, we can implement a matrix-matrix product using a vector dot
-  product:
+  例如，我们可以用向量点积实现矩阵-
+  矩阵乘积：
 
   >>> import jax.numpy as jnp
   >>>
@@ -1084,15 +1030,15 @@ def vmap[F: Callable](
   >>> mv = vmap(vv, (0, None), 0)      #  ([b,a], [a]) -> [b]      (b is the mapped axis)
   >>> mm = vmap(mv, (None, 1), 1)      #  ([b,a], [a,c]) -> [b,c]  (c is the mapped axis)
 
-  Here we use ``[a,b]`` to indicate an array with shape (a,b). Here are some
-  variants:
+  这里我们用 ``[a,b]`` 表示形状为
+  (a,b) 的数组。下面是一些变体：
 
   >>> mv1 = vmap(vv, (0, 0), 0)   #  ([b,a], [b,a]) -> [b]        (b is the mapped axis)
   >>> mv2 = vmap(vv, (0, 1), 0)   #  ([b,a], [a,b]) -> [b]        (b is the mapped axis)
   >>> mm2 = vmap(mv2, (1, 1), 0)  #  ([b,c,a], [a,c,b]) -> [c,b]  (c is the mapped axis)
 
-  Here's an example of using container types in ``in_axes`` to specify which
-  axes of the container elements to map over:
+  下面是一个在 ``in_axes`` 中使用容器类型的例子，
+  用来指定要映射容器元素的哪些轴：
 
   >>> A, B, C, D = 2, 3, 4, 5
   >>> x = jnp.ones((A, B))
@@ -1115,8 +1061,8 @@ def vmap[F: Callable](
   >>> print(vfoo(tree).shape)
   (6, 2, 5)
 
-  Here's another example using container types in ``in_axes``, this time a
-  dictionary, to specify the elements of the container to map over:
+  下面是另一个在 ``in_axes`` 中使用容器类型的例子，
+  这次用的是字典，用来指定要映射的容器元素：
 
   >>> dct = {'a': 0., 'b': jnp.arange(5.)}
   >>> x = 1.
@@ -1126,24 +1072,24 @@ def vmap[F: Callable](
   >>> print(out)
   [1. 2. 3. 4. 5.]
 
-  The results of a vectorized function can be mapped or unmapped. For example,
-  the function below returns a pair with the first element mapped and the second
-  unmapped. Only for unmapped results we can specify ``out_axes`` to be ``None``
-  (to keep it unmapped).
+  向量化函数的结果可以是已映射的或未映射的。例如，
+  下面的函数返回一个二元组，其中第一个元素已映射，
+  第二个元素未映射。只有对未映射的结果，我们才能把
+  ``out_axes`` 指定为 ``None``（以使其保持未映射）。
 
   >>> print(vmap(lambda x, y: (x + y, y * 2.), in_axes=(0, None), out_axes=(0, None))(jnp.arange(2.), 4.))
   (Array([4., 5.], dtype=float32), 8.0)
 
-  If the ``out_axes`` is specified for an unmapped result, the result is
-  broadcast across the mapped axis:
+  如果为未映射的结果指定了 ``out_axes``，
+  该结果会沿映射轴广播：
 
   >>> print(vmap(lambda x, y: (x + y, y * 2.), in_axes=(0, None), out_axes=0)(jnp.arange(2.), 4.))
   (Array([4., 5.], dtype=float32), Array([8., 8.], dtype=float32, weak_type=True))
 
-  If the ``out_axes`` is specified for a mapped result, the result is transposed
-  accordingly.
+  如果为已映射的结果指定了 ``out_axes``，
+  该结果会相应转置。
 
-  Finally, here's an example using ``axis_name`` together with collectives:
+  最后，这里是一个把 ``axis_name`` 与集合通信一起使用的例子：
 
   >>> xs = jnp.arange(3. * 4.).reshape(3, 4)
   >>> print(vmap(lambda x: lax.psum(x, 'i'), axis_name='i')(xs))
@@ -1151,7 +1097,7 @@ def vmap[F: Callable](
    [12. 15. 18. 21.]
    [12. 15. 18. 21.]]
 
-  See the :py:func:`jax.pmap` docstring for more examples involving collectives.
+  涉及集合通信的更多示例请参见 :py:func:`jax.pmap` 的文档字符串。
   """
   check_callable(fun)
   docstr = ("Vectorized version of {fun}. Takes similar arguments as {fun} "
@@ -1165,11 +1111,11 @@ def vmap[F: Callable](
     spmd_axis_name = (spmd_axis_name,)
 
   if isinstance(in_axes, list):
-    # To be a tree prefix of the positional args tuple, in_axes can never be a
-    # list: if in_axes is not a leaf, it must be a tuple of trees. However,
-    # in cases like these users expect tuples and lists to be treated
-    # essentially interchangeably, so we canonicalize lists to tuples here
-    # rather than raising an error. https://github.com/jax-ml/jax/issues/2367
+    # 要成为位置参数元组的树前缀，in_axes 绝不能是列表：如果 in_axes
+    # 不是叶子，它必须是树的元组。然而，在此类情况下用户期望元组和
+    # 列表基本上可以互换使用，因此我们在这里把列表规范化为元组，
+    # 而不是抛出错误。
+    # https://github.com/jax-ml/jax/issues/2367
     in_axes = tuple(in_axes)
 
   from jax._src import hijax  # pyrefly: ignore[missing-module-attribute]
@@ -1260,7 +1206,7 @@ def vmap[F: Callable](
 def _mapped_axis_spec(args_flat, in_axes_flat):
   def _get_spec(arg, i):
     try:
-      # Duck type arrays like BCOO arrays can be passed to vmap.
+      # 像 BCOO 数组这样的鸭子类型数组可以传给 vmap。
       return shaped_abstractify(arg).sharding.spec[i]
     except (IndexError, TypeError, AttributeError):
       return None
@@ -1311,7 +1257,7 @@ def _mapped_axis_size(fn, tree, vals, dims, name, axis_size=None):
       return shape[axis]
     except (IndexError, TypeError) as e:
       if not core.valid_jaxtype(x) or not isinstance(axis, int):
-        return None  # Suppress the check for custom vmappable types.
+        return None  # 对自定义的、可被 vmap 的类型抑制该检查。
       if core.typeof(x).is_high:
         raise ValueError(
             f"{name} was requested to map a value of non-array type "
@@ -1320,7 +1266,7 @@ def _mapped_axis_size(fn, tree, vals, dims, name, axis_size=None):
             "MappingSpec instance) as this argument's in_axes entry, and "
             "pass axis_size explicitly.") from None
       min_rank = axis + 1 if axis >= 0 else -axis
-      # TODO(mattjj): better error message here
+      # TODO(mattjj): 这里的错误信息可以更好
       raise ValueError(
           f"{name} was requested to map its argument along axis {axis}, "
           f"which implies that its rank should be at least {min_rank}, "
@@ -1344,7 +1290,7 @@ def _mapped_axis_size(fn, tree, vals, dims, name, axis_size=None):
   def _get_argument_type(x):
     try:
       return shaped_abstractify(x).str_short()
-    except TypeError: # Catch all for user specified objects that can't be interpreted as a data type
+    except TypeError: # 兜底捕获无法被解释为数据类型的用户指定对象
       return "unknown"
   msg = [f"{name} got inconsistent sizes for array axes to be mapped:\n"]
   args, kwargs = tree_unflatten(tree, vals)
@@ -1357,9 +1303,9 @@ def _mapped_axis_size(fn, tree, vals, dims, name, axis_size=None):
   def arg_name(key_path):
     if signature_parameters is None:
       return f"args{keystr(key_path)}"
-    # args is a tuple, so key_path[0].idx is the index into args.
+    # args 是元组，因此 key_path[0].idx 就是 args 中的索引。
     i = key_path[0].idx
-    # This can happen with star arguments (*args)
+    # 在使用星号参数（*args）时可能出现这种情况
     if i >= len(signature_parameters):
       return f"args{keystr(key_path)}"
     res = f"argument {signature_parameters[i]}"
@@ -1398,41 +1344,41 @@ def _mapped_axis_size(fn, tree, vals, dims, name, axis_size=None):
       msg.append(f"  * one axis had size {sz}: axis {ax} of {ex};\n")
     else:
       msg.append(f"  * some axes ({ct} of them) had size {sz}, e.g. axis {ax} of {ex};\n")
-  raise ValueError(''.join(msg)[:-2])  # remove last semicolon and newline
+  raise ValueError(''.join(msg)[:-2])  # 去掉最后的分号和换行
 
 
 @partial(api_boundary, repro_api_name="jax.jvp")
 def jvp(
     fun: Callable, primals, tangents, has_aux: bool = False
   ) -> tuple[Any, ...]:
-  """Computes a (forward-mode) Jacobian-vector product of ``fun``.
+  """计算 ``fun`` 的（前向模式）Jacobian-向量乘积。
 
   Args:
-    fun: Function to be differentiated. Its arguments should be arrays, scalars,
-      or standard Python containers of arrays or scalars. It should return an
-      array, scalar, or standard Python container of arrays or scalars.
-    primals: The primal values at which the Jacobian of ``fun`` should be
-      evaluated. Should be either a tuple or a list of arguments,
-      and its length should be equal to the number of positional parameters of
-      ``fun``.
-    tangents: The tangent vector for which the Jacobian-vector product should be
-      evaluated. Should be either a tuple or a list of tangents, with the same
-      tree structure and array shapes as ``primals``.
-    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the
-     first element is considered the output of the mathematical function to be
-     differentiated and the second element is auxiliary data. Default False.
+    fun: 需要求导的函数。其参数应为数组、标量，
+      或由数组或标量构成的标准 Python 容器。它应返回数组、
+      标量，或由数组或标量构成的标准 Python 容器。
+    primals: 用于计算 ``fun`` 的 Jacobian 的原始值。
+      应为参数的元组或列表，其长度应等于
+      ``fun`` 的位置参数个数。
+    tangents: 用于计算 Jacobian-
+      向量乘积的切向量。应为切向量的元组或列表，
+      其树结构和数组形状与 ``primals`` 相同。
+    has_aux: 可选，bool。
+     指示 ``fun`` 是否返回一个二元组，
+     其中第一个元素被视为待求导的数学函数的输出，
+     第二个元素是辅助数据。默认为 False。
 
   Returns:
-    If ``has_aux`` is ``False``, returns a ``(primals_out, tangents_out)`` pair,
-    where ``primals_out`` is ``fun(*primals)``,
-    and ``tangents_out`` is the Jacobian-vector product of
-    ``function`` evaluated at ``primals`` with ``tangents``. The
-    ``tangents_out`` value has the same Python tree structure and shapes as
-    ``primals_out``. If ``has_aux`` is ``True``, returns a
-    ``(primals_out, tangents_out, aux)`` tuple where ``aux``
-    is the auxiliary data returned by ``fun``.
+    如果 ``has_aux`` 为 ``False``，
+    返回 ``(primals_out, tangents_out)`` 二元组，其中
+    ``primals_out`` 是 ``fun(*primals)``，``tangents_out`` 是
+    ``function`` 在 ``primals`` 处用 ``tangents`` 求得的 Jacobian-
+    向量乘积。``tangents_out`` 的值具有与 ``primals_out``
+    相同的 Python 树结构和形状。如果 ``has_aux`` 为 ``True``，
+    返回 ``(primals_out, tangents_out, aux)``
+    三元组，其中 ``aux`` 是 ``fun`` 返回的辅助数据。
 
-  For example:
+  例如：
 
   >>> import jax
   >>>
@@ -1486,61 +1432,61 @@ def linearize(fun: Callable, *primals, has_aux: Literal[True],
 def linearize(fun: Callable, *primals, has_aux: bool = False,
               in_nzs: Any = None
               ) -> tuple[Any, Callable] | tuple[Any, Callable, Any]:
-  """Produces a linear approximation to ``fun`` using :py:func:`jvp` and partial eval.
+  """使用 :py:func:`jvp` 与部分求值产生 ``fun`` 的线性近似。
 
   Args:
-    fun: Function to be differentiated. Its arguments should be arrays, scalars,
-      or standard Python containers of arrays or scalars. It should return an
-      array, scalar, or standard python container of arrays or scalars.
-    primals: The primal values at which the Jacobian of ``fun`` should be
-      evaluated. Should be a tuple of arrays, scalar, or standard Python
-      container thereof. The length of the tuple is equal to the number of
-      positional parameters of ``fun``.
-    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the first
-      element is considered the output of the mathematical function to be linearized,
-      and the second is auxiliary data. Default False.
-    in_nzs: Optional, a tuple-tree of bools (see ``in_nzs`` on :func:`jax.vjp`),
-      by default ``None`` meaning all-True. Declares which primal inputs have
-      (possibly) nonzero tangents; a False-marked input's tangent is treated as
-      symbolically zero during linearization. The resulting per-output nonzeros
-      pattern is available as the ``out_nzs`` attribute of the returned
-      linearized function (though not preserved across pytree flattening).
+    fun: 需要被微分的函数。其参数应该是数组、标量，
+      或数组、标量的标准 Python 容器。它应该返回
+      数组、标量，或数组、标量的标准 Python 容器。
+    primals: 求 ``fun`` 的 Jacobian 时所对应的原始值。
+      应该是由数组、标量，或它们的标准 Python
+      容器构成的元组。元组长度等于 ``fun`` 的
+      位置参数个数。
+    has_aux: 可选，bool。指示 ``fun`` 是否返回一个二元组，其中第一个
+      元素被视为待线性化的数学函数的输出，
+      第二个元素是辅助数据。默认为 False。
+    in_nzs: 可选，一个由 bool 构成的 tuple-tree（参见 :func:`jax.vjp` 上的
+      ``in_nzs``），默认为 ``None``，表示全为 True。它声明哪些原始输入
+      具有（可能）非零的切向量；被标记为 False 的输入的切向量在
+      线性化过程中按符号零处理。由此得到的逐输出非零
+      模式可以通过返回的线性化函数的 ``out_nzs``
+      属性获取（不过在 pytree 展平后不会被保留）。
 
   Returns:
-    If ``has_aux`` is ``False``, returns a pair where the first element is the value of
-    ``f(*primals)`` and the second element is a function that evaluates the
-    (forward-mode) Jacobian-vector product of ``fun`` evaluated at ``primals`` without
-    re-doing the linearization work. If ``has_aux`` is ``True``, returns a
-    ``(primals_out, lin_fn, aux)`` tuple where ``aux`` is the auxiliary data returned by
-    ``fun``.
+    如果 ``has_aux`` 为 ``False``，返回一个二元组，其中第一个元素是
+    ``f(*primals)`` 的值，第二个元素是一个函数，它计算 ``fun`` 在 ``primals``
+    处求值的（前向模式）Jacobian-向量乘积，而无需
+    重新做线性化的工作。如果 ``has_aux`` 为 ``True``，返回
+    ``(primals_out, lin_fn, aux)`` 元组，其中 ``aux`` 是 ``fun``
+    返回的辅助数据。
 
-  In terms of values computed, :py:func:`linearize` behaves much like a curried
-  :py:func:`jvp`, where these two code blocks compute the same values::
+  就所计算的值而言，:py:func:`linearize` 的行为很像柯里化的
+  :py:func:`jvp`，下面这两个代码块计算的是相同的值::
 
     y, out_tangent = jax.jvp(f, (x,), (in_tangent,))
 
     y, f_jvp = jax.linearize(f, x)
     out_tangent = f_jvp(in_tangent)
 
-  However, the difference is that :py:func:`linearize` uses partial evaluation
-  so that the function ``f`` is not re-linearized on calls to ``f_jvp``. In
-  general that means the memory usage scales with the size of the computation,
-  much like in reverse-mode. (Indeed, :py:func:`linearize` has a similar
-  signature to :py:func:`vjp`!)
+  但区别在于，:py:func:`linearize` 使用部分求值，
+  因此函数 ``f`` 在调用 ``f_jvp`` 时不会被重新线性化。
+  一般来说，这意味着内存占用随计算规模增长，
+  与反向模式十分相似。（确实，:py:func:`linearize`
+  的签名与 :py:func:`vjp` 很接近！）
 
-  This function is mainly useful if you want to apply ``f_jvp`` multiple times,
-  i.e. to evaluate a pushforward for many different input tangent vectors at the
-  same linearization point. Moreover if all the input tangent vectors are known
-  at once, it can be more efficient to vectorize using :py:func:`vmap`, as in::
+  当你想要多次应用 ``f_jvp`` 时，这个函数特别有用，也就是说，
+  在同一个线性化点上针对许多不同的输入切向量求 pushforward。
+  此外，如果所有输入切向量都同时已知，用 :py:func:`vmap` 做向量化
+  可能更高效，例如::
 
     pushfwd = partial(jvp, f, (x,))
     y, out_tangents = vmap(pushfwd, out_axes=(None, 0))((in_tangents,))
 
-  By using :py:func:`vmap` and :py:func:`jvp` together like this we avoid the stored-linearization
-  memory cost that scales with the depth of the computation, which is incurred
-  by both :py:func:`linearize` and :py:func:`vjp`.
+  像这样把 :py:func:`vmap` 与 :py:func:`jvp` 结合使用，
+  我们就避免了 :py:func:`linearize` 和 :py:func:`vjp` 都要承担的、
+  随计算深度增长的存储线性化的内存开销。
 
-  Here's a more complete example of using :py:func:`linearize`:
+  下面是一个更完整的使用 :py:func:`linearize` 的例子：
 
   >>> import jax
   >>> import jax.numpy as jnp
@@ -1586,7 +1532,7 @@ def _lift_linearized(jaxpr, in_avals, out_avals, out_zeros, consts,
       if (isinstance(primal_aval, core.ShapedArray) and
           isinstance(tangent_aval, core.ShapedArray) and
           primal_aval.mat != tangent_aval.mat):
-        # TODO(yashkatariya): Tweak error.
+        # TODO(yashkatariya): 调整报错信息。
         pvary_applications = []
         if left := tangent_aval.mat.varying - primal_aval.mat.varying:
           pvary_applications.append(
@@ -1612,7 +1558,7 @@ def _lift_linearized(jaxpr, in_avals, out_avals, out_zeros, consts,
   assert next(tangents_out_, None) is None
   return out_avals.update(full_out).unflatten()
 
-# TODO(mattjj): see similar function in custom_derivatives.py
+# TODO(mattjj): 参见 custom_derivatives.py 中的类似函数
 def _temporary_dtype_exception(a, a_) -> bool:
   if isinstance(a, core.ShapedArray) and isinstance(a_, core.ShapedArray):
     return a.shape == a_.shape and a_.dtype == float0
@@ -1640,52 +1586,52 @@ def vjp(
     fun: Callable, *primals, has_aux: bool = False, reduce_axes=(),
     saveable_args: Any = True, in_nzs: Any = None,
   ) -> tuple[Any, Callable] | tuple[Any, Callable, Any]:
-  """Compute a (reverse-mode) vector-Jacobian product of ``fun``.
+  """计算 ``fun`` 的（反向模式）向量-Jacobian 乘积。
 
-  :py:func:`grad` is implemented as a special case of :py:func:`vjp`.
+  :py:func:`grad` 就是作为 :py:func:`vjp` 的一个特例实现的。
 
   Args:
-    fun: Function to be differentiated. Its arguments should be arrays, scalars,
-      or standard Python containers of arrays or scalars. It should return an
-      array, scalar, or standard Python container of arrays or scalars.
-    primals: A sequence of primal values at which the Jacobian of ``fun``
-      should be evaluated. The number of ``primals`` should be equal to the
-      number of positional parameters of ``fun``. Each primal value should be
-      an array, a scalar, or a pytree (standard Python containers) thereof.
-    has_aux: Optional, bool. Indicates whether ``fun`` returns a pair where the
-     first element is considered the output of the mathematical function to be
-     differentiated and the second element is auxiliary data. Default False.
-    saveable_args: Optional, a tuple-tree of bools (i.e. nested tuples with
-      bool leaves) or equivalently a pytree prefix of the primals with bool
-      leaves, by default the single bool ``True``. Indicates whether
-      each primal argument (or argument sub-pytree, or leaf) may be saved for
-      the backward pass. It must form a tree prefix of ``primals`` up to
-      pytree node types: tuples are matched against argument containers only
-      by their number of children, so e.g. a tuple entry can correspond to a
-      dict argument. Where a False entry applies, argument values that would have
-      been saved verbatim as residuals are instead replaced by ``NotSaveable``
-      sentinels in the ``args_res`` attribute of ``vjpfun``, and the caller
-      must restore them (e.g. by assigning to ``vjpfun.args_res``) before
-      applying ``vjpfun``. Only argument values saved verbatim are affected;
-      residuals computed from the arguments are saved as usual.
-    in_nzs: Optional, a tuple-tree of bools like ``saveable_args``, by default
-      ``None`` meaning all-True. Declares which primal inputs have (possibly)
-      nonzero tangents. Where a False entry applies, that input's tangent is
-      treated as symbolically zero during linearization, which can make more
-      outputs' tangents symbolically zero; the resulting per-output nonzeros
-      pattern is available as the ``out_nzs`` attribute of ``vjpfun``, and
-      ``vjpfun`` returns a zero cotangent for any False-marked input.
+    fun: 需要被微分的函数。其参数应该是数组、标量，
+      或数组、标量的标准 Python 容器。它应该返回
+      数组、标量，或数组、标量的标准 Python 容器。
+    primals: 一个原始值序列，求 ``fun`` 的 Jacobian 时以它们为求值点。
+      ``primals`` 的个数应该等于 ``fun`` 的位置参数个数。
+      每个原始值应该是一个数组、标量，或它们的 pytree（标准 Python 容器）。
+    has_aux: 可选，bool。指示 ``fun`` 是否返回一个二元组，其中
+     第一个元素被视为待微分的数学函数的输出，
+     第二个元素是辅助数据。默认为 False。
+    saveable_args: 可选，一个由 bool 构成的 tuple-tree（即叶子为 bool
+      的嵌套元组），或者等价地说，是 ``primals`` 的一个叶子为 bool 的
+      pytree 前缀，默认为单个 bool ``True``。它指示
+      每个原始参数（或参数的子 pytree，或叶子）是否可以
+      为反向传播保存。它必须在 pytree 节点类型这一层面上
+      构成 ``primals`` 的树前缀：元组与参数容器
+      只按子节点个数匹配，因此例如一个元组项可以对应
+      一个 dict 参数。在 False 项生效的位置，原本会
+      原样保存为残差的参数值会被替换为
+      ``vjpfun`` 的 ``args_res`` 属性中的 ``NotSaveable``
+      哨兵值，调用方必须把它们恢复（例如通过给
+      ``vjpfun.args_res`` 赋值）才能应用
+      ``vjpfun``。只有原样保存的参数值会受影响；
+      由参数计算出的残差照常保存。
+    in_nzs: 可选，一个与 ``saveable_args`` 类似的由 bool 构成的 tuple-tree，默认为
+      ``None``，表示全为 True。它声明哪些原始输入具有（可能）
+      非零的切向量。在 False 项生效的位置，该输入的切向量
+      在线性化过程中按符号零处理，这可以使更多
+      输出的切向量成为符号零；由此得到的逐输出非零
+      模式可以通过 ``vjpfun`` 的 ``out_nzs`` 属性获取，并且
+      ``vjpfun`` 对任何被标记为 False 的输入返回零余切向量。
 
   Returns:
-    If ``has_aux`` is ``False``, returns a ``(primals_out, vjpfun)`` pair, where
-    ``primals_out`` is ``fun(*primals)``. If ``has_aux`` is ``True``, returns a
-    ``(primals_out, vjpfun, aux)`` tuple where ``aux`` is the auxiliary data
-    returned by ``fun``.
+    如果 ``has_aux`` 为 ``False``，返回 ``(primals_out, vjpfun)`` 二元组，其中
+    ``primals_out`` 是 ``fun(*primals)``。如果 ``has_aux`` 为 ``True``，返回
+    ``(primals_out, vjpfun, aux)`` 元组，其中 ``aux`` 是 ``fun``
+    返回的辅助数据。
 
-    ``vjpfun`` is a function from a cotangent vector with the same shape as
-    ``primals_out`` to a tuple of cotangent vectors with the same number and
-    shapes as ``primals``, representing the vector-Jacobian product of ``fun``
-    evaluated at ``primals``.
+    ``vjpfun`` 是一个函数，它把与 ``primals_out`` 形状相同的余切向量
+    映射到与 ``primals`` 个数和形状都相同的余切向量元组，
+    表示 ``fun`` 在 ``primals`` 处求值得到的
+    向量-Jacobian 乘积。
 
   >>> import jax
   >>>
@@ -1742,7 +1688,7 @@ def _vjp3_callable(spec, out_zeros, jaxpr, out_primal_avals, in_tree, out_tree,
                       isinstance(args_res_[i.idx], NotSaveable)]:
     _vjp_not_saveable_error(jaxpr, in_tree, not_restored)
   residuals = [args_res_[i.idx] if i.primal else opaque_res[i.idx] for i in spec]
-  arg_invars = jaxpr.invars[len(spec):]  # skip the residual invars
+  arg_invars = jaxpr.invars[len(spec):]  # 跳过残差输入变量
   maybe_accums = [_vjp_accum(jaxpr, in_tree, explicit_refs, idx, v, x)
                   for idx, (v, x) in enumerate(unsafe_zip(arg_invars, maybe_ct_refs_flat))]
   return Partial(partial(_vjp3_bwd, in_tree, out_tree, out_zeros, jaxpr,
@@ -1791,7 +1737,7 @@ def _vjp_arg_name(jaxpr, in_tree, idx):
     dummy_args = tree_unflatten(in_tree, list(range(in_tree.num_leaves)))
     path, _ = list(generate_key_paths(dummy_args))[idx]
     position = f"args{keystr(path)}"
-  except Exception:  # unflattening custom pytree nodes can reject dummy leaves
+  except Exception:  # 反展平（unflatten）自定义 pytree 节点时可能会拒绝哑叶子
     position = f"flat argument index {idx}"
   return (f"the argument at position {position} of the "
           f"differentiated function {jaxpr.debug_info.func_src_info}")
@@ -1861,12 +1807,12 @@ def tuptree_map(f, treedef, *args):
   return treedef.walk(lambda xs, _: tuple(xs), lambda xs: f(*xs), zip(*args))
 
 def tuptree_flags(prefix, treedef, name: str, full_name: str) -> list[bool]:
-  """Expand a flags prefix into per-leaf flags for `treedef`.
+  """把 flags 前缀扩展为 `treedef` 的逐叶子 flags。
 
-  The prefix may be a bool, a pytree prefix of `treedef` with bool leaves, or
-  a tuple-tree: made of bools and tuples only, forming a tree prefix of
-  `treedef` up to pytree node types, with tuples matched against containers
-  only by their number of children."""
+  前缀可以是 bool、`treedef` 的叶子为 bool 的 pytree 前缀，或者
+  一个 tuple-tree：仅由 bool 和元组构成，在 pytree 节点类型这一层面上
+  构成 `treedef` 的树前缀，其中元组与容器只按
+  子节点个数匹配。"""
   if isinstance(prefix, bool):
     return [prefix] * treedef.num_leaves
   try:
@@ -1967,7 +1913,7 @@ But the tree structures differ:
 
 
 def _vjp_check_ct_avals(cts, primal_avals):
-  # TODO(mattjj): improve this error  by flattening with keys in the first place
+  # TODO(mattjj): 改进这个报错，一开始就带着键做展平
   for ct, aval in zip(cts, primal_avals):
     if isinstance(ct, ad.Zero): continue
     ct_aval = typeof(ct)
@@ -2030,9 +1976,9 @@ class VJP:
                     self.opaque_residuals, self.structured_residuals,
                     self.want_logs)(out_ct)
 
-  # Like __call__, but returns a pair (arg_cts, logs), where logs is a dict
-  # merging (with clobber semantics, in backward execution order) the dicts
-  # logged by transpose/vjp_bwd rules. Plain __call__ drops the logs.
+  # 类似 __call__，但返回一对 (arg_cts, logs)，其中 logs 是一个字典，
+  # 它按反向执行顺序、以覆盖语义合并各 transpose/vjp_bwd 规则记录的字典。
+  # 普通的 __call__ 会丢弃这些 logs。
   with_logs = property(lambda self: self.replace(want_logs=True))
 
   def with_refs(self, *maybe_ct_refs):
@@ -2042,7 +1988,7 @@ class VJP:
 
   replace = dataclasses.replace
 
-  # Only safe to put these in cache keys if residuals aren't mutated. Beware!
+  # 只有在残差不会被改写时，才可以安全地把它们放进缓存键中。注意！
   __hash__ = object.__hash__
   __eq__ = object.__eq__
 
@@ -2055,32 +2001,32 @@ register_pytree_node(
 
 @partial(api_boundary, repro_api_name="jax.linear_transpose")
 def linear_transpose(fun: Callable, *primals, reduce_axes=()) -> Callable:
-  """Transpose a function that is promised to be linear.
+  """转置一个承诺为线性的函数。
 
-  For linear functions, this transformation is equivalent to :py:func:`vjp`, but
-  avoids the overhead of computing the forward pass.
+  对于线性函数，这个变换等价于 :py:func:`vjp`，但
+  避免了计算前向传播的开销。
 
-  The outputs of the transposed function will always have the exact same dtypes
-  as ``primals``, even if some values are truncated (e.g., from complex to
-  float, or from float64 to float32). To avoid truncation, use dtypes in
-  ``primals`` that match the full range of desired outputs from the transposed
-  function. Integer dtypes are not supported.
+  转置后的函数的输出总是具有与 ``primals`` 完全相同的数据类型，
+  即使某些值被截断（例如从复数到
+  float，或从 float64 到 float32）。为避免截断，请让
+  ``primals`` 中的数据类型与转置函数期望输出的完整
+  范围相匹配。不支持整数数据类型。
 
   Args:
-    fun: the linear function to be transposed.
-    *primals: a positional argument tuple of arrays, scalars, or (nested)
-      standard Python containers (tuples, lists, dicts, namedtuples, i.e.,
-      pytrees) of those types used for evaluating the shape/dtype of
-      ``fun(*primals)``. These arguments may be real scalars/ndarrays, but that
-      is not required: only the ``shape`` and ``dtype`` attributes are accessed.
-      See below for an example. (Note that the duck-typed objects cannot be
-      namedtuples because those are treated as standard Python containers.)
+    fun: 需要被转置的线性函数。
+    *primals: 一个位置参数元组，由数组、标量或它们的
+      （嵌套）标准 Python 容器（元组、列表、dict、namedtuple，即
+      pytree）构成，用于求值 ``fun(*primals)`` 的形状/数据类型。
+      这些参数可以是真实的标量/ndarray，但
+      并非必须如此：只会访问它们的 ``shape`` 与 ``dtype`` 属性。
+      参见下面的例子。（注意，鸭子类型的对象不能是
+      namedtuple，因为那类对象会被当作标准 Python 容器处理。）
 
   Returns:
-    A callable that calculates the transpose of ``fun``. Valid input into this
-    function must have the same shape/dtypes/structure as the result of
-    ``fun(*primals)``. Output will be a tuple, with the same
-    shape/dtypes/structure as ``primals``.
+    一个可调用对象，它计算 ``fun`` 的转置。传入这个函数的有效输入
+    必须与 ``fun(*primals)`` 的结果具有相同的
+    形状/数据类型/结构。输出将是一个元组，具有与 ``primals``
+    相同的形状/数据类型/结构。
 
   >>> import jax
   >>>
@@ -2128,7 +2074,7 @@ def linear_transpose(fun: Callable, *primals, reduce_axes=()) -> Callable:
     in_cts = map(ad.instantiate_zeros, in_cts)
     return tree_unflatten(in_tree, in_cts)
 
-  # Ensure that transposed_fun is a PyTree
+  # 确保 transposed_fun 是一个 PyTree
   return Partial(transposed_fun, const)
 
 
@@ -2157,43 +2103,43 @@ def make_jaxpr(
     axis_env: Sequence[tuple[AxisName, int]] | None = None,
     return_shape: bool = False,
 ) -> Callable[..., core.Jaxpr | tuple[core.Jaxpr, Any]]:
-  """Create a function that returns the jaxpr of ``fun`` given example args.
+  """创建一个函数，它在给定示例参数时返回 ``fun`` 的 jaxpr。
 
   Args:
-    fun: The function whose ``jaxpr`` is to be computed. Its positional
-      arguments and return value should be arrays, scalars, or standard Python
-      containers (tuple/list/dict) thereof.
-    static_argnums: See the :py:func:`jax.jit` docstring.
-    axis_env: Optional, a sequence of pairs where the first element is an axis
-      name and the second element is a positive integer representing the size of
-      the mapped axis with that name. This parameter is useful when lowering
-      functions that involve parallel communication collectives, and it
-      specifies the axis name/size environment that would be set up by
-      applications of :py:func:`jax.pmap`.
-    return_shape: Optional boolean, defaults to ``False``. If ``True``, the
-      wrapped function returns a pair where the first element is the
-      ``Jaxpr`` representation of ``fun`` and the second element is a
-      pytree with the same structure as the output of ``fun`` and where the
-      leaves are objects with ``shape`` and ``dtype`` attributes representing
-      the corresponding types of the output leaves.
+    fun: 要计算其 ``jaxpr`` 的函数。它的位置参数以及它的返回值，
+      都应当是数组、标量，或由这些类型构成的标准 Python 容器
+      （tuple/list/dict）。
+    static_argnums: 参见 :py:func:`jax.jit` 的文档字符串。
+    axis_env: 可选，一个由数对构成的序列。
+      每个数对的第一个元素是一个轴的名字，
+      第二个元素是一个正整数，表示以该名字命名的映射轴的大小。
+      当降级涉及并行通信集合操作的函数时，这个参数很有用，
+      它指定了 :py:func:`jax.pmap` 的各次应用所会建立起来的
+      轴名字/大小环境。
+    return_shape: 可选布尔值，默认为 ``False``。
+      若为 ``True``，则被包装的函数返回一个数对，
+      第一个元素是 ``fun`` 的 ``Jaxpr`` 表示，
+      第二个元素是一个 pytree，其结构与 ``fun`` 的输出相同，
+      它的叶子是带有 ``shape`` 和 ``dtype`` 属性的对象，
+      表示输出中各叶子对应的类型。
 
   Returns:
-    A wrapped version of ``fun`` that when applied to example arguments returns
-    a ``Jaxpr`` representation of ``fun`` on those arguments. If the
-    argument ``return_shape`` is ``True``, then the returned function instead
-    returns a pair where the first element is the ``Jaxpr``
-    representation of ``fun`` and the second element is a pytree representing
-    the structure, shape, dtypes, and named shapes of the output of ``fun``.
+    一个经过包装的 ``fun``：当它作用于示例参数时，会返回 ``fun``
+    在这些参数上的 ``Jaxpr`` 表示。如果参数 ``return_shape``
+    为 ``True``，那么返回的函数改为返回一个数对，
+    其中第一个元素是 ``fun`` 的 ``Jaxpr`` 表示，
+    第二个元素是一个 pytree，表示 ``fun`` 输出的结构、
+    形状、数据类型和具名形状。
 
-  A ``jaxpr`` is JAX's intermediate representation for program traces. The
-  ``jaxpr`` language is based on the simply-typed first-order lambda calculus
-  with let-bindings. :py:func:`make_jaxpr` adapts a function to return its
-  ``jaxpr``, which we can inspect to understand what JAX is doing internally.
-  The ``jaxpr`` returned is a trace of ``fun`` abstracted to
-  :py:class:`ShapedArray` level. Other levels of abstraction exist internally.
+  ``jaxpr`` 是 JAX 用来表示程序追踪的中间表示。``jaxpr`` 语言
+  基于带 let 绑定的简单类型一阶 lambda 演算。:py:func:`make_jaxpr`
+  把一个函数改造成返回其 ``jaxpr`` 的形式，我们可以借此检查
+  JAX 内部究竟在做什么。返回的 ``jaxpr`` 是 ``fun`` 的追踪，
+  它被抽象到 :py:class:`ShapedArray` 层级。
+  在 JAX 内部还存在其他抽象层级。
 
-  We do not describe the semantics of the ``jaxpr`` language in detail here, but
-  instead give a few examples.
+  这里不详细描述 ``jaxpr`` 语言的语义，
+  而是给出几个例子。
 
   >>> import jax
   >>>
@@ -2224,8 +2170,8 @@ def make_jaxpr(
   def make_jaxpr_f(*args, **kwargs):
     with core.extend_axis_env_nd(axis_env or []):
       traced = jit(fun, static_argnums=static_argnums).trace(*args, **kwargs)
-    # `jit` converts tracers in consts to args but `make_jaxpr` callers expect
-    # consts not to be converted.
+    # `jit` 会把常量中的追踪器转换为参数，但 `make_jaxpr` 的调用者
+    # 期望常量不被转换。
     jaxpr = (traced.jaxpr.with_consts(traced._consts) if traced._consts
              else traced.jaxpr)
     if return_shape:
@@ -2257,7 +2203,7 @@ def _infer_src_sharding(src, x, x_aval) -> Sharding | None:
 
 @util.cache(max_size=2048, trace_context_in_key=False)
 def _check_string_compatible_sharding(s):
-  """Checks if target devices are compatible with string arrays."""
+  """检查目标设备是否与字符串数组兼容。"""
   if isinstance(s, xc.Device) and s.device_kind == "cpu":
     return
   if (isinstance(s, Sharding)
@@ -2285,7 +2231,7 @@ def _check_sharding(aval, s):
     pjit.pjit_check_aval_sharding(
         (s,), (aval,), ("",), "device_put args", allow_uneven_sharding=False
     )
-    s.shard_shape(aval.shape)  # should raise an Error if incompatible
+    s.shard_shape(aval.shape)  # 若形状不兼容应当抛出错误
 
 def pspec_to_sharding(name, val):
   if isinstance(val, P):
@@ -2303,34 +2249,34 @@ def device_put(
     device: None | xc.Device | Sharding | P | Format | Any = None,
     *, src: None | xc.Device | Sharding | P | Format | Any = None,
     donate: bool | Any = False, may_alias: bool | None | Any = None):
-  """Transfers ``x`` to ``device``.
+  """把 ``x`` 传输到 ``device``。
 
   Args:
-    x: An array, scalar, or (nested) standard Python container thereof.
-    device: The (optional) :py:class:`Device`, :py:class:`Sharding`, or a
-      (nested) :py:class:`Sharding` in standard Python container (must be a tree
-      prefix of ``x``), representing the device(s) to which ``x`` should be
-      transferred. If given, then the result is committed to the device(s).
-    src: The (optional) :py:class:`Device`, :py:class:`Sharding`, or a (nested)
-      :py:class:`Sharding` in standard Python container (must be a tree prefix
-      of ``x``), representing the device(s) on which ``x`` belongs.
-    donate: bool or a (nested) bool in standard Python container (must be a tree
-      prefix of ``x``). If True, ``x`` can be overwritten and marked deleted in
-      the caller. This is best effort. JAX will donate if possible, otherwise it
-      won't. The input buffer (in the future) will always be deleted if donated.
-    may_alias: bool or None or a (nested) bool in standard Python container
-      (must be a tree prefix of ``x``). If False, `x` will be copied. If true,
-      `x` may be aliased depending on the runtime's implementation.
+    x: 一个数组、标量，或由它们构成的（嵌套）标准 Python 容器。
+    device: （可选）:py:class:`Device`、:py:class:`Sharding`，或标准
+      Python 容器中的（嵌套）:py:class:`Sharding`（必须是 ``x`` 的
+      树前缀），表示 ``x`` 应该被传输到的设备。如果给出该参数，
+      那么结果会被提交到这些设备上。
+    src: （可选）:py:class:`Device`、:py:class:`Sharding`，或标准 Python
+      容器中的（嵌套）:py:class:`Sharding`（必须是 ``x`` 的树前缀），
+      表示 ``x`` 当前所属的设备。
+    donate: bool，或标准 Python 容器中的（嵌套）bool（必须是 ``x`` 的
+      树前缀）。若为 True，则调用方可以覆写 ``x`` 并将其标记为已删除。
+      这只是尽力而为：JAX 在可能的情况下会捐赠，否则不会。
+      若发生了捐赠，输入缓冲区（在将来）总会被删除。
+    may_alias: bool、None，或标准 Python 容器中的（嵌套）bool
+      （必须是 ``x`` 的树前缀）。若为 False，``x`` 会被复制；
+      若为 True，``x`` 是否被别名化取决于运行时的实现。
 
   Returns:
-    A copy of ``x`` that resides on ``device``.
+    ``x`` 的一份副本，它位于 ``device`` 上。
 
-  If the ``device`` parameter is ``None``, then this operation behaves like the
-  identity function if the operand is on any device already, otherwise it
-  transfers the data to the default device, uncommitted.
+  如果 ``device`` 参数为 ``None``，那么当操作数已经位于某个设备上时，
+  这个操作的行为类似于恒等函数；否则它会把数据传输到默认设备，
+  且不把结果提交到该设备上。
 
-  This function is always asynchronous, i.e. returns immediately without
-  blocking the calling Python thread until any transfers are completed.
+  该函数始终是异步的，也就是说它会立即返回，
+  不会阻塞调用它的 Python 线程直到传输完成。
   """
   with config.explicit_device_put_scope():
     x_flat, treedef = tree_flatten(x)
@@ -2398,25 +2344,25 @@ def device_put(
 
 
 def device_put_sharded(shards: Sequence[Any], devices: Sequence[xc.Device]):  # noqa: F811
-  """Transfer array shards to specified devices and form Array(s).
+  """把数组分片传输到指定设备并组成 Array。
 
   Args:
-    shards: A sequence of arrays, scalars, or (nested) standard Python
-      containers thereof representing the shards to be stacked together to form
-      the output. The length of ``shards`` must equal the length of ``devices``.
-    devices: A sequence of :py:class:`Device` instances representing the devices
-      to which corresponding shards in ``shards`` will be transferred.
+    shards: 一个由数组、标量或它们的（嵌套）标准 Python 容器构成的
+      序列，表示要堆叠在一起构成输出的各个分片。``shards`` 的长度
+      必须等于 ``devices`` 的长度。
+    devices: 一个由 :py:class:`Device` 实例构成的序列，表示 ``shards``
+      中对应的分片将被传输到的那些设备。
 
-  This function is always asynchronous, i.e. returns immediately.
+  该函数始终是异步的，也就是说它会立即返回。
 
   Returns:
-    A Array or (nested) Python container thereof representing the
-    elements of ``shards`` stacked together, with each shard backed by physical
-    device memory specified by the corresponding entry in ``devices``.
+    一个 Array 或它的（嵌套）Python 容器，表示把 ``shards`` 的各元素
+    堆叠在一起的结果，其中每个分片都由 ``devices`` 中对应条目
+    所指定的物理设备内存支撑。
 
   Examples:
-    Passing a list of arrays for ``shards`` results in a sharded array
-    containing a stacked version of the inputs:
+    为 ``shards`` 传入一个数组列表，会得到一个分片数组，
+    其中包含把各输入堆叠起来的结果：
 
     >>> import jax
     >>> devices = jax.local_devices()
@@ -2425,9 +2371,9 @@ def device_put_sharded(shards: Sequence[Any], devices: Sequence[xc.Device]):  # 
     >>> np.allclose(y, jax.numpy.stack(x))  # doctest: +SKIP
     True
 
-    Passing a list of nested container objects with arrays at the leaves for
-    ``shards`` corresponds to stacking the shards at each leaf. This requires
-    all entries in the list to have the same tree structure:
+    为 ``shards`` 传入一个列表，其中元素是叶子为数组的嵌套容器对象，
+    这对应于在每个叶子上分别堆叠分片。这要求列表中的所有条目
+    都具有相同的树结构：
 
     >>> x = [(i, jax.numpy.arange(i, i + 4)) for i in range(len(devices))]
     >>> y = jax.device_put_sharded(x, devices)  # doctest: +SKIP
@@ -2444,8 +2390,8 @@ def device_put_sharded(shards: Sequence[Any], devices: Sequence[xc.Device]):  # 
     - device_put
     - device_put_replicated
   """
-  # TODO(jakevdp): provide a default for devices that considers both local
-  # devices and pods
+  # TODO(jakevdp): 为 devices 提供一个默认值，
+  # 该默认值同时考虑本地设备和 pod
   if not isinstance(shards, Sequence):
     raise TypeError("device_put_sharded `shards` input must be a sequence; "
                      f"got {type(shards)}")
@@ -2478,24 +2424,24 @@ def device_put_sharded(shards: Sequence[Any], devices: Sequence[xc.Device]):  # 
 
 
 def device_put_replicated(x: Any, devices: Sequence[xc.Device]):  # noqa: F811
-  """Transfer array(s) to each specified device and form Array(s).
+  """把数组传输到每一个指定设备并组成 Array。
 
   Args:
-    x: an array, scalar, or (nested) standard Python container thereof
-      representing the array to be replicated to form the output.
-    devices: A sequence of :py:class:`Device` instances representing the devices
-      to which ``x`` will be transferred.
+    x: 一个数组、标量或它们的（嵌套）标准 Python 容器，
+      表示要复制多份以构成输出的数组。
+    devices: 一个由 :py:class:`Device` 实例构成的序列，
+      表示 ``x`` 将被传输到的那些设备。
 
-  This function is always asynchronous, i.e. returns immediately.
+  该函数始终是异步的，也就是说它会立即返回。
 
   Returns:
-    An Array or (nested) Python container thereof representing the
-    value of ``x`` broadcasted along a new leading axis of size
-    ``len(devices)``, with each slice along that new leading axis backed by
-    memory on the device specified by the corresponding entry in ``devices``.
+    一个 Array 或它的（嵌套）Python 容器，表示把 ``x`` 的值沿一个
+    大小为 ``len(devices)`` 的新前导轴广播后的结果，其中沿该新前导轴的
+    每个切片都由 ``devices`` 中对应条目所指定的设备上的
+    内存支撑。
 
   Examples:
-    Passing an array:
+    传入一个数组：
 
     >>> import jax
     >>> devices = jax.local_devices()
@@ -2528,17 +2474,17 @@ def device_put_replicated(x: Any, devices: Sequence[xc.Device]):  # noqa: F811
     return tree_map(_device_put_replicated, x)
 
 
-# TODO(mattjj): consider revising
+# TODO(mattjj): 考虑修订
 def _device_get(x):
   if isinstance(x, core.Tracer):
     return x
 
-  # Extended dtypes dispatch via their device_get rule.
+  # 扩展数据类型通过它们各自的 device_get 规则进行分派。
   if isinstance(x, basearray.Array) and dtypes.issubdtype(x.dtype, dtypes.extended):
     bufs, tree = tree_util.dispatch_registry.flatten(x)
     return tree.unflatten(device_get(bufs))
 
-  # Other types dispatch via their __array__ method.
+  # 其他类型通过它们的 __array__ 方法进行分派。
   try:
     toarray = x.__array__
   except AttributeError:
@@ -2547,27 +2493,27 @@ def _device_get(x):
     return toarray()
 
 def device_get(x: Any):
-  """Transfer ``x`` to host.
+  """把 ``x`` 传输到主机。
 
-  If ``x`` is a pytree, then the individual buffers are copied in parallel.
+  如果 ``x`` 是一个 pytree，那么各个缓冲区会被并行复制。
 
   Args:
-    x: An array, scalar, Array or (nested) standard Python container thereof
-      representing the array to be transferred to host.
+    x: 一个数组、标量、Array 或它们的（嵌套）标准 Python 容器，
+      表示要传输到主机的数组。
 
   Returns:
-    An array or (nested) Python container thereof representing the
-    value of ``x``.
+    一个数组或它的（嵌套）Python 容器，
+    表示 ``x`` 的值。
 
   Examples:
-    Passing a Array:
+    传入一个 Array：
 
     >>> import jax
     >>> x = jax.numpy.array([1., 2., 3.])
     >>> jax.device_get(x)
     array([1., 2., 3.], dtype=float32)
 
-    Passing a scalar (has no effect):
+    传入一个标量（不会有任何效果）：
 
     >>> jax.device_get(1)
     1
@@ -2588,38 +2534,38 @@ def device_get(x: Any):
 
 @partial(api_boundary, repro_api_name="jax.eval_shape")
 def eval_shape(fun: Callable, *args, **kwargs):
-  """Compute the shape/dtype of ``fun`` without any FLOPs.
+  """在不执行任何 FLOP 的情况下计算 ``fun`` 的形状/数据类型。
 
-  This utility function is useful for performing shape inference. Its
-  input/output behavior is defined by::
+  这个工具函数可用于进行形状推断。它的输入/输出行为
+  由下式定义::
 
     def eval_shape(fun, *args, **kwargs):
       out = fun(*args, **kwargs)
       return jax.tree_util.tree_map(jax.ShapeDtypeStruct.like, out)
 
-  But instead of applying ``fun`` directly, which might be expensive, it uses
-  JAX's abstract interpretation machinery to evaluate the shapes without doing
-  any FLOPs.
+  但它并不直接应用可能开销很大的 ``fun``，而是使用 JAX 的
+  抽象解释机制来求值形状，
+  完全不执行任何 FLOP。
 
-  Using :py:func:`eval_shape` can also catch shape errors, and will raise same
-  shape errors as evaluating ``fun(*args, **kwargs)``.
+  使用 :py:func:`eval_shape` 还能捕获形状错误，它会抛出与求值
+  ``fun(*args, **kwargs)`` 相同的形状错误。
 
   Args:
-    fun: The function whose output shape should be evaluated.
-    *args: a positional argument tuple of arrays, scalars, or (nested) standard
-      Python containers (tuples, lists, dicts, namedtuples, i.e. pytrees) of
-      those types. Since only the ``shape`` and ``dtype`` attributes are
-      accessed, one can use :class:`jax.ShapeDtypeStruct` or another container
-      that duck-types as ndarrays (note however that duck-typed objects cannot
-      be namedtuples because those are treated as standard Python containers).
-    **kwargs: a keyword argument dict of arrays, scalars, or (nested) standard
-      Python containers (pytrees) of those types. As in ``args``, array values
-      need only be duck-typed to have ``shape`` and ``dtype`` attributes.
+    fun: 需要求值其输出形状的函数。
+    *args: 一个位置参数元组，其中的元素是数组、标量，或这些类型的
+      （嵌套）标准 Python 容器（元组、列表、字典、具名元组，即 pytree）。
+      由于只会访问 ``shape`` 和 ``dtype`` 属性，因此可以使用
+      :class:`jax.ShapeDtypeStruct` 或另一个鸭子类型化为 ndarray 的
+      容器（不过请注意，鸭子类型化的对象不能是具名元组，
+      因为具名元组会被当作标准 Python 容器处理）。
+    **kwargs: 一个关键字参数字典，其中的值是数组、标量，或这些类型的
+      （嵌套）标准 Python 容器（pytree）。与 ``args`` 中一样，数组值
+      只需按鸭子类型化方式具有 ``shape`` 和 ``dtype`` 属性即可。
 
   Returns:
-    out: a nested PyTree containing :class:`jax.ShapeDtypeStruct` objects as leaves.
+    out: 一个嵌套的 PyTree，其叶子是 :class:`jax.ShapeDtypeStruct` 对象。
 
-  For example:
+  例如：
 
   >>> import jax
   >>> import jax.numpy as jnp
@@ -2633,8 +2579,8 @@ def eval_shape(fun: Callable, *args, **kwargs):
   >>> print(out.dtype)
   float32
 
-  All arguments passed via :func:`eval_shape` will be treated as dynamic;
-  static arguments can be included via closure, for example using :func:`functools.partial`:
+  通过 :func:`eval_shape` 传入的所有参数都会被当作动态参数；
+  静态参数可以通过闭包引入，例如使用 :func:`functools.partial`：
 
   >>> import jax
   >>> from jax import lax
@@ -2664,28 +2610,28 @@ def named_call[F: Callable](
     *,
     name: str | None = None,
 ) -> F:
-  """Adds a user specified name to a function when staging out JAX computations.
+  """在暂存 JAX 计算时给函数加上用户指定的名字。
 
-  When staging out computations for just-in-time compilation to XLA (or other
-  backends such as TensorFlow) JAX runs your Python program but by default does
-  not preserve any of the function names or other metadata associated with it.
-  This can make debugging the staged out (and/or compiled) representation of
-  your program complicated because there is limited context information for each
-  operation being executed.
+  在为即时编译到 XLA（或 TensorFlow 等其他后端）而暂存计算时，
+  JAX 会运行你的 Python 程序，但默认情况下它不会保留
+  任何函数名或与这些函数关联的其他元数据。
+  这会让调试程序的已暂存（和/或已编译）表示变得复杂，
+  因为对每个正在执行的操作而言，
+  可用的上下文信息都非常有限。
 
-  `named_call` tells JAX to stage the given function out as a subcomputation
-  with a specific name. When the staged out program is compiled with XLA these
-  named subcomputations are preserved and show up in debugging utilities like
-  the TensorFlow Profiler in TensorBoard. Names are also preserved when staging
-  out JAX programs to TensorFlow using :func:`experimental.jax2tf.convert`.
+  `named_call` 让 JAX 把给定的函数暂存为一个具有特定名字的子计算。
+  当暂存出的程序用 XLA 编译时，这些具名子计算会被保留，
+  并出现在 TensorBoard 的 TensorFlow Profiler 等调试工具中。
+  在使用 :func:`experimental.jax2tf.convert` 把 JAX 程序暂存到
+  TensorFlow 时，名字同样会被保留。
 
   Args:
-    fun: Function to be wrapped. This can be any Callable.
-    name: Optional. The prefix to use to name all sub computations created
-      within the name scope. Use the fun.__name__ if not specified.
+    fun: 要被包装的函数。它可以是任何 Callable。
+    name: 可选。用于为名字作用域内创建的所有子计算命名的前缀。
+      如果未指定，则使用 ``fun.__name__``。
 
   Returns:
-    A version of ``fun`` that is wrapped in a ``named_scope``.
+    一个被包装在 ``named_scope`` 中的 ``fun`` 版本。
   """
   if name is None:
     name = fun.__name__
@@ -2696,32 +2642,32 @@ def named_call[F: Callable](
 def named_scope(
     name: str,
   ) -> source_info_util.ExtendNameStackContextManager:
-  """A context manager that adds a user specified name to the JAX name stack.
+  """一个上下文管理器，把用户指定的名字加入 JAX 的名字栈。
 
-  When staging out computations for just-in-time compilation to XLA (or other
-  backends such as TensorFlow) JAX does not, by default, preserve the names
-  (or other source metadata) of Python functions it encounters.
-  This can make debugging the staged out (and/or compiled) representation of
-  your program complicated because there is limited context information for each
-  operation being executed.
+  在为即时编译到 XLA（或 TensorFlow 等其他后端）而暂存计算时，
+  JAX 默认不会保留它所遇到的 Python 函数的名字
+  （或其他源码元数据）。
+  这会让调试程序的已暂存（和/或已编译）表示变得复杂，
+  因为对每个正在执行的操作而言，
+  可用的上下文信息都非常有限。
 
-  ``named_scope`` tells JAX to stage the given function with additional
-  annotations on the underlying operations. JAX internally keeps track of these
-  annotations in a name stack. When the staged out program is compiled with XLA
-  these annotations are preserved and show up in debugging utilities like the
-  TensorFlow Profiler in TensorBoard. Names are also preserved when staging out
-  JAX programs to TensorFlow using :func:`experimental.jax2tf.convert`.
+  ``named_scope`` 让 JAX 在暂存给定函数时，给底层操作加上额外的注解。
+  JAX 内部会在一个名字栈中记录这些注解。
+  当暂存出的程序用 XLA 编译时，这些注解会被保留，
+  并出现在 TensorBoard 的 TensorFlow Profiler 等调试工具中。
+  在使用 :func:`experimental.jax2tf.convert` 把 JAX 程序暂存到
+  TensorFlow 时，名字同样会被保留。
 
 
   Args:
-    name: The prefix to use to name all operations created within the name
-      scope.
+    name: 用于为在名字作用域内创建的所有操作
+      命名的前缀。
   Yields:
-    Yields ``None``, but enters a context in which `name` will be appended to
-    the active name stack.
+    产出 ``None``，但会进入一个上下文，在该上下文中 `name`
+    会被追加到当前活动的名字栈上。
 
   Examples:
-    ``named_scope`` can be used as a context manager inside compiled functions:
+    ``named_scope`` 可以在已编译函数内部用作上下文管理器：
 
     >>> import jax
     >>>
@@ -2732,7 +2678,7 @@ def named_scope(
     ...   with jax.named_scope("activation"):
     ...     return jax.nn.relu(logits)
 
-    It can also be used as a decorator:
+    它也可以用作装饰器：
 
     >>> @jax.jit
     ... @jax.named_scope("layer")
@@ -2745,19 +2691,19 @@ def named_scope(
   return source_info_util.extend_name_stack(name)
 
 def effects_barrier():
-  """Waits until existing functions have completed any side-effects."""
+  """等待已有的函数完成它们的副作用。"""
   dispatch.runtime_tokens.block_until_ready()
 
 def block_until_ready(x):
   """
-  Tries to call a ``block_until_ready`` method on pytree leaves.
+  尝试在 pytree 的叶子上调用 ``block_until_ready`` 方法。
 
   Args:
-    x: a pytree, usually with at least some JAX array instances at its leaves.
+    x: 一个 pytree，通常它的叶子中至少有一些是 JAX 数组实例。
 
   Returns:
-    A pytree with the same structure and values of the input, where the values
-    of all JAX array leaves are ready.
+    一个与输入具有相同结构和值的 pytree，
+    其中所有 JAX 数组叶子的值都已就绪。
   """
   def try_to_block(x):
     try:
@@ -2773,32 +2719,32 @@ def block_until_ready(x):
       try_to_block(leaf)
 
   if not arrays:
-    # `arrays` will be empty if tree_leaves(x) is empty or all leaves are not
-    # jax.Array.
+    # 如果 tree_leaves(x) 为空，或者所有叶子都不是 jax.Array，
+    # 那么 `arrays` 会是空的。
     pass
   elif len(arrays) == 1:
-    # Fast path for single array.
+    # 单个数组的快速路径。
     try_to_block(arrays[0])
   else:
-    # Optimized for multiple arrays.
+    # 为多个数组优化的路径。
     xc.batched_block_until_ready(arrays)
 
   return x
 
 def copy_to_host_async(x):
   """
-  Tries to call a ``copy_to_host_async`` method on pytree leaves.
+  尝试在 pytree 的叶子上调用 ``copy_to_host_async`` 方法。
 
-  For each leaf this method will try to call the ``copy_to_host_async`` method
-  on the leaf. If the leaf is not a JAX array, or if the leaf does not have a
-  ``copy_to_host_async`` method, then this method will do nothing to the leaf.
+  对每个叶子，该方法都会尝试在叶子上调用 ``copy_to_host_async`` 方法。
+  如果该叶子不是 JAX 数组，或者该叶子没有 ``copy_to_host_async`` 方法，
+  那么该方法不会对这个叶子做任何事。
 
   Args:
-    x: a pytree, usually with at least some JAX array instances at its leaves.
+    x: 一个 pytree，通常它的叶子中至少有一些是 JAX 数组实例。
 
   Returns:
-    A pytree with the same structure and values of the input, where the host
-    copy of the values of all JAX array leaves are started.
+    一个与输入具有相同结构和值的 pytree，
+    其中所有 JAX 数组叶子值的主机副本都已被启动复制。
   """
   for leaf in tree_leaves(x):
     try:
@@ -2813,7 +2759,7 @@ def copy_to_host_async(x):
 
 def clear_backends(_crash=False):
   """
-  Clear all backend clients so that new backend clients can be created later.
+  清除所有后端客户端，以便之后可以创建新的后端客户端。
   """
   clients = []
   if config.debug_leaked_clients_on_clear_backends.value:
@@ -2831,9 +2777,9 @@ def clear_backends(_crash=False):
   _jax.PjitFunctionCache.clear_all()
 
   if clients:
-    # GC a couple times because there are false cycles that seem to be due
-    # to captured stack traces in exceptions raised during testing.
-    # TODO(parkers): Figure out how to make this a single gc.collect() call.
+    # 垃圾回收几次，因为存在一些假循环，它们似乎是由测试期间
+    # 抛出的异常中所捕获的堆栈回溯造成的。
+    # TODO(parkers): 想办法把它变成一次 gc.collect() 调用。
     for _ in range(4):
       gc.collect()
     for r in clients:
@@ -2850,27 +2796,27 @@ def clean_up():
     clear_backends(_crash=True)
   clear_caches()
 
-  # Shut down distributed system if it exists. Otherwise, this is a no-op.
+  # 如果分布式系统存在就关闭它。否则这是一个空操作。
   distributed.shutdown()
 
 
 def live_arrays(platform=None):
-  """Return all live arrays in the backend for `platform`.
+  """返回后端中 `platform` 上的所有存活数组。
 
-  If platform is None, it is the default backend.
+  若 platform 为 None，则指默认后端。
   """
   return xb.get_backend(platform).live_arrays()
 
 def clear_caches():
-  """Clear all compilation and staging caches.
+  """清空所有编译缓存与暂存缓存。
 
-  This doesn't clear the persistent cache; to disable it (e.g. for benchmarks),
-  set the jax_enable_compilation_cache config option to False.
+  这不会清空持久化缓存；若要在基准测试等场景中禁用它，
+  请把 jax_enable_compilation_cache 配置项设为 False。
   """
-  # Clear all lu.cache, util.cache and util.weakref_lru_cache instances
-  # (used for staging and Python-dispatch compiled executable caches).
+  # 清空所有 lu.cache、util.cache 与 util.weakref_lru_cache 实例
+  # （用于暂存阶段以及 Python 分派的已编译可执行文件缓存）。
   util.clear_all_caches()
-  # Clear all C++ compiled executable caches for pjit
+  # 清空 pjit 的所有 C++ 已编译可执行文件缓存
   pjit._cpp_pjit_cache_fun_only.clear()
   pjit._cpp_pjit_cache_explicit_attributes.clear()
   _jax.PjitFunctionCache.clear_all()

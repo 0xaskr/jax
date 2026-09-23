@@ -11,8 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：为 Jaxpr 中间表示（IR）提供遍历、统计与导出工具。
+# 它可遍历 jaxpr（含嵌套子 jaxpr）中的方程，并按原语、源位置、输出形状等维度汇总计数，
+# 也能分析每个变量的定义点与引用点，以及找出使用某个变量的叶子方程。
+# 还能按 Python 栈回溯聚合方程数量，生成可用 pprof 可视化的 profile，
+# 从而定位是哪些 Python 代码产生了大量方程；此外按 `JAX_DUMP_IR_TO` 等配置
+# 把 jaxpr 转储为文本、HTML 或 pprof，其中 `jaxpr_to_html` 渲染出可交互的单文件 HTML。
 
-"""Utilities for the Jaxpr IR."""
+"""Jaxpr IR 的工具函数。"""
 
 from __future__ import annotations
 
@@ -167,9 +173,9 @@ def _pprof_profile(
     sample_unit: str,
     comment: str = "",
 ) -> bytes:
-  """Converts a profile into a compressed pprof protocol buffer.
+  """把 profile 转换为压缩的 pprof 协议缓冲区。
 
-  The input profile is a map from (traceback, primitive) pairs to counts.
+  输入的 profile 是从 (回溯, 原语) 对到计数的映射。
   """
   s: defaultdict[str, int]
   func: defaultdict[types.CodeType, int]
@@ -220,9 +226,9 @@ def _pprof_profile(
         "filename": s[filename],
         "start_line": code.co_firstlineno,
     })
-  # This is the JSON encoding of a pprof profile protocol buffer. See:
-  # https://github.com/google/pprof/blob/master/proto/profile.proto for a
-  # description of the format.
+  # 这是 pprof profile 协议缓冲区的 JSON 编码。
+  # 该格式的说明见：
+  # https://github.com/google/pprof/blob/master/proto/profile.proto
   sample_type_id = s[sample_type]
   sample_unit_id = s[sample_unit]
   comment_id = s[comment]
@@ -239,19 +245,19 @@ def _pprof_profile(
 
 def pprof_equation_profile(jaxpr: core.Jaxpr, *,
                            workspace_root: str | None = None) -> bytes:
-  """Generates a pprof profile that maps jaxpr equations to Python stack traces.
+  """生成把 jaxpr 方程映射到 Python 栈回溯的 pprof profile。
 
-  By visualizing the profile using pprof, one can identify Python code that is
-  responsible for yielding large numbers of jaxpr equations.
+  用 pprof 可视化该 profile，就能定位到哪些 Python 代码
+  产生了大量 jaxpr 方程。
 
   Args:
-    jaxpr: a Jaxpr.
-    workspace_root: the root of the workspace. If specified, function names
-      will be fully qualified, with respect to the workspace root.
+    jaxpr: 一个 Jaxpr。
+    workspace_root: 工作区的根目录。若指定，函数名将相对于
+      工作区根目录给出完整限定名。
 
   Returns:
-    A gzip-compressed pprof Profile protocol buffer, suitable for passing to
-    pprof tool for visualization.
+    一个经 gzip 压缩的 pprof Profile 协议缓冲区，可直接传给
+    pprof 工具做可视化。
   """
   d = Counter(
       (tb, eqn.primitive)
@@ -274,12 +280,12 @@ def pprof_equation_profile(jaxpr: core.Jaxpr, *,
 
 
 def eqns_using_var_with_invar_index(jaxpr: core.Jaxpr, invar: core.Var) -> Iterator[tuple[core.JaxprEqn, int]]:
-  """Find all the equations which use invar and the positional index of its binder"""
+  """查找所有使用 `invar` 的方程，以及该变量绑定者的位置下标"""
   for eqn in jaxpr.eqns:
     for invar_index, eqn_var in enumerate(eqn.invars):
       if eqn_var == invar:
         yield eqn, invar_index
-        break # we found the var, no need to keep looking in this eqn
+        break # 已找到该变量，无需在本次方程中继续查找
 
 def jaxpr_and_binder_in_params(params, index: int) -> Iterator[tuple[core.Jaxpr, core.Var]]:
   for val in params.values():
@@ -295,14 +301,14 @@ def jaxpr_and_binder_in_params(params, index: int) -> Iterator[tuple[core.Jaxpr,
         yield v, v.invars[index]
 
 def eqns_using_var(jaxpr: core.Jaxpr, invar: core.Var) -> Iterator[core.JaxprEqn]:
-  """Find the leaf equations using a variable"""
-  # The complexity of this call is because the invar might originate from a nested jaxpr
+  """查找使用某个变量的叶子方程"""
+  # 这里的复杂度来自：`invar` 可能源自某个嵌套的 jaxpr
   for eqn, invar_index in eqns_using_var_with_invar_index(jaxpr, invar):
     if (child_jaxprs_and_vars := tuple(jaxpr_and_binder_in_params(eqn.params, invar_index))):
       for (jaxpr, invar) in child_jaxprs_and_vars:
         yield from eqns_using_var(jaxpr, invar)
     else:
-      # if the previous condition fails, there is no deeper jaxpr to explore =(
+      # 若上面的条件不成立，说明没有更深层的 jaxpr 可继续探索 =(
       yield eqn
 
 
@@ -311,17 +317,17 @@ _jaxpr_id_counter = itertools.count()
 def maybe_dump_jaxpr_to_file(
     fun_name: str, jaxpr: core.Jaxpr
 ) -> str | None:
-  """Maybe dumps the `jaxpr` to a file.
+  """视情况把 `jaxpr` 转储到文件。
 
-  Dumps the jaxpr if JAX_DUMP_JAXPR_TO is defined.
+  若定义了 `JAX_DUMP_JAXPR_TO`，则转储该 jaxpr。
 
   Args:
-    fn: The name of the function whose jaxpr is being dumped.
-    jaxpr: The jaxpr to dump.
+    fn: 其 jaxpr 正被转储的函数的名称。
+    jaxpr: 要转储的 jaxpr。
 
   Returns:
-    The path to the file where the jaxpr was dumped, or None if no file was
-    dumped.
+    转储 jaxpr 时所在的文件路径；若未转储文件，
+    则返回 None。
   """
   if not (out_dir := path.make_jax_dump_dir(config.jax_dump_ir_to.value)):
     return None
@@ -355,9 +361,9 @@ def maybe_dump_jaxpr_to_file(
 
 
 def jaxpr_to_html(jaxpr: core.Jaxpr) -> str:
-  """Renders a Jaxpr as HTML with interactive tracebacks and search."""
+  """把 Jaxpr 渲染为带交互式回溯与搜索功能的 HTML。"""
 
-  # 1. Render jaxpr to string and get source map
+  # 1. 把 jaxpr 渲染成字符串并取得源映射
   source_map_output: list[list[tuple[int, int, Any]]] = []
   rendered_str = jaxpr.pretty_print(
       source_map=source_map_output,
@@ -366,7 +372,7 @@ def jaxpr_to_html(jaxpr: core.Jaxpr) -> str:
       separable_lines=True,
   )
 
-  # 2. Process source map and build traceback DAG
+  # 2. 处理源映射并构建回溯 DAG
   raw_frame_to_idx: dict[tuple[types.CodeType, int], int] = {}
   dag_nodes: list[dict[str, int | None]] = []
   node_to_idx: dict[tuple[int, int | None], int] = {}
@@ -397,7 +403,7 @@ def jaxpr_to_html(jaxpr: core.Jaxpr) -> str:
     code, lasti = tb.raw_frames()
 
     parent_node_idx = None
-    # raw_frames gives inner to outer. We iterate from outer to inner.
+    # `raw_frames` 的顺序是从内到外，这里从外到内遍历。
     for i in reversed(range(len(code))):
       frame_idx = get_frame_idx(code[i], lasti[i])
       parent_node_idx = get_node_idx(frame_idx, parent_node_idx)
@@ -405,14 +411,14 @@ def jaxpr_to_html(jaxpr: core.Jaxpr) -> str:
     tb_to_node_idx[tb] = parent_node_idx
     return parent_node_idx
 
-  # 3. Generate HTML lines with spans
+  # 3. 生成带 span 的 HTML 行
   lines = rendered_str.splitlines()
   html_lines = []
   line_to_nodes = defaultdict(set)
 
   for i, line in enumerate(lines):
     spans = source_map_output[i] if i < len(source_map_output) else []
-    # Sort spans by start column
+    # 按起始列对 span 排序
     spans.sort(key=lambda x: x[0])
 
     result = []
@@ -436,7 +442,7 @@ def jaxpr_to_html(jaxpr: core.Jaxpr) -> str:
 
     html_lines.append("".join(result))
 
-  # 4. Convert raw frames to final Frame representations with string pooling
+  # 4. 借助字符串池把原始帧转换为最终的 Frame 表示
   final_frames = []
   string_to_idx: dict[str, int] = {}
 
@@ -460,7 +466,7 @@ def jaxpr_to_html(jaxpr: core.Jaxpr) -> str:
         "col": frame.start_column,
     })
 
-  # 5. Build string_to_lines map
+  # 5. 构建 string_to_lines 映射
   string_to_lines = defaultdict(set)
   for i, node_indices in line_to_nodes.items():
     for node_idx in node_indices:
@@ -472,7 +478,7 @@ def jaxpr_to_html(jaxpr: core.Jaxpr) -> str:
         string_to_lines[frame_data["func_idx"]].add(i)
         curr = node["parent"]
 
-  # 5. Construct final HTML and compress data
+  # 5. 组装最终 HTML 并压缩数据
 
   data = {
       "frames": final_frames,

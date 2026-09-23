@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：注册 Python / NumPy 各种类型到 JAX 抽象值（aval）的映射，并转发
+# `core` 中的抽象数组设施（`ShapedArray`、`AbstractToken`、`canonicalize_shape`）。
+# 这里为 numpy 标量、numpy 数组、Python 内建标量、typed scalar 等注册
+# `core.pytype_aval_mappings`，同时收集可字面化的类型集合供后续追踪与常量化使用。
+# 它还让 numpy 掩码数组（masked array）在作为 JAX 函数输入时直接抛出错误，
+# 从而在追踪入口处给出清晰的失败信息。
+
 from __future__ import annotations
 
 import numpy as np
@@ -83,8 +90,8 @@ _int32_max = np.iinfo(np.int32).max
 _int64_min = np.iinfo(np.int64).min
 _int64_max = np.iinfo(np.int64).max
 
-# Note: all python scalar types are weak except bool, because bool only
-# comes in a single width.
+# 注意：除 `bool` 之外，所有 Python 标量类型都是弱类型，
+# 因为 `bool` 只有一种宽度。
 _bool_aval = ShapedArray((), dtype=np.dtype(bool))
 _int32_aval = ShapedArray((), dtype=np.dtype(np.int32), weak_type=True)
 _int64_aval = ShapedArray((), dtype=np.dtype(np.int64), weak_type=True)

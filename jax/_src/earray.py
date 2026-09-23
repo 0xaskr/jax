@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 `EArray`，一种可承载扩展数据类型（extended dtype）的数组类型。
+# 它在 `basearray.Array` 之上包一层逻辑抽象值（aval），把 `shape`、`dtype`
+# 等属性转发给 aval，把设备、缓冲区等物理属性转发给底层数据。
+# 同时注册 `EArray` 的分片参数处理器、pytype 到 aval 的映射以及 pytree 节点，
+# 使扩展数据类型能像普通数组一样参与分派、分片与 pytree 扁平化。
+
 from __future__ import annotations
 
 import math
@@ -27,7 +33,7 @@ from jax._src.util import safe_zip, safe_map
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
 
-# EArray is an Array that can contain extended dtypes.
+# `EArray` 是一种可以承载扩展数据类型的 `Array`。
 class EArray(basearray.Array):
   __slots__ = ['_aval', '_data']
   __hash__ = None
@@ -58,11 +64,11 @@ class EArray(basearray.Array):
     if self.ndim == 0: raise TypeError('iteration over a 0-d array')
     raise NotImplementedError
 
-  # forward to aval
+  # 转发给 aval
   shape = property(lambda self: self.aval.shape)
   dtype = property(lambda self: self.aval.dtype)
 
-  # computed from shape and dtype
+  # 由形状和数据类型计算得到
   ndim = property(lambda self: len(self.aval.shape))
   size = property(lambda self: math.prod(self.aval.shape))
   itemsize = property(lambda self: self.aval.dtype.itemsize)
@@ -70,7 +76,7 @@ class EArray(basearray.Array):
     if self.ndim == 0: raise TypeError('len() of unsized object')
     return self.shape[0]
 
-  # forward to self._data
+  # 转发给 self._data
   devices = property(lambda self: self._data.devices)  # pyrefly: ignore[bad-override]
   _committed = property(lambda self: self._data._committed)
   is_fully_addressable = property(lambda self: self._data.is_fully_addressable)
@@ -80,7 +86,7 @@ class EArray(basearray.Array):
   on_device_size_in_bytes = property(lambda self: self._data.on_device_size_in_bytes)  # pyrefly: ignore[bad-override]
   unsafe_buffer_pointer = property(lambda self: self._data.unsafe_buffer_pointer)  # pyrefly: ignore[bad-override]
 
-  # defer to extended dtype rules
+  # 交由扩展数据类型规则处理
   @property
   def sharding(self):
     phys_sharding = self._data.sharding
@@ -96,7 +102,7 @@ class EArray(basearray.Array):
       return self._data.device
     return self.sharding
 
-  # TODO(mattjj): not implemented below here, need more methods from ArrayImpl
+  # TODO(mattjj): 以下尚未实现，还需要 `ArrayImpl` 中的更多方法
 
   def addressable_data(self, index: int) -> EArray:
     raise NotImplementedError
@@ -115,7 +121,7 @@ def _earray_shard_arg_handler(xs, shardings, layouts, copy_semantics):
   arrs = [x._data for x in xs]
   phys_shardings = [sharding_impls.physical_sharding(x.aval, sharding)
                     for x, sharding in zip(xs, shardings)]
-  # TODO(yashkatariya): `layouts` should be converted to physical layouts.
+  # TODO(yashkatariya): `layouts` 应当被转换为物理布局。
   return pxla.shard_args(phys_shardings, layouts, copy_semantics, arrs)
 pxla.shard_arg_handlers[EArray] = _earray_shard_arg_handler
 

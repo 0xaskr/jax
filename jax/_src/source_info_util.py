@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：定义 JAX 的 `SourceInfo` 机制，记录「是哪段用户代码触发了这次 JAX 操作」。
+# 它从 Python 栈回溯中筛出用户帧（过滤 JAX 自身与标准库），维护可嵌套的命名栈
+# （`NameStack`，元素为作用域 `Scope` 与变换 `Transform`），并通过线程局部的上下文
+# 在变换与追踪过程中传播来源信息，供错误信息与 XLA 降级的来源标注使用。
+# `UserContextManager` 还会在异常发生时把变换前的用户栈回溯挂到异常链上，便于定位错误来源。
+
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterator
@@ -44,18 +50,18 @@ class Frame(NamedTuple):
 
 
 _exclude_paths: list[str] = [
-    # Attach the separator to make sure that .../jax does not end up matching
-    # .../jax_triton and other packages that might have a jax prefix.
+    # 附带路径分隔符，确保 .../jax 不会匹配到
+    # .../jax_triton 以及其他可能带 jax 前缀的包。
     os.path.dirname(os.path.dirname(__file__)) + os.sep,
-    # Also exclude stdlib as user frames. In a non-standard Python runtime,
-    # the following may be different.
+    # 同时把标准库排除在用户帧之外。在非标准 Python 运行时中，
+    # 下面的结果可能不同。
     sysconfig.get_path('stdlib'),
     os.path.dirname(contextlib.__file__),
 ]
 
 @functools.cache
 def _exclude_path_regex() -> re.Pattern[str]:
-  # The regex below would not handle an empty set of exclusions correctly.
+  # 下面的正则无法正确处理空的排除集合。
   assert len(_exclude_paths) > 0
   return re.compile('|'.join(f'^{re.escape(path)}' for path in _exclude_paths))
 
@@ -66,7 +72,7 @@ def register_exclusion(path: str):
   is_user_filename.cache_clear()
 
 
-# Explicit inclusions take priority over exclude paths.
+# 显式包含的路径优先于排除路径。
 _include_paths: list[str] = []
 
 @functools.cache
@@ -137,7 +143,7 @@ class SourceInfo:
   traceback: Traceback | None
   name_stack: NameStack
 
-  # It's slightly faster to use a class with __slots__ than a NamedTuple.
+  # 使用带 __slots__ 的类比 NamedTuple 略快一些。
   __slots__ = ['traceback', 'name_stack']
 
   def __init__(self, traceback: Traceback | None, name_stack: NameStack):
@@ -156,7 +162,7 @@ def new_source_info() -> SourceInfo:
 
 @functools.cache
 def is_user_filename(filename: str) -> bool:
-  """Heuristic that guesses the identity of the user's code in a stack trace."""
+  """启发式地猜测栈回溯中哪些是用户代码。"""
   return (_include_path_regex().search(filename) is not None
           or _exclude_path_regex().search(filename) is None)
 
@@ -171,13 +177,13 @@ def raw_frame_to_frame(code: types.CodeType, lasti: int) -> Frame:
 
 
 def user_frames(traceback: Traceback | None) -> Iterator[Frame]:
-  """Iterator over the user's frames, filtering jax-internal frames."""
-  # Guess the user's frame is the innermost frame not in the jax source tree or
-  # Python stdlib. We don't use traceback_util.path_starts_with because that
-  # incurs filesystem access, which may be slow; we call this function when
-  # e.g. adding source provenance annotations to XLA lowerings, so we don't
-  # want to incur the cost. We consider files that end with _test.py as user
-  # frames, to allow testing this mechanism from tests.
+  """遍历用户帧的迭代器，会过滤掉 jax 内部的帧。"""
+  # 猜测用户帧：不在 jax 源码树或 Python 标准库中的最内层帧。
+  # 我们不使用 traceback_util.path_starts_with，因为它会触发
+  # 文件系统访问，可能很慢；而我们会在诸如为 XLA 降级添加
+  # 源码来源标注时调用这个函数，所以不希望承担这种开销。
+  # 我们把以 _test.py 结尾的文件也视为用户帧，
+  # 以便能够在测试中检验该机制。
   code, lasti = traceback.raw_frames() if traceback else ([], [])
   return (raw_frame_to_frame(code[i], lasti[i]) for i in range(len(code))
           if is_user_filename(code[i].co_filename))
@@ -315,9 +321,9 @@ class SetNameStackContextManager:
 set_name_stack = SetNameStackContextManager
 
 
-# TODO(mattjj,phawkins): figure out why the commented-out reset_name_stack
-# implementation doesn't work. Luckily this context manager isn't called much so
-# the performance shouldn't matter. See blame commit message for repro.
+# TODO(mattjj,phawkins): 弄清楚被注释掉的 reset_name_stack
+# 实现为什么不起作用。好在调用这个上下文管理器的次数不多，
+# 所以性能应该无关紧要。复现方式见 blame 提交信息。
 # reset_name_stack = lambda: SetNameStackContextManager(NameStack())
 @contextlib.contextmanager
 def reset_name_stack() -> Generator[None]:

@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helper for running multi-process tests."""
+# 文件职责：为 JAX 的多进程（多 worker）测试提供统一的启动与协调辅助。
+# 它在主进程里按 flag 指定的数量拉起多个子进程，为每个子进程分配各自的
+# GPU 或 TPU 芯片，并借助 `jax._src.distributed` 初始化控制器与协调服务，
+# 最后收集、汇总各子进程的 stdout/stderr 日志并判定整体成败；
+# 子进程（worker）复用同一入口初始化分布式运行时并执行测试用例。
+# 对外主要暴露 `main()` 入口、`MultiProcessTest` 基类以及一组 absl flags。
+
+"""用于运行多进程测试的辅助工具。"""
 
 import functools
 import os
@@ -68,7 +75,7 @@ EXTRA_TEST_ARGS = absl.flags.DEFINE_multi_string(
     "extra_test_args", [], "Extra flags to pass to worker process."
 )
 
-# For internal use.
+# 仅供内部使用。
 MULTIPROCESS_TEST_WORKER_ID = absl.flags.DEFINE_integer(
     "multiprocess_test_worker_id",
     -1,
@@ -137,9 +144,9 @@ def main(shard_main=None):
 
 
 class GracefulKiller:
-  """Add a signal handler that sets a flag if SIGINT or SIGTERM are caught."""
+  """添加一个信号处理器：捕获到 SIGINT 或 SIGTERM 时设置标志。"""
 
-  # From https://stackoverflow.com/a/31464349
+  # 源自 https://stackoverflow.com/a/31464349
   kill_now = False
 
   def __init__(self):
@@ -152,7 +159,7 @@ class GracefulKiller:
 
 
 def _main(argv, shard_main):
-  # TODO(emilyaf): Enable multiprocess tests on Windows.
+  # TODO(emilyaf): 在 Windows 上启用多进程测试。
   if sys.platform == "win32":
     print("Multiprocess tests are not supported on Windows.")
     return
@@ -182,7 +189,7 @@ def _main(argv, shard_main):
       return shard_main()
     return absltest.main(testLoader=jtu.JaxTestLoader())
 
-  if not argv[0].endswith(".py"):  # Skip the interpreter path if present.
+  if not argv[0].endswith(".py"):  # 若存在解释器路径则跳过。
     argv = argv[1:]
 
   if num_processes is None:
@@ -218,15 +225,15 @@ def _main(argv, shard_main):
       tpu_host_bounds = "4,2,1"
       tpu_chips_per_host_bounds = "1,1,1"
     elif tpu_chips_per_process == 4:
-      # Note: this branch assumes we are using 2x4 v6e LitePod, and will not
-      # work with 4x2 v5e LitePod.
+      # 注意：该分支假定使用的是 2x4 的 v6e LitePod，
+      # 在 4x2 的 v5e LitePod 上无法工作。
       tpu_host_bounds = "1,2,1"
       tpu_chips_per_host_bounds = "2,2,1"
     elif tpu_chips_per_process == 8:
       tpu_host_bounds = "1,1,1"
       tpu_chips_per_host_bounds = "2,4,1"
     else:
-      # TODO(phawkins): implement other cases.
+      # TODO(phawkins): 实现其他情况。
       raise ValueError(
           "Invalid number of TPU chips per worker {}".format(
               tpu_chips_per_process
@@ -249,7 +256,7 @@ def _main(argv, shard_main):
   megascale_coordinator_port = None
 
   if gpus_per_process > 0:
-    # Get the number of GPUs visible to this process without initializing the runtime
+    # 在不初始化运行时的情况下，获取本进程可见的 GPU 数量
     if cuda_versions is not None:
       local_device_count = cuda_versions.cuda_device_count()
       if num_processes * gpus_per_process > local_device_count:
@@ -264,8 +271,8 @@ def _main(argv, shard_main):
   if portpicker is None:
     jax_port = 9876
   else:
-    # TODO(emilyaf): Use a port server if there are flaky port collisions due
-    # to pick_unused_port() racing among tests.
+    # TODO(emilyaf): 如果因各测试间 pick_unused_port() 竞争而出现偶发端口冲突，
+    # 就改用端口服务器。
     portserver_address = os.environ.get("JAX_PORTSERVER_ADDRESS")
     jax_port = portpicker.pick_unused_port(portserver_address=portserver_address)
   subprocesses = []
@@ -277,10 +284,10 @@ def _main(argv, shard_main):
     device_ids = None
     env = os.environ.copy()
 
-    # Note: Fix for rules_python >= 1.7.0 (Strict Hermeticity):
-    # The parent process sees dependencies via sys.path, but modern rules_python
-    # does not export this to PYTHONPATH by default. We must manually propagate
-    # it so child workers can locate dependencies.
+    # 注意：这是针对 rules_python >= 1.7.0（Strict Hermeticity，严格封闭性）的修复：
+    # 父进程通过 sys.path 看到依赖，但新版 rules_python
+    # 默认不会把它导出到 PYTHONPATH。我们必须手动传递，
+    # 以便子工作进程能够定位依赖。
     path_parts = [sys_path, env.get("PYTHONPATH", "")]
     env["PYTHONPATH"] = os.pathsep.join(p for p in path_parts if p)
 
@@ -359,8 +366,8 @@ def _main(argv, shard_main):
 
   print(" All launched, running ".center(80, "="), flush=True)
 
-  # Wait for all the children to finish or for a SIGTERM from bazel. If we get
-  # SIGTERM, we still want to collect their logs, so kill them and continue.
+  # 等待所有子进程结束，或等待来自 bazel 的 SIGTERM。若收到
+  # SIGTERM，我们仍希望收集它们的日志，因此先杀掉它们再继续。
   killer = GracefulKiller()
   running_procs = dict(enumerate(subprocesses))
   while not killer.kill_now and running_procs:
@@ -372,19 +379,19 @@ def _main(argv, shard_main):
   if killer.kill_now and running_procs:
     print("Caught termination, terminating remaining children.", flush=True)
 
-    # Send a SIGTERM to each child process, to let it know it should terminate.
+    # 向每个子进程发送 SIGTERM，通知它应当终止。
     for i, proc in running_procs.items():
       proc.terminate()
       print(f"Process {i} terminated.", flush=True)
 
-    # We give the child process(es) a few seconds for their own cleanup, and
-    # keep the rest (up to 15s) for copying the children logs into our own.
+    # 我们给子进程几秒钟做自身的清理，
+    # 余下时间（最多 15 秒）用于把子进程日志复制到我们自己的输出中。
     time.sleep(5)
 
-    # Send a SIGKILL (a "hard" kill) to each child process. This is CRITICAL:
-    # without it, this process may end up waiting a long time on the proc.wait()
-    # below, and never get to saving the children logs, making test timeouts
-    # very hard to debug.
+    # 向每个子进程发送 SIGKILL（“硬”杀）。这至关重要：若不这样做，
+    # 本进程可能长时间阻塞在下面的 proc.wait() 上，
+    # 以致永远无法保存子进程日志，
+    # 从而使测试超时问题变得非常难以调试。
     for i, proc in running_procs.items():
       proc.kill()
       print(f"Process {i} killed.")
@@ -437,7 +444,7 @@ def _main(argv, shard_main):
 class MultiProcessTest(parameterized.TestCase):
 
   def setUp(self):
-    """Start tests together."""
+    """让各测试一起开始。"""
     super().setUp()
     if xb.process_count() == 1:
       self.skipTest("Test requires multiple processes.")
@@ -445,7 +452,7 @@ class MultiProcessTest(parameterized.TestCase):
         xb.process_count(),
         NUM_PROCESSES.value,
     )
-    # Make sure all processes are at the same test case.
+    # 确保所有进程都处于同一个测试用例。
     client = distributed.global_state.client
     if client is None:
       raise TypeError("client cannot be None")
@@ -463,13 +470,13 @@ class MultiProcessTest(parameterized.TestCase):
         ) from e
 
   def tearDown(self):
-    """End tests together."""
+    """让各测试一起结束。"""
     client = distributed.global_state.client
     if client is None:
       raise TypeError("client cannot be None")
-    # Ensure a shared fate for tests where a subset of processes run different
-    # test assertions (i.e. some processes may pass and some processes fail -
-    # but the overall test should fail).
+    # 对于一部分进程运行不同测试断言的测试，确保它们的命运与共
+    # （即某些进程可能通过、某些进程可能失败，
+    # 但整体测试应当失败）。
     try:
       client.wait_at_barrier(
           f"{self._testMethodName}_end", _BARRIER_TIMEOUT.value * 1000)

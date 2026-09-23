@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：为 XLA 编译缓存生成稳定且可复现的缓存键（cache key）。
+# `get()` 汇集输入 IR、jaxlib 与后端版本、XLA flags、编译选项、
+# 加速器拓扑与压缩算法等条目，逐项哈希后返回 `<模块名>-<sha256>`。
+# 生成前会对 IR 做规范化：清除调试信息、剥离 Mosaic 内核字节码中的
+# 源文件路径与自定义分区回调指针，避免非确定性内容造成缓存未命中。
+# 环境变量与命令行中与编译结果无关的 XLA dump 类 flags 会被排除，
+# GPU 多进程场景下还会剔除设备分配以保证跨进程缓存键一致。
+
 import base64
 import copy
 import hashlib
@@ -36,30 +44,30 @@ logger = logging.getLogger(__name__)
 _extra_flag_prefixes: list[str] = []
 
 def add_flag_prefixes(flag_prefixes: list[str]) -> None:
-  """Add flag prefixes to include in the cache key. Call prior to get().
+  """添加要纳入缓存键的 flag 前缀。请在调用 get() 之前调用。
   """
   global _extra_flag_prefixes
   _extra_flag_prefixes += flag_prefixes
 
 
 def clear_flag_prefixes() -> None:
-  """Clear flag prefixes added by add_flag_prefixes().
+  """清除由 add_flag_prefixes() 添加的 flag 前缀。
   """
   global _extra_flag_prefixes
   _extra_flag_prefixes = []
 
 
 def get_flag_prefixes() -> list[str]:
-  """Return flag prefixes added by add_flag_prefixes().
+  """返回由 add_flag_prefixes() 添加的 flag 前缀。
   """
   return _extra_flag_prefixes
 
 
 def custom_hook() -> str:
-  """Custom hook for any addition to the cache key.
+  """用于向缓存键追加内容的自定义钩子。
 
-  The custom hook will be called every time get() is called and can be
-  defined to return a string that will be hashed into the cache key.
+  每次调用 get() 时都会调用该自定义钩子，可将其定义为返回一个字符串，
+  该字符串会被哈希进缓存键。
   """
   return ""
 
@@ -72,22 +80,22 @@ def get(
     compression_algorithm: str = "zstandard",
     ignore_custom_partitioning: bool = False,
 ) -> str:
-  """Creates a hashed string to use as a key to the compilation cache.
+  """生成一个哈希字符串，用作编译缓存的键。
 
-  Creates a cache key that is a hex-encoded string of a unique hash based on
-  the arguments. The hex-encoded string is 256 characters long.
+  依据各参数创建一个缓存键，它是唯一哈希的十六进制编码字符串。
+  该十六进制编码字符串长度为 256 个字符。
 
   Args:
-    module: the input program
-    devices: an array of accelerator devices that the program will run on
-    compile_options: options passed to the XLA compiler
-    backend: description of the platform (e.g., TPU version)
-    compression_algorithm: a string representing the compression algorithm used
-      for the executable before persisting in the cache
-    ignore_custom_partitioning: whether to remove custom_partitioning callback
-      pointers from the computation.
+    module: 输入程序
+    devices: 程序将在其上运行的加速器设备数组
+    compile_options: 传给 XLA 编译器的选项
+    backend: 平台描述（例如 TPU 版本）
+    compression_algorithm: 表示可执行文件在持久化到缓存之前所用压缩
+      算法的字符串
+    ignore_custom_partitioning: 是否从计算中移除 custom_partitioning
+      回调指针。
 
-  Typical return value example:
+  典型返回值示例：
    'jit__psum-14ac577cdb2ef6d986078b4054cc9893a9a14a16dbb0d8f37b89167c1f1aacdf'
   """
   entries = [
@@ -116,8 +124,8 @@ def get(
           lambda hash_obj: _hash_serialized_compile_options(
               hash_obj,
               compile_options,
-              # In case of GPU multi-process tasks we need to strip device
-              # assignment to use cache key as invariant between processes.
+              # 在 GPU 多进程任务中，需要剔除设备分配，以便把缓存键
+              # 用作各进程之间的不变量。
               strip_device_assignment=(backend.platform == "gpu"),
           ),
       ),
@@ -143,7 +151,7 @@ def get(
 
 def _log_cache_key_hash(hash_obj, last_serialized: str, hashfn):
   if logger.isEnabledFor(logging.DEBUG):
-    # Log the hash of just this entry
+    # 只记录该条目自身的哈希值
     fresh_hash_obj = hashlib.sha256()
     hashfn(fresh_hash_obj)
     logger.debug(
@@ -151,7 +159,7 @@ def _log_cache_key_hash(hash_obj, last_serialized: str, hashfn):
         last_serialized,
         fresh_hash_obj.digest().hex(),
     )
-    # Log the cumulative hash
+    # 记录累计哈希值
     logger.debug(
         "get_cache_key hash after serializing %s: %s",
         last_serialized,
@@ -160,9 +168,9 @@ def _log_cache_key_hash(hash_obj, last_serialized: str, hashfn):
 
 
 def _remove_custom_partitioning_callbacks(m: ir.Module):
-  """Removes custom_partitioning callback pointers from precompiled IR.
+  """从预编译 IR 中移除 custom_partitioning 回调指针。
 
-  Python function pointers are not deterministic across executions.
+  Python 函数指针在不同次执行之间不是确定性的。
   """
   def _update_bc_attribute(op: ir.Operation) -> ir.WalkResult:
     if "call_target_name" not in op.attributes:
@@ -181,10 +189,10 @@ def _remove_custom_partitioning_callbacks(m: ir.Module):
 
 
 def _strip_mosaic_debug_info(m: ir.Module) -> None:
-  """Strips debug info from Mosaic kernel bytecode in tpu_custom_call ops.
+  """剥离 tpu_custom_call 算子中 Mosaic 内核字节码的调试信息。
 
-  The top-level strip-debuginfo pass does not reach into the serialized kernel
-  MLIR embedded in backend_config, so source file paths leak into the cache key.
+  顶层的 strip-debuginfo pass 不会深入到 backend_config 内嵌的序列化内核
+  MLIR，因此源文件路径会泄漏进缓存键。
   """
   try:
     from jax._src.lib import tpu  # pylint: disable=g-import-not-at-top
@@ -264,8 +272,7 @@ def _hash_accelerator_config(hash_obj, accelerators: np.ndarray):
     topology = xla_client.get_topology_for_devices(accelerator_devices)
     hash_obj.update(topology.fingerprint().to_bytes(8, byteorder="big"))
   except _jax.JaxRuntimeError as ex:
-    # Fall back for those backends that do not support serialized
-    # PjRtTopologyDescription as yet.
+    # 对那些尚不支持序列化 PjRtTopologyDescription 的后端做回退。
     logger.info("get (_hash_accelerator_config): unable to hash "
                 "accelerator config, falling back to hashing "
                 "devices %s (type %s)", ex, type(ex))
@@ -308,15 +315,14 @@ env_override_flags_to_exclude_from_cache_key = {
 
 def _hash_serialized_compile_options(hash_obj, compile_options_obj,
                                      strip_device_assignment=False):
-  # Do not mess with the original CompileOptions object since it is passed to
-  # the compiler. Create a deep copy for the purpose of cache key generation.
+  # 不要改动原始的 CompileOptions 对象，因为它会被传给编译器。
+  # 为生成缓存键创建一个深拷贝。
   compile_options_copy = copy.deepcopy(compile_options_obj)
 
-  # Certain debug options do not affect the compile result and thus, should not
-  # be part of the cache key as their inclusion will result in unnecessary cache
-  # misses. Clear them here by setting bool values to False, ints to 0, and
-  # strings to empty. The exact values used to clear are not relevant as long
-  # as the same values are used every time for each field.
+  # 某些调试选项不影响编译结果，因此不应成为缓存键的一部分，
+  # 否则会导致不必要的缓存未命中。这里通过把布尔值设为 False、整数设为 0、
+  # 字符串设为空来清除它们。只要每个字段每次都使用相同的值，
+  # 具体用什么值来清除并不重要。
   debug_options = compile_options_copy.executable_build_options.debug_options
   # LINT.IfChange(debug_options)
   debug_options.xla_force_host_platform_device_count = 0
@@ -338,13 +344,11 @@ def _hash_serialized_compile_options(hash_obj, compile_options_obj,
   debug_options.xla_dump_hlo_pipeline_re = ""
   debug_options.xla_gpu_experimental_autotune_cache_mode = 0
 
-  # Optional way to specify the cuda install path to be used by the compiler.
-  # This could possibly affect the cuda version compiled with, but this should
-  # already be included in the platform information (and might not be reflected
-  # by the cuda path regardless, since this only hashes on the directory name
-  # and not the contents). It can also cause spurious cache misses if the cuda
-  # path changes across runs despite being the same version, so we clear it
-  # here.
+  # 可选地指定编译器使用的 cuda 安装路径。
+  # 它可能影响编译所用的 cuda 版本，但这一点本应已经包含在平台信息中
+  # （而且也可能并不反映在 cuda 路径上，因为这里只对目录名做哈希而不对
+  # 内容做哈希）。若 cuda 路径跨多次运行发生变化而版本相同，
+  # 它还会造成无谓的缓存未命中，因此我们在此清除它。
   debug_options.xla_gpu_cuda_data_dir = ""
   debug_options.xla_gpu_per_fusion_autotune_cache_dir = ""
   # LINT.ThenChange(:xla_flags)
@@ -385,8 +389,8 @@ def _hash_xla_flags(hash_obj, extra_flag_prefixes: list[str]):
     ):
       xla_flags.append(arg)
 
-  # N.B. all XLA flags that take an argument must use '=' and not a space
-  # (e.g. --xla_force_host_platform_device_count=8) (I think).
+  # 注意：所有带参数的 XLA flag 都必须使用 '=' 而不能用空格
+  # （例如 --xla_force_host_platform_device_count=8）（我想是这样）。
   for flag in sorted(xla_flags):
     if flag.split("=")[0] in xla_flags_to_exclude_from_cache_key:
       logger.debug("Not including XLA flag in cache key: %s", flag)

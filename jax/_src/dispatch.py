@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Primitive dispatch and jit dispatch.
+# 文件职责：原语分派与 jit 分派，是 JAX 把抽象计算落到具体设备并执行的最后一环。
+# 一方面为每个原语生成“单步编译并运行”的实现（op-by-op 即时执行），
+# 另一方面实现 `device_put` 原语，负责数组的跨设备、跨主机搬运与重分片
+# （含分片提交状态、拷贝语义与 DCN 传输回退）。
+# 同时用 `RuntimeTokenSet` 维护有序效果（effect）的 token 顺序，保证多次分派的
+# 副作用按序发生，并提供编译耗时的事件与日志记录工具。
+
+# 原语分派与 jit 分派。
 from __future__ import annotations
 
 import atexit
@@ -73,16 +80,16 @@ zip, unsafe_zip = util.safe_zip, zip
 
 logger = logging.getLogger(__name__)
 
-# This flag is set on exit; no logging should be attempted
+# 该标志在退出时被置位；此时不应再尝试记录日志
 _on_exit = False
 
 ### op-by-op execution
 
 def apply_primitive(prim, *args, **params):
-  """Impl rule that compiles and runs a single primitive 'prim' using XLA."""
+  """实现规则：用 XLA 编译并运行单个原语 'prim'。"""
   fun = xla_primitive_callable(prim, **params)
-  # TODO(yashkatariya): Investigate adding is_primitive to jit and never
-  # triggering the disable jit path instead of messing around with it here.
+  # TODO(yashkatariya): 调研在 jit 上加入 is_primitive 并永远不再
+  # 触发禁用 jit 的路径，而不是在这里对它做各种临时处理。
   prev = config.disable_jit.swap_local(False)
   try:
     outs = fun(*args)
@@ -90,11 +97,11 @@ def apply_primitive(prim, *args, **params):
     config.disable_jit.set_local(prev)
   return outs
 
-# TODO(necula): this cache will contain strong references to all
-# Jaxprs in `params` (for higher-order primitives).
-# This is not immediately fixable by using
-# util.multi_weakref_lru_cache, because the `params` (including the Jaxpr)
-# are closed over in the `prim_fun` lambda. Leaving this fix for a later PR.
+# TODO(necula): 这个缓存会持有 `params` 中所有 Jaxpr 的强引用
+# （针对高阶原语）。
+# 这无法立刻通过改用
+# util.multi_weakref_lru_cache 来修复，因为 `params`（包括其中的 Jaxpr）
+# 被 `prim_fun` 这个 lambda 闭包捕获了。此修复留到后续 PR。
 @util.cache()
 def xla_primitive_callable(prim: core.Primitive, **params):
   util.test_event("xla_primitive_callable_cache_miss")
@@ -113,14 +120,13 @@ def simple_impl(prim):
 RuntimeToken = Any
 
 class RuntimeTokenSet(threading.local):
-  """See docstring for effects.py module for the calling convention for tokens."""
+  """关于 token 的调用约定，见 effects.py 模块的文档字符串。"""
 
-  # For each ordered effect, the token returned by the last dispatched
-  # computation, sharded over the devices in that computation.
+  # 对于每个有序效果，记录最近一次被分派计算返回的 token，
+  # 该 token 已按该次计算涉及的设备做了分片。
   current_tokens: dict[core.Effect, core.Token]
 
-  # For each device, the runtime token returned by the last dispatched
-  # computation on that device.
+  # 对于每个设备，记录该设备上最近一次被分派计算返回的运行时 token。
   output_runtime_tokens: dict[Device, RuntimeToken]
 
   def __init__(self):
@@ -133,15 +139,15 @@ class RuntimeTokenSet(threading.local):
     tok = self.current_tokens.get(eff, np.zeros(0, np.bool_))
 
     if isinstance(tok, core.Token):
-      # The order of devices may change, so we need to reshard if necessary.
-      # TODO(yueshengys): This might still be buggy in a multi-process SPMD
-      # scenario. Revise the logic later. A distributed shutdown barrier inside
-      # the XLA program may be needed.
+      # 设备的顺序可能发生变化，因此必要时需要重新分片。
+      # TODO(yueshengys): 在多进程 SPMD 场景下这里可能仍有 bug。
+      # 该逻辑以后再修订。可能需要在 XLA 程序内部加入一个
+      # 分布式关停屏障。
       return api.device_put(
           tok, NamedSharding(Mesh(devices, 'x'), PartitionSpec('x')))
 
-    # We only use replicated sharding for the first time when the token for the
-    # order effect hasn't been created.
+    # 只有在有序效果的 token 尚未创建时，我们才第一次使用
+    # 复制式分片。
     s = GSPMDSharding.get_replicated(devices)
     sharded_tok = core.Token(
         pxla.shard_args(
@@ -155,9 +161,8 @@ class RuntimeTokenSet(threading.local):
     self.current_tokens[eff] = token
 
   def set_output_runtime_token(self, device: Device, token: RuntimeToken):
-    # We're free to clobber the previous output token because on each
-    # device we have a total ordering of computations. Only the token
-    # from the latest computation matters.
+    # 我们可以随意覆盖先前的输出 token，因为在每个设备上计算都是
+    # 全序的。只有最近一次计算的 token 才有意义。
     self.output_runtime_tokens[device] = token
 
   def clear(self):
@@ -215,16 +220,16 @@ log_elapsed_time = LogElapsedTimeContextManager
 
 
 def should_tuple_args(num_args: int, platform: str) -> bool:
-  # CPU and GPU do not need tuples as they use host-side data structures that
-  # do not have small bounds.
-  # TPU only needs a tuple for very long lists
+  # CPU 和 GPU 不需要元组，因为它们使用的主机端数据结构
+  # 没有很小的数量上限。
+  # TPU 只在列表非常长时才需要元组
   if platform == "tpu":
     return num_args > 2000
   else:
     return False
 
 def jaxpr_has_primitive(jaxpr: core.Jaxpr, prim_name: str) -> bool:
-  """Whether there is a primitive given by user anywhere inside a Jaxpr."""
+  """Jaxpr 内部任意位置是否存在用户给定的某个原语。"""
   for eqn in jaxpr.eqns:
     if prim_name in eqn.primitive.name:
       return True
@@ -234,8 +239,8 @@ def jaxpr_has_primitive(jaxpr: core.Jaxpr, prim_name: str) -> bool:
   return False
 
 
-# Use this registry with caution. It will void the guarantee that lowering to
-# stablehlo is oblivious of physical devices.
+# 请谨慎使用这个注册表。它会破坏“降级到 stablehlo 时不感知
+# 物理设备”这一保证。
 prim_requires_devices_during_lowering: set[core.Primitive] = set()
 
 @util.weakref_lru_cache
@@ -359,22 +364,22 @@ def _different_device_order_reshard(
 
 @util.cache(max_size=2048, trace_context_in_key=False)
 def _is_supported_cross_host_transfer(ndim, src_sharding, dst_sharding):
-  """Returns True if src->dst is a supported cross-host transfer."""
+  """若 src->dst 是受支持的跨主机传输，则返回 True。"""
   if (src_sharding._internal_device_list.device_kind !=
       dst_sharding._internal_device_list.device_kind):
     return False
   if (src_sharding._to_xla_hlo_sharding(ndim) !=
       dst_sharding._to_xla_hlo_sharding(ndim)):
     return False
-  # This check excludes the case where the source and destination shardings
-  # have the same process index sets but there are shards that require
-  # cross-host transfers. This case is supportable but expensive to check for.
+  # 该检查排除了以下情形：源分片与目标分片具有相同的进程索引集合，
+  # 但其中存在需要跨主机传输的分片。这种情形是可以支持的，
+  # 只是检查代价很高。
   different_process_inds = (
       src_sharding._internal_device_list.process_indices !=
       dst_sharding._internal_device_list.process_indices)
   backend = xb.get_backend()
-  # If a cross-host device transfer is requested but the backend does not
-  # support it, then the user must set the flags to enable DCN-based transfers.
+  # 如果请求了跨主机设备传输，但后端不支持，那么用户必须设置
+  # 相应标志以启用基于 DCN 的传输。
   if (different_process_inds and
       (xb.FORCE_DCN_CROSS_HOST_TRANSFERS.value
       or not getattr(backend, "supports_cross_host_transfers", False)) and
@@ -393,11 +398,11 @@ def _is_supported_cross_host_transfer(ndim, src_sharding, dst_sharding):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _DeferredShardArg:
-  """Deferred call to `pxla.shard_args`.
+  """对 `pxla.shard_args` 的延迟调用。
 
-  Per-array impls return this object instead of a result array to indicate a
-  deferred `shard_args` call. `_batched_device_put_impl` then batches all
-  `_DeferredShardArg` objects into a single `shard_args` call.
+  各数组的实现会返回此对象而不是结果数组，以表示一次
+  延迟的 `shard_args` 调用。随后 `_batched_device_put_impl` 会把所有
+  `_DeferredShardArg` 对象合并为一次 `shard_args` 调用。
   """
 
   x: Any
@@ -412,17 +417,18 @@ class _DeferredShardArg:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _DeferredCrossHostTransferArg:
-  """Deferred call to `xc.batched_copy_array_to_devices_with_sharding` for
-  cross-host data transfers.
+  """对 `xc.batched_copy_array_to_devices_with_sharding` 的延迟调用，
+  用于跨主机数据传输。
 
-  Per-array impls return this object instead of a result array to indicate a
-  deferred `batched_copy_array_to_devices_with_sharding` call for a cross-host
-  data transfer. `_batched_device_put_impl` then batches all
-  `_DeferredCrossHostTransferArg` objects into a single
-  `_batched_device_put_impl` call.
+  各数组的实现会返回此对象而不是结果数组，以表示一次延迟的
+  `batched_copy_array_to_devices_with_sharding` 调用，用于跨主机
+  数据传输。随后 `_batched_device_put_impl` 会把所有
+  `_DeferredCrossHostTransferArg` 对象合并为一次
+  `_batched_device_put_impl` 调用。
 
-  For any _DeferredCrossHostTransferArg, _is_supported_cross_host_transfer(
-  x.ndim, x.sharding, dst_sharding) == True.
+  对于任意 _DeferredCrossHostTransferArg，都有
+  _is_supported_cross_host_transfer(
+  x.ndim, x.sharding, dst_sharding) == True。
   """
 
   x: array.ArrayImpl
@@ -438,8 +444,8 @@ def _device_put_sharding_impl(
 ):
   from jax.experimental import multihost_utils  # pyrefly: ignore[missing-import]
 
-  # Use a dynamic type, because the static type depends on the value of
-  # ``x_is_jax_array``.
+  # 这里使用动态类型，因为静态类型取决于
+  # ``x_is_jax_array`` 的取值。
   x_sharding: Any
   if isinstance(x, array.ArrayImpl):
     x_is_jax_array = True
@@ -464,7 +470,7 @@ def _device_put_sharding_impl(
           norm(x_sharding.spec) == norm(s.spec) and
           x_sharding.mesh.size == s.mesh.size):
         return _DeferredShardArg(x, s, aval, True, copy)
-      # TODO(mattjj,yashkatariya): handle donation
+      # TODO(mattjj,yashkatariya): 处理捐赠（donation）
       return api.jit(_device_put_reshard, out_shardings=s)(x)
 
     if (not s_is_fully_addressable and
@@ -485,9 +491,8 @@ def _device_put_sharding_impl(
       return _DeferredCrossHostTransferArg(x, s, copy)
 
     if not s_is_fully_addressable:
-      # If both the source and target shardings are not fully addressable and
-      # one of the above conditions has not been met, then assume that the user
-      # is attempting a different device order reshard.
+      # 如果源分片和目标分片都不是完全可寻址的，并且上述条件
+      # 均未满足，那么假定用户正在尝试不同设备顺序的重分片。
       if (x_is_jax_array and not x_is_fully_addressable
           and s.device_set != x_sharding.device_set):
         inp_ids = [d.id for d in x_sharding._device_assignment]
@@ -505,14 +510,12 @@ def _device_put_sharding_impl(
 
       if ((x_is_jax_array and not x._committed) or
           type(x) in array_types or type(x) in dtypes.python_scalar_types):
-        # If all hosts participate in the sharding, assert that the input is the
-        # same on all hosts. If some hosts have no addressable devices in the
-        # sharding, bypass the check, since we can't easily distinguish between
-        # these two cases: (1) the sharding contains the same subset of global
-        # devices on all hosts (and hosts with no addressable devices in the
-        # sharding do not transfer data) or (2) the sharding contains a
-        # different subset of devices on each host. For (1), the input should be
-        # the same on all hosts, but for (2) it need not be.
+        # 如果所有主机都参与该分片，则断言输入在所有主机上相同。
+        # 如果某些主机在该分片中没有任何可寻址设备，则跳过该检查，
+        # 因为我们无法轻易区分以下两种情形：(1) 该分片在所有主机上
+        # 包含同一组全局设备的子集（与分片中没有任何可寻址设备的主机
+        # 不传输数据）；(2) 该分片在每台主机上包含不同的设备子集。
+        # 对于 (1)，输入在所有主机上应当相同；而对于 (2)，则不必相同。
         if xb.process_count() == len(s._internal_device_list.process_indices):
           multihost_utils.assert_equal(
               x, fail_message=(
@@ -520,14 +523,14 @@ def _device_put_sharding_impl(
                   " process. Make sure you are passing the same value of"
                   f" {type(x)} on each process."))
         return _DeferredShardArg(x, s, aval, True, copy)
-      # TODO(yashkatariya,mattjj): Link to a doc about McJAX and jax.Array.
+      # TODO(yashkatariya,mattjj): 链接到一篇关于 McJAX 与 jax.Array 的文档。
       raise ValueError(
           "device_put's second argument must be a Device or a Sharding which"
           f" represents addressable devices, but got {s}. Please pass device or"
           " Sharding which represents addressable devices.")
     return _DeferredShardArg(x, s, aval, True, copy)
 
-  # Only `Device` exists below. `Sharding` instance is handled above.
+  # 下面只剩下 `Device` 的情形。`Sharding` 实例已在上面处理。
   if x_is_jax_array:
     if not x_is_fully_addressable and not x_sharding.num_devices == 1:
       raise ValueError(
@@ -544,10 +547,9 @@ def _device_put_sharding_impl(
       device = x_sharding._device_assignment[0] if device is None else device
       sharding = make_single_device_sharding(device)
       if not x._committed and not sharding.has_addressable_devices:
-        # For uncommitted arrays in McJAX, each process has a local copy of the
-        # array. If the destination sharding is not addressable, no data
-        # transfer is needed, since the data was transferred in the process
-        # in which the sharding is addressable.
+        # 对于 McJAX 中未提交的数组，每个进程都持有一份该数组的本地副本。
+        # 如果目标分片不可寻址，则不需要传输数据，因为数据已经在
+        # 该分片可寻址的那个进程中完成了传输。
         shards, devices = [], []
       else:
         shards, devices = [x], [device]
@@ -661,8 +663,8 @@ device_put_p.def_impl(batched_device_put_impl)
 
 
 def _device_put_folding_rule(consts, params, out_avals):
-  # We elide device_puts that do nothing; these can be generated by jnp.array,
-  # for example.
+  # 我们会消除那些什么都不做的 device_put；例如 jnp.array
+  # 就可能生成这类调用。
   if (all(x is None for x in params["devices"])
       and all(isinstance(x, literals.TypedNdArray) for x in consts)
       and all(x == ArrayCopySemantics.REUSE_INPUT for x in params["copy_semantics"])):
@@ -703,7 +705,7 @@ def _device_put_transpose(cts, *args, devices, srcs, copy_semantics):
 
   if dp_cts:
     indices, dp_ct, args, devices, srcs, copy_semantics = list(zip(*dp_cts))
-    # TODO(yashkatariya): Maybe remove the special carve out for Host?
+    # TODO(yashkatariya): 也许可以去掉针对 Host 的特殊处理？
     srcs = tuple(a.aval.memory_space
                  if s is None and a.aval.memory_space == core.MemorySpace.Host
                  else s for s, a in zip(srcs, args))
@@ -735,8 +737,8 @@ def _device_put_batcher(batched_args, batch_dims, **params):
 batching.primitive_batchers[device_put_p] = _device_put_batcher
 
 def _tpu_gpu_device_put_lowering(ctx, *xs, devices, srcs, copy_semantics):
-  # TODO(yashkatariya): Maybe we should add the custom calls anyways if it's
-  # being used inside jit? Atleast for now, this preserves the old behavior.
+  # TODO(yashkatariya): 或许无论如何都应该加上这些自定义调用，如果它正被用在 jit 内部的话？
+  # 至少就目前而言，这样可以保持旧有的行为。
   if ctx.module_context.all_default_mem_kind:
     return xs
   def lower(x, device, aval, out_aval):

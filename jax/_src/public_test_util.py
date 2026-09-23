@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：为 `jax.test_util` 提供数值梯度校验的底层实现。
+# 只有 `check_grads`、`check_jvp`、`check_vjp` 三个函数对外导出，应当经由
+# `jax.test_util` 使用；此处其余功能仅供内部使用，可能随时变更或删除，且不经过弃用周期。
+# 核心做法是用中心差分近似导数，再与自动微分给出的 JVP/VJP 结果比对，
+# 并按数据类型维护默认的绝对/相对容差表（含 float8、bf16 等低精度类型）。
+
 from functools import partial
 import operator
 from typing import Any, TypeAlias
@@ -24,9 +30,9 @@ from jax._src.tree_util import tree_map, tree_reduce
 import numpy as np
 
 
-# The only functions intended to be exported are these; they should be used via
-# jax.test_util. All other functionality appearing here is for internal use only,
-# and may be changed or removed at any time and without any deprecation cycle.
+# 只有这些函数是对外导出的；它们应当经由
+# jax.test_util 使用。此处出现的其他所有功能仅供内部使用，
+# 可能随时变更或删除，且不经过任何弃用周期。
 __all__ = ['check_grads', 'check_jvp', 'check_vjp']
 
 
@@ -128,9 +134,9 @@ def _assert_numpy_allclose(a, b, atol=None, rtol=None, err_msg=''):
   def maybe_upcast(x):
     if x.dtype in custom_float_dtypes:
       return x.astype(np.float32)
-    # TODO(reedwm): Upcasting int2/int4 to int8 will no longer be necessary once
-    # JAX depends on a version of ml_dtypes which contains
-    # https://github.com/jax-ml/ml_dtypes/commit/348fd3704306cae97f617c38045cee6bc416bf10.
+    # TODO(reedwm): 一旦 JAX 依赖的 ml_dtypes 版本包含了
+    # https://github.com/jax-ml/ml_dtypes/commit/348fd3704306cae97f617c38045cee6bc416bf10，
+    # 就不必再把 int2/int4 提升到 int8 了。
     if x.dtype in _dtypes._intn_dtypes:
       return x.astype(np.int8 if _dtypes.iinfo(x.dtype).min < 0 else np.uint8)
     return x
@@ -142,8 +148,8 @@ def _assert_numpy_allclose(a, b, atol=None, rtol=None, err_msg=''):
   if atol: kw["atol"] = atol
   if rtol: kw["rtol"] = rtol
   with np.errstate(invalid='ignore'):
-    # TODO(phawkins): surprisingly, assert_allclose sometimes reports invalid
-    # value errors. It should not do that.
+    # TODO(phawkins): 奇怪的是，assert_allclose 有时会报告无效
+    # 值错误。它不应该那样做。
     np.testing.assert_allclose(a, b, **kw, err_msg=err_msg)
 
 
@@ -188,7 +194,7 @@ def inner_prod(xs, ys):
 
 
 def _safe_subtract(x, y, *, dtype):
-  """Subtraction that with `inf - inf == 0` semantics."""
+  """具有 `inf - inf == 0` 语义的减法。"""
   with np.errstate(invalid='ignore'):
     return np.where(np.equal(x, y), np.array(0, dtype),
                     np.subtract(x, y, dtype=dtype))
@@ -248,24 +254,24 @@ def _merge_tolerance(tol, default):
 
 
 def check_jvp(f, f_jvp, args, atol=None, rtol=None, eps=EPS, err_msg=''):
-  """Check a JVP from automatic differentiation against finite differences.
+  """用有限差分检验自动微分给出的 JVP。
 
-  Gradients are only checked in a single randomly chosen direction, which
-  ensures that the finite difference calculation does not become prohibitively
-  expensive even for large input/output spaces.
+  只在一个随机选取的方向上检验梯度，
+  这保证了即使输入/输出空间很大，
+  有限差分的计算也不会变得过于昂贵。
 
   Args:
-    f: function to check at ``f(*args)``.
-    f_jvp: function that calculates ``jax.jvp`` applied to ``f``. Typically this
-      should be ``functools.partial(jax.jvp, f)``.
-    args: tuple of argument values.
-    atol: absolute tolerance for gradient equality.
-    rtol: relative tolerance for gradient equality.
-    eps: step size used for finite differences.
-    err_msg: additional error message to include if checks fail.
+    f: 在 ``f(*args)`` 处被检验的函数。
+    f_jvp: 计算施加于 ``f`` 的 ``jax.jvp`` 的函数。通常应当是
+      ``functools.partial(jax.jvp, f)``。
+    args: 参数值组成的元组。
+    atol: 梯度相等性的绝对容差。
+    rtol: 梯度相等性的相对容差。
+    eps: 有限差分使用的步长。
+    err_msg: 检验失败时要附加的错误信息。
 
   Raises:
-    AssertionError: if gradients do not match.
+    AssertionError: 若梯度不匹配。
   """
   atol = _merge_tolerance(atol, default_gradient_tolerance)
   rtol = _merge_tolerance(rtol, default_gradient_tolerance)
@@ -276,9 +282,9 @@ def check_jvp(f, f_jvp, args, atol=None, rtol=None, eps=EPS, err_msg=''):
   v_out_expected = f(*args)
   _check_dtypes_match(v_out, v_out_expected)
   t_out_expected = numerical_jvp(f, args, tangent, eps=eps)
-  # In principle we should expect exact equality of v_out and v_out_expected,
-  # but due to nondeterminism especially on GPU (e.g., due to convolution
-  # autotuning) we only require "close".
+  # 原则上我们应当期望 v_out 与 v_out_expected 完全相等，
+  # 但由于非确定性（尤其在 GPU 上，例如卷积自动调优导致），
+  # 我们只要求它们“接近”。
   check_close(v_out, v_out_expected, atol=atol, rtol=rtol,
               err_msg=f'{err_msg} primal' if err_msg else 'primal')
   check_close(t_out, t_out_expected, atol=atol, rtol=rtol,
@@ -286,24 +292,24 @@ def check_jvp(f, f_jvp, args, atol=None, rtol=None, eps=EPS, err_msg=''):
 
 
 def check_vjp(f, f_vjp, args, atol=None, rtol=None, eps=EPS, err_msg=''):
-  """Check a VJP from automatic differentiation against finite differences.
+  """用有限差分检验自动微分给出的 VJP。
 
-  Gradients are only checked in a single randomly chosen direction, which
-  ensures that the finite difference calculation does not become prohibitively
-  expensive even for large input/output spaces.
+  只在一个随机选取的方向上检验梯度，
+  这保证了即使输入/输出空间很大，
+  有限差分的计算也不会变得过于昂贵。
 
   Args:
-    f: function to check at ``f(*args)``.
-    f_vjp: function that calculates ``jax.vjp`` applied to ``f``. Typically this
-      should be ``functools.partial(jax.vjp, f)``.
-    args: tuple of argument values.
-    atol: absolute tolerance for gradient equality.
-    rtol: relative tolerance for gradient equality.
-    eps: step size used for finite differences.
-    err_msg: additional error message to include if checks fail.
+    f: 在 ``f(*args)`` 处被检验的函数。
+    f_vjp: 计算施加于 ``f`` 的 ``jax.vjp`` 的函数。通常应当是
+      ``functools.partial(jax.vjp, f)``。
+    args: 参数值组成的元组。
+    atol: 梯度相等性的绝对容差。
+    rtol: 梯度相等性的相对容差。
+    eps: 有限差分使用的步长。
+    err_msg: 检验失败时要附加的错误信息。
 
   Raises:
-    AssertionError: if gradients do not match.
+    AssertionError: 若梯度不匹配。
   """
   atol = _merge_tolerance(atol, default_gradient_tolerance)
   rtol = _merge_tolerance(rtol, default_gradient_tolerance)
@@ -325,23 +331,23 @@ def check_vjp(f, f_vjp, args, atol=None, rtol=None, eps=EPS, err_msg=''):
 
 def check_grads(f, args, order,
                 modes=("fwd", "rev"), atol=None, rtol=None, eps=None):
-  """Check gradients from automatic differentiation against finite differences.
+  """用有限差分检验自动微分给出的梯度。
 
-  Gradients are only checked in a single randomly chosen direction, which
-  ensures that the finite difference calculation does not become prohibitively
-  expensive even for large input/output spaces.
+  只在一个随机选取的方向上检验梯度，
+  这保证了即使输入/输出空间很大，
+  有限差分的计算也不会变得过于昂贵。
 
   Args:
-    f: function to check at ``f(*args)``.
-    args: tuple of argument values.
-    order: forward and backwards gradients up to this order are checked.
-    modes: lists of gradient modes to check ('fwd' and/or 'rev').
-    atol: absolute tolerance for gradient equality.
-    rtol: relative tolerance for gradient equality.
-    eps: step size used for finite differences.
+    f: 在 ``f(*args)`` 处被检验的函数。
+    args: 参数值组成的元组。
+    order: 检验到此阶为止的前向与反向梯度。
+    modes: 要检验的梯度模式列表（'fwd' 和/或 'rev'）。
+    atol: 梯度相等性的绝对容差。
+    rtol: 梯度相等性的相对容差。
+    eps: 有限差分使用的步长。
 
   Raises:
-    AssertionError: if gradients do not match.
+    AssertionError: 若梯度不匹配。
   """
   args = tuple(args)
   eps = eps or EPS

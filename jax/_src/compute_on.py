@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 `jax.compute_on` 机制，把被装饰函数追踪、暂存后绑定到指定的计算类型上，
+# 支持 `device_host`、`device`、`tpu_sparsecore` 以及 `gpu_stream:#` 形式的 GPU 流，
+# 并用 `out_memory_spaces` 指定各输出所在的内存空间。
+# 计算类型通过 `extend_compute_type` 存入 config 的局部上下文，整个 jaxpr 则由核心原语
+# `compute_on` 承载；本模块为该原语注册降级、批处理、JVP、线性化、部分求值、转置、
+# to_lojax 与死代码消除等规则，使其在 JAX 的各变换下保持正确。
 from __future__ import annotations
 from contextlib import contextmanager
 from functools import partial
@@ -316,7 +322,7 @@ def _compute_on_partial_eval_custom_params_updater(
     unks_in: Sequence[bool], inst_in: Sequence[bool],
     kept_outs_known: Sequence[bool], kept_outs_staged: Sequence[bool],
     num_res_out: int, num_res_in: int, params_known, params_staged):
-  # prune inputs to jaxpr_known according to unks_in
+  # 按 unks_in 裁剪 jaxpr_known 的输入
   _, out_memory_spaces_known = pe.partition_list(
       kept_outs_known, params_known['out_memory_spaces'])
   new_params_known = dict(
@@ -327,7 +333,7 @@ def _compute_on_partial_eval_custom_params_updater(
   assert (len(new_params_known['out_memory_spaces']) ==
           len(params_known['jaxpr'].out_avals))
 
-  # added num_res new inputs to jaxpr_staged, and pruning according to inst_in
+  # 给 jaxpr_staged 增加 num_res 个新输入，并按 inst_in 裁剪
   _, out_memory_spaces_staged = pe.partition_list(
       kept_outs_staged, params_staged['out_memory_spaces'])
   new_params_staged = dict(

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：JAX 内部通用工具集。
+# 提供安全版 map/zip（`safe_map`/`safe_zip`）、`curry`、列表切分与合并
+# （`split_list`、`partition_list`、`unzip2`/`unzip3`）、缓存设施
+# （`cache`、`weakref_lru_cache`、`multi_weakref_lru_cache`、弱引用驻留器）、
+# 以及 `immutable`、`HashableFunction`、`StrictABCMeta` 等辅助类与类型工具。
+
 from __future__ import annotations
 
 import abc
@@ -38,14 +44,14 @@ logger = logging.getLogger(__name__)
 
 Seq = Sequence
 
-# TODO(jakevdp): fix import cycles and import Array.
+# TODO(jakevdp): 修复导入循环并导入 Array。
 Array = Any
 
 
 if TYPE_CHECKING:
-  # safe_zip cannot yet be fully annotated, so we use a strategy similar
-  # to that used for builtins.zip in python/typeshed. This supports
-  # return types matching input types for up to three arguments.
+  # safe_zip 目前还无法完整地标注类型，因此我们采用与 python/typeshed
+  # 中 builtins.zip 类似的策略。这样在最多三个参数时，返回类型
+  # 可以与输入类型相匹配。
   @overload
   def safe_zip[T1](__arg1: Iterable[T1], /) -> list[tuple[T1]]:
     ...
@@ -61,14 +67,14 @@ if TYPE_CHECKING:
 
   def safe_zip(*args):
     """
-    Like builtin :func:`zip`, but with additional safety checks.
+    类似内置的 :func:`zip`，但带有额外的安全检查。
 
-    The differences from :func:`zip` are:
+    与 :func:`zip` 的区别在于：
 
-    - :func:`safe_zip` checks that at least one argument is provided.
-    - :func:`safe_zip` checks that all arguments have the same length.
-    - :func:`safe_zip` returns an eagerly-evaluated list instead of a
-      lazily-evaluated iterator.
+    - :func:`safe_zip` 检查至少提供了一个参数。
+    - :func:`safe_zip` 检查所有参数具有相同的长度。
+    - :func:`safe_zip` 返回立即求值的列表，而不是
+      惰性求值的迭代器。
     """
     if not args:
       raise TypeError("safe_zip requires at least 1 argument.")
@@ -78,9 +84,9 @@ else:
 
 
 if TYPE_CHECKING:
-  # safe_map cannot yet be fully annotated, so we use a strategy similar
-  # to that used for builtins.map in python/typeshed. This supports
-  # checking input types for the callable with up to three arguments.
+  # safe_map 目前还无法完整地标注类型，因此我们采用与 python/typeshed
+  # 中 builtins.map 类似的策略。这支持对最多三个参数的
+  # 可调用对象进行输入类型检查。
   @overload
   def safe_map[T, T1](f: Callable[[T1], T], __arg1: Iterable[T1], /) -> list[T]: ...
 
@@ -126,9 +132,9 @@ else:
 
 def unzip2[T1, T2](xys: Iterable[tuple[T1, T2]]
     ) -> tuple[tuple[T1, ...], tuple[T2, ...]]:
-  """Unzip sequence of length-2 tuples into two tuples."""
-  # Note: we deliberately don't use zip(*xys) because it is lazily evaluated,
-  # is too permissive about inputs, and does not guarantee a length-2 output.
+  """将由长度为 2 的元组构成的序列解包为两个元组。"""
+  # Note: 我们有意不使用 zip(*xys)，因为它是惰性求值的，
+  # 对输入过于宽松，并且不保证输出长度为 2。
   xs: list[T1] = []
   ys: list[T2] = []
   for x, y in xys:
@@ -138,9 +144,9 @@ def unzip2[T1, T2](xys: Iterable[tuple[T1, T2]]
 
 def unzip3[T1, T2, T3](xyzs: Iterable[tuple[T1, T2, T3]]
     ) -> tuple[tuple[T1, ...], tuple[T2, ...], tuple[T3, ...]]:
-  """Unzip sequence of length-3 tuples into three tuples."""
-  # Note: we deliberately don't use zip(*xyzs) because it is lazily evaluated,
-  # is too permissive about inputs, and does not guarantee a length-3 output.
+  """将由长度为 3 的元组构成的序列解包为三个元组。"""
+  # Note: 我们有意不使用 zip(*xyzs)，因为它是惰性求值的，
+  # 对输入过于宽松，并且不保证输出长度为 3。
   xs: list[T1] = []
   ys: list[T2] = []
   zs: list[T3] = []
@@ -151,14 +157,14 @@ def unzip3[T1, T2, T3](xyzs: Iterable[tuple[T1, T2, T3]]
   return tuple(xs), tuple(ys), tuple(zs)
 
 def subvals[T](lst: Sequence[T], replace: Iterable[tuple[int, T]]) -> tuple[T, ...]:
-  """Substitute values within a list."""
+  """替换列表中的取值，并返回新的元组。"""
   lst = list(lst)
   for i, v in replace:
     lst[i] = v
   return tuple(lst)
 
 def split_list[T](args: Sequence[T], ns: Sequence[int]) -> list[list[T]]:
-  """Split list into sublists of the specified sizes."""
+  """将列表切分为指定大小的子列表。"""
   args = list(args)
   lists = []
   for n in ns:
@@ -168,7 +174,7 @@ def split_list[T](args: Sequence[T], ns: Sequence[int]) -> list[list[T]]:
   return lists
 
 def split_list_checked[T](args: Sequence[T], ns: Sequence[int]) -> list[list[T]]:
-  """Split list into sublists of the specified sizes."""
+  """将列表切分为指定大小的子列表。"""
   args = list(args)
   assert sum(ns) == len(args) and all(n >= 0 for n in ns)
   lists = []
@@ -178,7 +184,7 @@ def split_list_checked[T](args: Sequence[T], ns: Sequence[int]) -> list[list[T]]
   return lists
 
 def partition_list[T](bs: Sequence[bool], l: Sequence[T]) -> tuple[list[T], list[T]]:
-  """Partition a list into two based on a mask."""
+  """根据掩码将列表划分为两部分。"""
   assert len(bs) == len(l)
   lists: tuple[list[T], list[T]] = ([], [])
   for b, x in zip(bs, l):
@@ -187,7 +193,7 @@ def partition_list[T](bs: Sequence[bool], l: Sequence[T]) -> tuple[list[T], list
 
 def merge_lists[T1, T2](bs: Sequence[bool], l0: Sequence[T1], l1: Sequence[T2]
                 ) -> list[T1 | T2]:
-  """Merge the elements of two lists based on a mask."""
+  """根据掩码合并两个列表的元素。"""
   assert sum(bs) == len(l1) and len(bs) - sum(bs) == len(l0)
   i0, i1 = iter(l0), iter(l1)
   out: list[T1 | T2] = [next(i1) if b else next(i0) for b in bs]
@@ -214,7 +220,7 @@ def subs_list2[T](
   return out
 
 def concatenate[T](xs: Iterable[Sequence[T]]) -> list[T]:
-  """Concatenates/flattens a list of lists."""
+  """拼接/展平由列表构成的列表。"""
   return list(it.chain.from_iterable(xs))
 
 flatten = concatenate
@@ -222,9 +228,9 @@ flatten = concatenate
 _unflatten_done = object()
 
 def unflatten[T](xs: Iterable[T], ns: Sequence[int]) -> list[list[T]]:
-  """Splits `xs` into subsequences of lengths `ns`.
+  """将 `xs` 切分为长度分别为 `ns` 的子序列。
 
-  Unlike `split_list`, the `sum(ns)` must be equal to `len(xs)`."""
+  与 `split_list` 不同，`sum(ns)` 必须等于 `len(xs)`。"""
   xs_iter = iter(xs)
   unflattened = [[next(xs_iter) for _ in range(n)] for n in ns]
   assert next(xs_iter, _unflatten_done) is _unflatten_done
@@ -232,9 +238,9 @@ def unflatten[T](xs: Iterable[T], ns: Sequence[int]) -> list[list[T]]:
 
 
 def curry(f):
-  """Curries arguments of f, returning a function on any remaining arguments.
+  """对 f 的参数进行柯里化，返回一个作用于剩余参数的函数。
 
-  For example:
+  例如：
   >>> f = lambda x, y, z, w: x * y + z * w
   >>> f(2,3,4,5)
   26
@@ -261,18 +267,18 @@ def cache(max_size=4096, trace_context_in_key: bool | Callable = True, num_shard
     return cached_f
   return decorator
 
-# Maps caches to the name of the callable they apply to. All caches in
-# this dictionary support `cache_clear()`.
+# 将缓存映射到其所适用的可调用对象的名称。此字典中的
+# 所有缓存都支持 `cache_clear()`。
 _caches: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
 
 def register_cache(cache: Any, for_what: str):
-  """Registers a cache with JAX's cache management.
+  """向 JAX 的缓存管理注册一个缓存。
 
   Args:
-    cache: an object supporting `cache_clear()`, `cache_info()`, and
-      `cache_keys()`, like the result of `functools.lru_cache()`.
-    for_what: a string to identify what this cache is used for. This is
-       used for debugging.
+    cache: 一个支持 `cache_clear()`、`cache_info()` 和
+      `cache_keys()` 的对象，例如 `functools.lru_cache()` 的结果。
+    for_what: 用于标识此缓存用途的字符串。
+       该字段用于调试。
   """
   _caches[cache] = for_what
 
@@ -311,11 +317,11 @@ def weakref_lru_cache[**P, R](
     trace_context_in_key: bool = True, explain: Callable | None = None
 ):
   """
-  Least recently used cache decorator with weakref support.
+  支持弱引用的最近最少使用（LRU）缓存装饰器。
 
-  The cache will take a weakref to the first argument of the wrapped function
-  and strong refs to all other arguments. In all other respects it should
-  behave similar to `functools.lru_cache`. The cache is thread local.
+  缓存会对被包装函数的第一个参数持有弱引用，
+  对所有其他参数持有强引用。在其他所有方面，它的行为
+  都应类似于 `functools.lru_cache`。该缓存是线程局部的。
   """
   kwargs = dict(maxsize=maxsize, trace_context_in_key=trace_context_in_key,
                 explain=explain)
@@ -331,27 +337,27 @@ def _weakref_lru_cache(f, maxsize, trace_context_in_key, explain):
   return cached_f
 
 
-# Interner from strong keys to weak values, intended for us to intern object
-# construction, thereby making subsequent __eq__ and __hash__ calls cheap and
-# based on object identity.
+# 从强键到弱值的驻留器（interner），用于对对象构造进行驻留，
+# 从而使后续的 __eq__ 和 __hash__ 调用既廉价又
+# 基于对象同一性。
 #
-# Caution: The interner does not know about the *signature* of the cached
-# function. In particular, if the same argument value can be passed as either
-# an arg or a kwarg, then the interner may store multiple entries for the same
-# logical call. If this troubles you canonicalize the arguments first, e.g.
-# via a wrapper function.
+# 注意：该驻留器并不知道被缓存函数的 *签名*。
+# 特别地，如果同一个参数值既可以作为位置参数也可以作为
+# 关键字参数传入，那么驻留器可能会为同一次逻辑调用存储多个条目。
+# 如果这给你带来困扰，请先规范化这些参数，例如
+# 通过一个包装器函数。
 weak_value_interner = lib_weakref_lru_cache.weak_value_interner
 
 
 def immutable(cls):
-  """Decorator to avoid boilerplate for immutable interned classes."""
+  """用于避免为不可变的驻留类编写样板代码的装饰器。"""
   def __deepcopy__(self, memo):
-    # Deep copy of a singleton interned object is the identity.
+    # 对单例驻留对象进行深拷贝得到的是它本身。
     return self
   cls.__deepcopy__ = __deepcopy__
 
-  # Pickling calls __getstate__ and __setstate__, but we're assuming the
-  # caller will implement __getnewargs_ex__.
+  # pickle 会调用 __getstate__ 和 __setstate__，但我们假定
+  # 调用方会实现 __getnewargs_ex__。
   def __getstate__(self):
     return None
   def __setstate__(self, state):
@@ -359,7 +365,7 @@ def immutable(cls):
   cls.__getstate__ = __getstate__
   cls.__setstate__ = __setstate__
 
-  # Discourage mutation after construction.
+  # 抑制构造完成后的修改。
   def __setattr__(self, name, value):
     raise AttributeError(f"cannot assign to field {name!r}")
   def __delattr__(self, name):
@@ -369,8 +375,8 @@ def immutable(cls):
   return cls
 
 
-# The types of arguments for which `multi_weakref_lru_cache` should keep
-# weak references.
+# `multi_weakref_lru_cache` 应为其保留弱引用的
+# 参数类型。
 weakref_cache_key_types: set[type] = set()
 
 
@@ -389,13 +395,13 @@ def multi_weakref_lru_cache(
     maxsize: int | None = 2048,
     trace_context_in_key: bool = True,
 ):
-  """Least recently used cache decorator with weakref support.
+  """支持弱引用的最近最少使用缓存装饰器。
 
-  Similar to `weakref_lru_cache`, except that it keeps weak references
-  to all positional and keyword arguments for which
-  `is_weakref_cache_key_type()` is true, and strong references to
-  other arguments. The cache entry is removed if any of the weakref
-  arguments dies.
+  类似于 `weakref_lru_cache`，区别在于它会对所有
+  `is_weakref_cache_key_type()` 为真的位置参数和
+  关键字参数保留弱引用，而对其他参数保留强引用。
+  如果任何一个弱引用参数消亡，该缓存条目
+  就会被移除。
   """
   cached_call = lib_weakref_lru_cache.multi_weakref_lru_cache(
       config.trace_context if trace_context_in_key else _ignore,
@@ -453,7 +459,7 @@ def fun_qual_name(fun: Callable) -> str:
   return fun_name(fun)
 
 def canonicalize_axis(axis: SupportsIndex, num_dims: int) -> int:
-  """Canonicalize an axis in [-num_dims, num_dims) to [0, num_dims)."""
+  """将 [-num_dims, num_dims) 范围内的轴规范化到 [0, num_dims)。"""
   axis = operator.index(axis)
   if not -num_dims <= axis < num_dims:
     raise ValueError(f"axis {axis} is out of bounds for array of dimension {num_dims}")
@@ -497,8 +503,8 @@ def wraps[T](
     **kwargs,
 ) -> Callable[[T], T]:
   """
-  Like functools.wraps, but with finer-grained control over the name and docstring
-  of the resulting function.
+  类似 `functools.wraps`，但对结果函数的名称和文档字符串
+  提供了更细粒度的控制。
   """
   def wrapper(fun: T) -> T:
     try:
@@ -530,23 +536,22 @@ def tuple_update[T](t: tuple[T, ...], idx: int, val: T) -> tuple[T, ...]:
   return t[:idx] + (val,) + t[idx+1:]
 
 class HashableFunction:
-  """Decouples function equality and hash from its identity.
+  """将函数的相等性和哈希与其身份解耦。
 
-  Local lambdas and function defs are reallocated on each function call, making
-  the functions created on different calls compare as unequal. This breaks our
-  caching logic, which should really only care about comparing the semantics and
-  not actual identity.
+  局部 lambda 和函数定义在每次函数调用时都会被重新分配，这使得在不同调用中
+  创建出的函数比较起来并不相等。这会破坏我们的缓存逻辑，
+  而该逻辑实际上只应关心比较语义，
+  而不应关心真实的身份。
 
-  This class makes it possible to compare different functions based on their
-  semantics. The parts that are taken into account are: the bytecode of the
-  wrapped function (which is cached by the CPython interpreter and is stable
-  across the invocations of the surrounding function), and `closure` which
-  should contain all values in scope that affect the function semantics. In
-  particular `closure` should contain all elements of the function closure, or
-  it should be possible to derive the relevant elements of the true function
-  closure based solely on the contents of the `closure` argument (e.g. in case
-  some closed-over values are not hashable, but are entirely determined by
-  hashable locals).
+  该类使得可以基于语义来比较不同的函数。所考虑的部分包括：
+  被包装函数的字节码（它由 CPython 解释器缓存，并且在
+  外层函数的多次调用之间保持稳定），以及 `closure` 参数，
+  该参数应包含作用域中所有会影响函数语义的值。特别是，
+  `closure` 应当包含函数闭包的所有元素，或者说应当
+  能够仅依据 `closure` 参数的内容，推导出真实函数
+  闭包中的相关元素（例如，当某些被闭包捕获的值
+  不可哈希，但完全由可哈希的局部变量决定时，
+  这种情况也是允许的）。
   """
 
   def __init__(self, f, closure):
@@ -595,11 +600,11 @@ def maybe_named_axis(axis, if_pos, if_named):
     return if_pos(pos)
 
 def distributed_debug_log(*pairs):
-  """Format and log `pairs` if config.jax_distributed_debug is enabled.
+  """如果启用了 `config.jax_distributed_debug`，则格式化并记录 `pairs`。
 
   Args:
-    pairs: A sequence of label/value pairs to log. The first pair is treated as
-    a heading for subsequent pairs.
+    pairs: 要记录的标签/值对序列。第一对被当作后续各对的
+    标题。
   """
   if config.distributed_debug.value:
     lines = ["\nDISTRIBUTED_DEBUG_BEGIN"]
@@ -615,9 +620,9 @@ def distributed_debug_log(*pairs):
 
 
 def stable_unique[T](it: Iterable[T]) -> Iterable[T]:
-  """Returns unique elements from `it` in the order of occurrence.
+  """按出现顺序返回 `it` 中的唯一元素。
 
-  The elements must be hashable.
+  这些元素必须是可哈希的。
   """
   return dict.fromkeys(it).keys()
 
@@ -691,9 +696,9 @@ class Either():
     else:
       return f"Right({self.val})"
 
-# A handy container for (args, kwargs) pairs that lets you map over it etc
-# with an API similar to FlatTree.
-# TODO: hashing, equality, printing etc
+# 一个便捷的 (args, kwargs) 对容器，可对其做 map 等操作，
+# API 与 `FlatTree` 类似。
+# TODO: 哈希、相等性、打印等
 class PyArgs:
   def __init__(self, args, kwargs):
     assert isinstance(args, tuple)
@@ -701,7 +706,7 @@ class PyArgs:
     self.args = args
     self.kwargs = kwargs
 
-  # True means keep
+  # True 表示保留
   def filter_with_mask(self, mask):
     assert len(mask) == len(self)
     keeps = iter(mask)
@@ -746,7 +751,7 @@ def set_module(module: str) -> Callable[[_T], _T]:
 
 
 def use_cpp_class(cpp_cls: type[Any]) -> Callable[[type[_T]], type[_T]]:
-  """A decorator replacing a Python class with its C++ version at runtime."""
+  """一个在运行时用 C++ 版本替换 Python 类的装饰器。"""
 
   def wrapper(cls):
     if cpp_cls is None:
@@ -765,7 +770,7 @@ def use_cpp_class(cpp_cls: type[Any]) -> Callable[[type[_T]], type[_T]]:
   return wrapper
 
 def use_cpp_method(is_enabled: bool = True) -> Callable[[_T], _T]:
-  """A decorator excluding methods from the set that are forwarded to C++ class."""
+  """一个装饰器，用于将某些方法排除在转发给 C++ 类的集合之外。"""
   if not isinstance(is_enabled, bool):
     raise TypeError("``is_enabled`` must be a bool")
   def decorator(f):
@@ -777,14 +782,14 @@ def use_cpp_method(is_enabled: bool = True) -> Callable[[_T], _T]:
 
 
 class StrictABCMeta(abc.ABCMeta):
-  """A variant of `abc.ABCMeta` which does not allow virtual subclasses.
+  """`abc.ABCMeta` 的一个变体，它不允许虚子类。
 
-  Virtual subclasses support require `abc.ABCMeta` to roundtrip through
-  pure Python when doing instance/subclass checking. This if fine for ABCs
-  which need virtual subclasses, but is wasteful for the ones which don't.
+  支持虚子类要求 `abc.ABCMeta` 在进行实例/子类检查时
+  经由纯 Python 往返。对于需要虚子类的 ABC 而言这没有问题，
+  但对于不需要虚子类的 ABC 来说则是一种浪费。
   """
   def register(cls, subclass):
-    del subclass  # Unused.
+    del subclass  # 未使用。
     raise NotImplementedError(f"{cls} does not support virtual subclasses")
 
   __instancecheck__ = type.__instancecheck__

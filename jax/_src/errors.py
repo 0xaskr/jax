@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：定义 `jax.errors` 对外暴露的全部 JAX 专有异常类型，并为追踪器等场景给出可读的诊断信息。
+# 这些异常覆盖 JAX 变换（`jit`、`vmap` 等）中常见的抽象值误用：抽象追踪器被当作具体值使用、
+# 非具体的布尔索引、数组/整数/布尔转换失败、`Tracer` 泄漏到变换之外，以及 PRNG key 的不安全复用。
+# 每个错误类都继承 `_JAXErrorMixin`，在其报错信息末尾附加指向官方 errors 文档页面中
+# 对应条目的链接，用户可据类名直接跳转查阅相应的成因与修复建议。
+# 该模块是 `jax.errors` 公共错误 API 的实现本体，经 `set_module` 把类导出为 `jax.errors` 成员。
 from __future__ import annotations
 
 from jax._src import core
@@ -20,7 +26,7 @@ export = set_module('jax.errors')
 
 
 class _JAXErrorMixin:
-  """Mixin for JAX-specific errors"""
+  """JAX 专有错误的混入类"""
   _error_page = 'https://docs.jax.dev/en/latest/errors.html'
   _module_name = "jax.errors"
 
@@ -34,29 +40,29 @@ class _JAXErrorMixin:
 
 @export
 class JAXTypeError(_JAXErrorMixin, TypeError):
-  """JAX-specific :class:`TypeError`"""
+  """JAX 专有的 :class:`TypeError`"""
 
 
 @export
 class JAXIndexError(_JAXErrorMixin, IndexError):
-  """JAX-specific :class:`IndexError`"""
+  """JAX 专有的 :class:`IndexError`"""
 
 
 @export
 class ConcretizationTypeError(JAXTypeError):
   """
-  This error occurs when a JAX Tracer object is used in a context where a
-  concrete value is required (see :ref:`faq-different-kinds-of-jax-values`
-  for more on what a Tracer is). In some situations, it can be easily fixed by
-  marking problematic values as static; in others, it may indicate that your
-  program is doing operations that are not directly supported by JAX's JIT
-  compilation model.
+  当 JAX 追踪器对象被用在需要具体值的上下文中时，
+  就会抛出这个错误，关于追踪器具体是什么，
+  参见 :ref:`faq-different-kinds-of-jax-values`。
+  在某些情形下，只需把有问题的值标记为静态即可轻松修复；
+  在另一些情形下，它可能表明你的程序正在执行的操作
+  并不被 JAX 的 JIT 编译模型直接支持。
 
   Examples:
 
-  Traced value where static value is expected
-    One common cause of this error is using a traced value where a static value
-    is required. For example:
+  在期望静态值的地方使用了被追踪的值
+    这个错误的一个常见原因，是在需要静态值的地方使用了被追踪的值。
+    例如：
 
       >>> from functools import partial
       >>> from jax import jit
@@ -71,7 +77,7 @@ class ConcretizationTypeError(JAXTypeError):
       ConcretizationTypeError: Abstract tracer value encountered where concrete
       value is expected: axis argument to jnp.min().
 
-    This can often be fixed by marking the problematic argument as static::
+    通常可以通过把有问题的参数标记为静态来修复::
 
         >>> @jit(static_argnums=1)
         ... def func(x, axis):
@@ -80,9 +86,9 @@ class ConcretizationTypeError(JAXTypeError):
         >>> func(jnp.arange(4), 0)
         Array(0, dtype=int32)
 
-  Shape depends on Traced Value
-    Such an error may also arise when a shape in your JIT-compiled computation
-    depends on the values within a traced quantity. For example::
+  形状依赖于被追踪的值
+    当 JIT 编译的计算中某个形状依赖于被追踪量的取值时，
+    也可能出现这类错误。例如::
 
       >>> @jit
       ... def func(x):
@@ -94,13 +100,13 @@ class ConcretizationTypeError(JAXTypeError):
       ConcretizationTypeError: Abstract tracer value encountered where concrete value is expected:
       The error arose in jnp.nonzero.
 
-    This is an example of an operation that is incompatible with JAX's JIT
-    compilation model, which requires array sizes to be known at compile-time.
-    Here the size of the returned array depends on the contents of `x`, and such
-    code cannot be JIT compiled.
+    这是一个与 JAX 的 JIT 编译模型不兼容的操作示例，
+    该模型要求数组大小在编译期已知。
+    这里返回数组的大小取决于 `x` 的内容，
+    因此这类代码无法被 JIT 编译。
 
-    In many cases it is possible to work around this by modifying the logic used
-    in the function; for example here is code with a similar issue::
+    很多情况下，可以通过修改函数中使用的逻辑来绕过这一问题；
+    例如下面这段代码也有类似的毛病::
 
       >>> @jit
       ... def func(x):
@@ -113,8 +119,8 @@ class ConcretizationTypeError(JAXTypeError):
       ConcretizationTypeError: Abstract tracer value encountered where concrete
       value is expected: The error arose in jnp.nonzero.
 
-    And here is how you might express the same operation in a way that avoids
-    creation of a dynamically-sized index array::
+    下面则展示了如何用避免创建动态大小索引数组的方式
+    来表达同样的操作::
 
       >>> @jit
       ... def func(x):
@@ -123,9 +129,9 @@ class ConcretizationTypeError(JAXTypeError):
       >>> func(jnp.arange(4))
       Array(5, dtype=int32)
 
-  To understand more subtleties having to do with tracers vs. regular values,
-  and concrete vs. abstract values, you may want to read
-  :ref:`faq-different-kinds-of-jax-values`.
+  如果你想深入了解追踪器与普通值、具体值与抽象值
+  之间还有哪些微妙之处，可以阅读
+  :ref:`faq-different-kinds-of-jax-values`。
   """
   def __init__(self, tracer: core.Tracer, context: str = ""):
     super().__init__(
@@ -136,19 +142,19 @@ class ConcretizationTypeError(JAXTypeError):
 @export
 class NonConcreteBooleanIndexError(JAXIndexError):
   """
-  This error occurs when a program attempts to use non-concrete boolean indices
-  in a traced indexing operation. Under JIT compilation, JAX arrays must have
-  static shapes (i.e. shapes that are known at compile-time) and so boolean
-  masks must be used carefully. Some logic implemented via boolean masking is
-  simply not possible in a :func:`jax.jit` function; in other cases, the logic
-  can be re-expressed in a JIT-compatible way, often using the three-argument
-  version of :func:`~jax.numpy.where`.
+  当程序在追踪的索引操作中使用非具体的布尔索引时，
+  就会抛出这个错误。在 JIT 编译下，
+  JAX 数组必须具有静态形状（即在编译期已知的形状），
+  因此使用布尔掩码时必须格外小心。
+  某些通过布尔掩码实现的逻辑在 :func:`jax.jit` 函数中根本无法完成；
+  而在另一些情况下，这些逻辑可以用 JIT 兼容的方式重新表达，
+  通常要借助 :func:`~jax.numpy.where` 的三参数版本。
 
-  Following are a few examples of when this error might arise.
+  下面是可能触发这个错误的几个示例。
 
-  Constructing arrays via boolean masking
-    This most commonly arises when attempting to create an array via a boolean
-    mask within a JIT context. For example::
+  通过布尔掩码构造数组
+    最常见的情形是在 JIT 上下文中尝试用布尔掩码创建数组。
+    例如::
 
       >>> import jax
       >>> import jax.numpy as jnp
@@ -162,16 +168,16 @@ class NonConcreteBooleanIndexError(JAXIndexError):
           ...
       NonConcreteBooleanIndexError: Array boolean indices must be concrete: ShapedArray(bool[10])
 
-    This function is attempting to return only the positive values in the input
-    array; the size of this returned array cannot be determined at compile-time
-    unless `x` is marked as static, and so operations like this cannot be
-    performed under JIT compilation.
+    这个函数试图只返回输入数组中的正值；
+    除非把 `x` 标记为静态，否则返回数组的大小
+    无法在编译期确定，因此像这样的操作无法
+    在 JIT 编译下执行。
 
-  Reexpressible Boolean Logic
-    Although creating dynamically sized arrays is not supported directly, in
-    many cases it is possible to re-express the logic of the computation in
-    terms of a JIT-compatible operation. For example, here is another function
-    that fails under JIT for the same reason::
+  可重新表达的布尔逻辑
+    尽管 JAX 并不直接支持创建动态大小的数组，
+    但在许多情况下，可以把计算的逻辑重新表达
+    为 JIT 兼容的操作。例如，下面这个函数
+    也因为同样的原因在 JIT 下失败::
 
       >>> @jax.jit
       ... def sum_of_positive(x):
@@ -182,9 +188,9 @@ class NonConcreteBooleanIndexError(JAXIndexError):
           ...
       NonConcreteBooleanIndexError: Array boolean indices must be concrete: ShapedArray(bool[10])
 
-    In this case, however, the problematic array is only an intermediate value,
-    and we can instead express the same logic in terms of the JIT-compatible
-    three-argument version of :func:`jax.numpy.where`::
+    不过在这个例子中，有问题的数组只是一个中间值，
+    我们可以改用 JIT 兼容的
+    :func:`jax.numpy.where` 三参数版本来表达同样的逻辑::
 
       >>> @jax.jit
       ... def sum_of_positive(x):
@@ -193,12 +199,12 @@ class NonConcreteBooleanIndexError(JAXIndexError):
       >>> sum_of_positive(jnp.arange(-5, 5))
       Array(10, dtype=int32)
 
-    This pattern of replacing boolean masking with three-argument
-    :func:`~jax.numpy.where` is a common solution to this sort of problem.
+    用三参数 :func:`~jax.numpy.where` 取代布尔掩码，
+    是解决这类问题的常见做法。
 
-  Boolean indexing into JAX arrays
-    The other situation where this error often arises is when using boolean
-    indices, such as with :code:`.at[...].set(...)`. Here is a simple example::
+  用布尔索引访问 JAX 数组
+    另一个经常出现该错误的情形是使用布尔索引，
+    例如 :code:`.at[...].set(...)`。下面是一个简单的例子::
 
       >>> @jax.jit
       ... def manual_clip(x):
@@ -209,9 +215,9 @@ class NonConcreteBooleanIndexError(JAXIndexError):
           ...
       NonConcreteBooleanIndexError: Array boolean indices must be concrete: ShapedArray(bool[4])
 
-    This function is attempting to set values smaller than zero to a scalar fill
-    value. As above, this can be addressed by re-expressing the logic in terms
-    of :func:`~jax.numpy.where`::
+    这个函数试图把小于零的值设为某个标量填充值。
+    与上面一样，可以把该逻辑重新表达为
+    :func:`~jax.numpy.where` 的形式来解决::
 
       >>> @jax.jit
       ... def manual_clip(x):
@@ -228,14 +234,14 @@ class NonConcreteBooleanIndexError(JAXIndexError):
 @export
 class TracerArrayConversionError(JAXTypeError):
   """
-  This error occurs when a program attempts to convert a JAX Tracer object into
-  a standard NumPy array (see :ref:`faq-different-kinds-of-jax-values` for more
-  on what a Tracer is). It typically occurs in one of a few situations.
+  当程序试图把 JAX 追踪器对象转换为标准 NumPy 数组时，就会抛出这个错误
+  （关于追踪器是什么，参见 :ref:`faq-different-kinds-of-jax-values`）。
+  它通常出现在以下几种情形之中。
 
-  Using non-JAX functions in JAX transformations
-    This error can occur if you attempt to use a non-JAX library like ``numpy``
-    or ``scipy`` inside a JAX transformation (:func:`~jax.jit`, :func:`~jax.grad`,
-    :func:`jax.vmap`, etc.). For example::
+  在 JAX 变换中使用非 JAX 函数
+    如果你在 JAX 变换（:func:`~jax.jit`、:func:`~jax.grad`、
+    :func:`jax.vmap` 等）内部使用 ``numpy`` 或 ``scipy`` 这类
+    非 JAX 库，就可能出现这个错误。例如::
 
       >>> from jax import jit
       >>> import numpy as np
@@ -250,8 +256,8 @@ class TracerArrayConversionError(JAXTypeError):
       TracerArrayConversionError: The numpy.ndarray conversion method
       __array__() was called on traced array with shape int32[4]
 
-    In this case, you can fix the issue by using :func:`jax.numpy.sin` in place of
-    :func:`numpy.sin`::
+    在这个例子中，可以用 :func:`jax.numpy.sin` 代替
+    :func:`numpy.sin` 来修复问题::
 
       >>> import jax.numpy as jnp
       >>> @jit
@@ -261,13 +267,13 @@ class TracerArrayConversionError(JAXTypeError):
       >>> func(jnp.arange(4))
       Array([0.        , 0.84147096, 0.9092974 , 0.14112   ], dtype=float32)
 
-    See also `External Callbacks`_ for options for calling back to host-side computations
-    from transformed JAX code.
+    关于从变换后的 JAX 代码回调主机侧计算的方案，
+    另见 `External Callbacks`_。
 
-  Indexing a numpy array with a tracer
-    If this error arises on a line that involves array indexing, it may be that
-    the array being indexed ``x`` is a standard numpy.ndarray while the indices
-    ``idx`` are traced JAX arrays. For example::
+  用追踪器索引 numpy 数组
+    如果这个错误出现在涉及数组索引的代码行上，
+    可能是被索引的数组 ``x`` 是标准 numpy.ndarray，
+    而索引 ``idx`` 是追踪的 JAX 数组。例如::
 
       >>> x = np.arange(10)
 
@@ -281,8 +287,8 @@ class TracerArrayConversionError(JAXTypeError):
       TracerArrayConversionError: The numpy.ndarray conversion method
       __array__() was called on traced array with shape int32[0]
 
-    Depending on the context, you may fix this by converting the numpy array
-    into a JAX array::
+    视具体上下文而定，你可以把该 numpy 数组
+    转换成 JAX 数组来修复::
 
       >>> @jit
       ... def func(i):
@@ -291,7 +297,7 @@ class TracerArrayConversionError(JAXTypeError):
       >>> func(0)
       Array(0, dtype=int32)
 
-    or by declaring the index as a static argument::
+    或者把索引声明为静态参数::
 
       >>> from functools import partial
       >>> @jit(static_argnums=(0,))
@@ -301,9 +307,9 @@ class TracerArrayConversionError(JAXTypeError):
       >>> func(0)
       Array(0, dtype=int32)
 
-  To understand more subtleties having to do with tracers vs. regular values,
-  and concrete vs. abstract values, you may want to read
-  :ref:`faq-different-kinds-of-jax-values`.
+  如果你想深入了解追踪器与普通值、具体值与抽象值
+  之间还有哪些微妙之处，可以阅读
+  :ref:`faq-different-kinds-of-jax-values`。
 
   .. _External Callbacks: https://docs.jax.dev/en/latest/notebooks/external_callbacks.html
   """
@@ -316,13 +322,13 @@ class TracerArrayConversionError(JAXTypeError):
 @export
 class TracerIntegerConversionError(JAXTypeError):
   """
-  This error can occur when a JAX Tracer object is used in a context where a
-  Python integer is expected (see :ref:`faq-different-kinds-of-jax-values` for
-  more on what a Tracer is). It typically occurs in a few situations.
+  当 JAX 追踪器对象被用在期望 Python 整数的上下文中时，就可能出现这个错误
+  （关于追踪器是什么，参见 :ref:`faq-different-kinds-of-jax-values`）。
+  它通常出现在以下几种情形之中。
 
-  Passing a tracer in place of an integer
-    This error can occur if you attempt to pass a traced value to a function
-    that requires a static integer argument; for example::
+  用追踪器代替整数传入
+    如果你试图把被追踪的值传给需要静态整数参数的函数，
+    就可能出现这个错误；例如::
 
       >>> from jax import jit
       >>> import numpy as np
@@ -337,8 +343,8 @@ class TracerIntegerConversionError(JAXTypeError):
       TracerIntegerConversionError: The __index__() method was called on
       traced array with shape int32[0]
 
-    When this happens, the solution is often to mark the problematic argument as
-    static::
+    出现这种情况时，通常的解决办法是把有问题的参数
+    标记为静态::
 
       >>> from functools import partial
       >>> @jit(static_argnums=1)
@@ -349,20 +355,20 @@ class TracerIntegerConversionError(JAXTypeError):
       [Array([0, 1, 2, 3, 4], dtype=int32),
        Array([5, 6, 7, 8, 9], dtype=int32)]
 
-    An alternative is to apply the transformation to a closure that encapsulates
-    the arguments to be protected, either manually as below or by using
-    :func:`functools.partial`::
+    另一种做法是把变换应用到一个封装了待保护参数的闭包上，
+    既可以像下面这样手工完成，
+    也可以借助 :func:`functools.partial`::
 
       >>> jit(lambda arr: np.split(arr, 2, 0))(np.arange(4))
       [Array([0, 1], dtype=int32), Array([2, 3], dtype=int32)]
 
-    **Note a new closure is created at every invocation, which defeats the
-    compilation caching mechanism, which is why static_argnums is preferred.**
+    **注意：每次调用都会创建一个新的闭包，这会破坏编译缓存机制，
+    因此更推荐使用 static_argnums。**
 
-  Indexing a list with a Tracer
-    This error can occur if you attempt to index a Python list with a traced
-    quantity.
-    For example::
+  用追踪器索引列表
+    如果你试图用被追踪的量去索引 Python 列表，
+    就可能出现这个错误。
+    例如::
 
       >>> import jax.numpy as jnp
       >>> from jax import jit
@@ -379,8 +385,8 @@ class TracerIntegerConversionError(JAXTypeError):
       TracerIntegerConversionError: The __index__() method was called on
       traced array with shape int32[0]
 
-    Depending on the context, you can generally fix this either by converting
-    the list to a JAX array::
+    视具体上下文而定，通常可以把该列表
+    转换成 JAX 数组来修复::
 
       >>> @jit
       ... def func(i):
@@ -389,7 +395,7 @@ class TracerIntegerConversionError(JAXTypeError):
       >>> func(0)
       Array(1, dtype=int32)
 
-    or by declaring the index as a static argument::
+    或者把索引声明为静态参数::
 
       >>> from functools import partial
       >>> @jit(static_argnums=0)
@@ -399,9 +405,9 @@ class TracerIntegerConversionError(JAXTypeError):
       >>> func(0)
       Array(1, dtype=int32, weak_type=True)
 
-  To understand more subtleties having to do with tracers vs. regular values,
-  and concrete vs. abstract values, you may want to read
-  :ref:`faq-different-kinds-of-jax-values`.
+  如果你想深入了解追踪器与普通值、具体值与抽象值
+  之间还有哪些微妙之处，可以阅读
+  :ref:`faq-different-kinds-of-jax-values`。
   """
   def __init__(self, tracer: core.Tracer):
     super().__init__(
@@ -412,24 +418,24 @@ class TracerIntegerConversionError(JAXTypeError):
 @export
 class TracerBoolConversionError(ConcretizationTypeError):
   """
-  This error occurs when a traced value in JAX is used in a context where a
-  boolean value is expected (see :ref:`faq-different-kinds-of-jax-values`
-  for more on what a Tracer is).
+  当 JAX 中被追踪的值被用在期望布尔值的上下文中时，就会抛出这个错误
+  （关于追踪器是什么，参见
+  :ref:`faq-different-kinds-of-jax-values`）。
 
-  The boolean cast may be an explicit (e.g. ``bool(x)``) or implicit, through use of
-  control flow (e.g. ``if x > 0`` or ``while x``), use of Python boolean
-  operators (e.g. ``z = x and y``, ``z = x or y``, ``z = not x``) or functions
-  that use them (e.g. ``z = max(x, y)``, ``z = min(x, y)`` etc.).
+  这种布尔转换可能是显式的（例如 ``bool(x)``），也可能是隐式的：
+  来自控制流（例如 ``if x > 0`` 或 ``while x``）、
+  Python 布尔运算符（例如 ``z = x and y``、``z = x or y``、``z = not x``），
+  或使用了这些运算符的函数（例如 ``z = max(x, y)``、``z = min(x, y)`` 等）。
 
-  In some situations, this problem can be easily fixed by marking traced values as
-  static; in others, it may indicate that your program is doing operations that are
-  not directly supported by JAX's JIT compilation model.
+  在某些情况下，把被追踪的值标记为静态即可轻松解决这个问题；
+  在另一些情况下，它可能表明你的程序正在执行的操作
+  并不被 JAX 的 JIT 编译模型直接支持。
 
   Examples:
 
-  Traced value used in control flow
-    One case where this often arises is when a traced value is used in
-    Python control flow. For example::
+  在控制流中使用被追踪的值
+    常见的一种情形是在 Python 控制流中
+    使用了被追踪的值。例如::
 
       >>> from jax import jit
       >>> import jax.numpy as jnp
@@ -442,9 +448,9 @@ class TracerBoolConversionError(ConcretizationTypeError):
           ...
       TracerBoolConversionError: Attempted boolean conversion of JAX Tracer [...]
 
-    We could mark both inputs ``x`` and ``y`` as static, but that would defeat
-    the purpose of using :func:`jax.jit` here. Another option is to re-express
-    the if statement in terms of the three-term :func:`jax.numpy.where`::
+    我们可以把两个输入 ``x`` 和 ``y`` 都标记为静态，
+    但那样就失去了在这里使用 :func:`jax.jit` 的意义。
+    另一种选择是用三项的 :func:`jax.numpy.where` 重新表达这个 if 语句::
 
       >>> @jit
       ... def func(x, y):
@@ -453,12 +459,12 @@ class TracerBoolConversionError(ConcretizationTypeError):
       >>> func(jnp.ones(4), jnp.zeros(4))
       Array([0., 0., 0., 0.], dtype=float32)
 
-    For more complicated control flow including loops, see
-    :ref:`lax-control-flow`.
+    关于包含循环在内的更复杂控制流，参见
+    :ref:`lax-control-flow`。
 
-  Control flow on traced values
-    Another common cause of this error is if you inadvertently trace over a boolean
-    flag. For example::
+  针对被追踪值的控制流
+    这个错误的另一个常见原因是，你不小心把某个布尔标志
+    也纳入了追踪。例如::
 
       >>> @jit
       ... def func(x, normalize=True):
@@ -471,9 +477,9 @@ class TracerBoolConversionError(ConcretizationTypeError):
           ...
       TracerBoolConversionError: Attempted boolean conversion of JAX Tracer ...
 
-    Here because the flag ``normalize`` is traced, it cannot be used in Python
-    control flow. In this situation, the best solution is probably to mark this
-    value as static::
+    这里由于标志 ``normalize`` 是被追踪的，
+    它不能用于 Python 控制流。在这种情况下，
+    最好的办法大概是把这个值标记为静态::
 
       >>> from functools import partial
       >>> @jit(static_argnames=['normalize'])
@@ -485,11 +491,11 @@ class TracerBoolConversionError(ConcretizationTypeError):
       >>> func(jnp.arange(5), True)
       Array([0. , 0.1, 0.2, 0.3, 0.4], dtype=float32)
 
-    For more on ``static_argnums``, see the documentation of :func:`jax.jit`.
+    关于 ``static_argnums`` 的更多内容，参见 :func:`jax.jit` 的文档。
 
-  Using non-JAX aware functions
-    Another common cause of this error is using non-JAX aware functions within JAX
-    code. For example:
+  使用不感知 JAX 的函数
+    另一个常见原因是在 JAX 代码中使用了
+    不感知 JAX 的函数。例如：
 
       >>> @jit
       ... def func(x):
@@ -500,9 +506,9 @@ class TracerBoolConversionError(ConcretizationTypeError):
           ...
       TracerBoolConversionError: Attempted boolean conversion of JAX Tracer ...
 
-    In this case, the error occurs because Python's built-in ``min`` function is not
-    compatible with JAX transforms. This can be fixed by replacing it with
-    ``jnp.minimum``:
+    在这个例子中，出错是因为 Python 内置的 ``min`` 函数
+    与 JAX 变换不兼容。可以把它替换为
+    ``jnp.minimum`` 来修复：
 
       >>> @jit
       ... def func(x):
@@ -511,9 +517,9 @@ class TracerBoolConversionError(ConcretizationTypeError):
       >>> print(func(2))
       0
 
-  To understand more subtleties having to do with tracers vs. regular values,
-  and concrete vs. abstract values, you may want to read
-  :ref:`faq-different-kinds-of-jax-values`.
+  如果你想深入了解追踪器与普通值、具体值与抽象值
+  之间还有哪些微妙之处，可以阅读
+  :ref:`faq-different-kinds-of-jax-values`。
   """
   def __init__(self, tracer: core.Tracer):
     JAXTypeError.__init__(self,
@@ -524,26 +530,26 @@ class TracerBoolConversionError(ConcretizationTypeError):
 @export
 class UnexpectedTracerError(JAXTypeError):
   """
-  This error occurs when you use a JAX value that has leaked out of a function.
-  What does it mean to leak a value? If you use a JAX transformation on a
-  function ``f`` that stores, in some scope outside of ``f``, a reference to
-  an intermediate value, that value is considered to have been leaked.
-  Leaking values is a side effect. (Read more about avoiding side effects in
-  `Pure Functions <https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions>`_)
+  当你使用了从函数中泄漏出来的 JAX 值时，就会抛出这个错误。
+  什么叫泄漏一个值？如果你对函数 ``f`` 使用 JAX 变换，
+  而该函数把某个中间值的引用存到了 ``f`` 之外的某个作用域中，
+  那么这个值就被视为已经泄漏。泄漏值是一种副作用。
+  （关于如何避免副作用，可阅读
+  `Pure Functions <https://docs.jax.dev/en/latest/notebooks/Common_Gotchas_in_JAX.html#pure-functions>`_）
 
-  JAX detects leaks when you then use the leaked value in another
-  operation later on, at which point it raises an ``UnexpectedTracerError``.
-  To fix this, avoid side effects: if a function computes a value needed
-  in an outer scope, return that value from the transformed function explicitly.
+  JAX 会在你之后于另一个操作中使用这个泄漏值时检测到泄漏，
+  此时它会抛出 ``UnexpectedTracerError``。
+  要修复这个问题，请避免副作用：如果某个函数计算出的值
+  在外层作用域中需要用到，就应当从被变换的函数中显式返回该值。
 
-  Specifically, a ``Tracer`` is JAX's internal representation of a function's
-  intermediate values during transformations, e.g. within :func:`~jax.jit`,
-  :func:`~jax.pmap`, :func:`~jax.vmap`, etc. Encountering a ``Tracer`` outside
-  of a transformation implies a leak.
+  具体来说，``Tracer`` 是 JAX 在变换期间对函数中间值的内部表示，
+  例如在 :func:`~jax.jit`、:func:`~jax.pmap`、
+  :func:`~jax.vmap` 等之中。在变换之外遇到 ``Tracer``
+  就意味着发生了泄漏。
 
-  Life-cycle of a leaked value
-    Consider the following example of a transformed function which leaks a value
-    to an outer scope::
+  泄漏值的生命周期
+    请看下面这个例子：一个被变换的函数
+    把值泄漏到了外层作用域::
 
       >>> from jax import jit
       >>> import jax.numpy as jnp
@@ -561,40 +567,40 @@ class UnexpectedTracerError(JAXTypeError):
           ...
       UnexpectedTracerError: Encountered an unexpected tracer.
 
-    In this example we leak a Traced value from an inner transformed scope to an
-    outer scope. We get an ``UnexpectedTracerError`` when the leaked value is
-    used, not when the value is leaked.
+    在这个例子中，我们把一个被追踪的值从内部变换作用域泄漏到了
+    外层作用域。``UnexpectedTracerError`` 是在泄漏值被使用时
+    抛出的，而不是在值泄漏时抛出。
 
-    This example also demonstrates the life-cycle of a leaked value:
+    这个例子也展示了泄漏值的生命周期：
 
-      1. A function is transformed (in this case, by :func:`~jax.jit`)
-      2. The transformed function is called (initiating an abstract trace of the
-         function and turning ``x`` into a ``Tracer``)
-      3. The intermediate value ``y``, which will later be leaked, is created
-         (an intermediate value of a traced function is also a ``Tracer``)
-      4. The value is leaked (appended to a list in an outer scope, escaping
-         the function through a side-channel)
-      5. The leaked value is used, and an UnexpectedTracerError is raised.
+      1. 函数被变换（这里是经 :func:`~jax.jit` 变换）
+      2. 被变换的函数被调用（由此启动对该函数的抽象追踪，
+         并把 ``x`` 变成一个 ``Tracer``）
+      3. 之后会被泄漏的中间值 ``y`` 被创建出来
+         （被追踪函数的中间值同样是 ``Tracer``）
+      4. 该值被泄漏（它被追加到外层作用域的一个列表中，
+         通过旁路从函数中逃逸出去）
+      5. 泄漏的值被使用，于是抛出 ``UnexpectedTracerError``。
 
-    The UnexpectedTracerError message tries to point to these locations in your
-    code by including information about each stage. Respectively:
+    ``UnexpectedTracerError`` 的消息会通过包含每个阶段的信息，
+    尽力指出你代码中这些位置。它们依次是：
 
-      1. The name of the transformed function (``side_effecting``) and which
-         transform kicked off the trace  :func:`~jax.jit`).
-      2. A reconstructed stack trace of where the leaked Tracer was created,
-         which includes where the transformed function was called.
-         (``When the Tracer was created, the final 5 stack frames were...``).
-      3. From the reconstructed stack trace, the line of code that created
-         the leaked Tracer.
-      4. The leak location is not included in the error message because it is
-         difficult to pin down! JAX can only tell you what the leaked value
-         looks like (what shape it has and where it was created) and what
-         boundary it was leaked over (the name of the transformation and the
-         name of the transformed function).
-      5. The current error's stack trace points to where the value is used.
+      1. 被变换函数的名称（``side_effecting``），以及是哪个变换
+         发起了这次追踪 :func:`~jax.jit`）。
+      2. 重建的栈回溯，指出泄漏的 ``Tracer`` 是在哪里创建的，
+         其中包含被变换函数的调用位置。
+         （``When the Tracer was created, the final 5 stack frames were...``）。
+      3. 根据重建的栈回溯，指出创建该泄漏 ``Tracer``
+         的那行代码。
+      4. 错误消息中不包含泄漏位置，因为这一点很难确定！
+         JAX 只能告诉你泄漏的值长什么样
+         （它是什么形状、在哪里创建），
+         以及它是越过哪个边界泄漏的（变换的名称
+         和被变换函数的名称）。
+      5. 当前错误的栈回溯指向该值被使用的位置。
 
-    The error can be fixed by the returning the value out of the
-    transformed function::
+    把该值从被变换的函数中返回出来
+    即可修复这个错误::
 
       >>> from jax import jit
       >>> import jax.numpy as jnp
@@ -611,28 +617,28 @@ class UnexpectedTracerError(JAXTypeError):
       >>> outs[0] + 1  # all good! no longer a leaked value.
       Array(3, dtype=int32, weak_type=True)
 
-  Leak checker
-    As discussed in point 2 and 3 above, JAX shows a reconstructed stack trace
-    which points to where the leaked value was created.  This is because
-    JAX only raises an error when the leaked value is used, not when the
-    value is leaked. This is not the most useful place to raise this error,
-    because you need to know the location where the Tracer was leaked to fix the
-    error.
+  泄漏检查器
+    如上面第 2 点和第 3 点所述，JAX 会显示重建的栈回溯，
+    指出泄漏的值是在哪里创建的。这是因为
+    JAX 只在泄漏值被使用时抛出错误，而不是在值泄漏时。
+    这并不是抛出该错误最有用的位置，
+    因为要修复错误，你需要知道 ``Tracer``
+    是在哪里泄漏的。
 
-    To make this location easier to track down, you can use the leak checker.
-    When the leak checker is enabled, an error is raised as soon as a ``Tracer``
-    is leaked. (To be more exact, it will raise an error when the transformed
-    function from which the ``Tracer`` is leaked returns)
+    为了让这个位置更容易定位，你可以使用泄漏检查器。
+    启用泄漏检查器后，一旦有 ``Tracer`` 泄漏就会立刻抛出错误。
+    （更准确地说，它会在 ``Tracer`` 所泄漏自的
+    被变换函数返回时抛出错误）
 
-    To enable the leak checker you can use the ``JAX_CHECK_TRACER_LEAKS``
-    environment variable or the ``with jax.checking_leaks()`` context manager.
+    要启用泄漏检查器，可以使用 ``JAX_CHECK_TRACER_LEAKS``
+    环境变量，或 ``with jax.checking_leaks()`` 上下文管理器。
 
     .. note::
-      Note that this tool is experimental and may report false positives. It
-      works by disabling some JAX caches, so it will have a negative effect on
-      performance and should only be used when debugging.
+      注意该工具是实验性的，可能会报告误报。
+      它的工作原理是禁用 JAX 的部分缓存，因此会对
+      性能产生负面影响，只应在调试时使用。
 
-    Example usage::
+    用法示例::
 
       >>> from jax import jit
       >>> import jax.numpy as jnp
@@ -659,11 +665,11 @@ class UnexpectedTracerError(JAXTypeError):
 @export
 class KeyReuseError(JAXTypeError):
   """
-  This error occurs when a PRNG key is reused in an unsafe manner.
-  Key reuse is checked only when `jax_debug_key_reuse` is
-  set to `True`.
+  当 PRNG key 以不安全的方式被复用时，就会抛出这个错误。
+  只有在 `jax_debug_key_reuse` 被设为 `True` 时，
+  才会检查 key 复用。
 
-  Here is a simple example of code that would lead to such an error::
+  下面是一个会导致此类错误的简单代码示例::
 
     >>> with jax.debug_key_reuse(True):  # doctest: +SKIP
     ...   key = jax.random.key(0)
@@ -675,7 +681,7 @@ class KeyReuseError(JAXTypeError):
     ...
     KeyReuseError: Previously-consumed key passed to jit-compiled function at index 0
 
-  This sort of key reuse is problematic because the JAX PRNG is stateless, and keys
-  must be manually split; For more information on this see `the Pseudorandom Numbers
-  tutorial <https://docs.jax.dev/en/latest/random-numbers.html>`_.
+  这类 key 复用之所以成为问题，是因为 JAX 的 PRNG 是无状态的，
+  key 必须手动拆分；更多信息参见
+  `伪随机数教程 <https://docs.jax.dev/en/latest/random-numbers.html>`_。
   """

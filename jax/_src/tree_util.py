@@ -27,6 +27,12 @@ from jax._src.lib import pytree
 from jax._src.util import safe_zip, set_module
 from jax._src.util import unzip2
 
+# 文件职责：实现 JAX 的 pytree 抽象层，把嵌套的 Python 容器（list、tuple、dict、
+# 自定义类等）视为可整体展平/重建的树，是 jit、vmap、grad 等变换处理非数组参数的
+# 统一接口。对外经 jax.tree_util 暴露 flatten/unflatten、map/reduce、transpose、
+# broadcast 等操作，以及带键路径（KeyPath）的遍历与注册 API。
+# 内部维护多个 PyTreeRegistry（默认、None 视作叶子的、供 C++ 快速分派的、用于追踪的），
+# 并提供结构不匹配时的诊断信息生成（_prefix_error、_equality_errors）。
 
 export = set_module('jax.tree_util')
 
@@ -41,28 +47,24 @@ PyTree = Any
 PyTreeDef = pytree.PyTreeDef
 
 default_registry = pytree.default_registry()
-# Set __module__ and __name__, which allow this registry to be pickled by
-# reference.
+# 设置 __module__ 与 __name__，使该注册表可以按引用被 pickle 序列化。
 default_registry.__module__ = __name__
 default_registry.__name__ = "default_registry"  # pyrefly: ignore[missing-attribute]
 
-# A copy of the default registry, where None is a leaf.
+# 默认注册表的一份副本，其中 None 被当作叶子。
 none_leaf_registry = pytree.PyTreeRegistry(
     enable_none=False, enable_tuple=True, enable_namedtuple=True,
     enable_list=True, enable_dict=True)
 none_leaf_registry.__module__ = __name__
 none_leaf_registry.__name__ = "none_leaf_registry"  # pyrefly: ignore[missing-attribute]
 
-# A special, internal pytree registry that includes everything in
-# `default_registry`, plus internal Python-defined types that we want
-# to teach the fast dispatch path ("C++ dispatch") how to flatten and
-# unflatten. A key example is PRNG key arrays, which are currently a
-# Python-defined class (in `jax._src.prng`). These ought to be a leaf
-# node everywhere in the system (e.g. in Jaxpr), but we want to unpack
-# and repack them across the fast dispatch boundary. If we were to
-# skip registering such types here, the fast dispatch path would not
-# know how to handle them as arguments. It would instead always
-# indicate a "cache miss" and dispatch on the slow path.
+# 一个特殊的内部 pytree 注册表，它包含 `default_registry` 中的全部内容，
+# 并额外包含我们想让快速分派路径（“C++ 分派”）学会如何展平与重建的、
+# 由 Python 定义的类型。一个关键例子是 PRNG 密钥数组，它目前是一个由
+# Python 定义的类（位于 `jax._src.prng`）。这些对象在系统的所有位置
+# （例如 Jaxpr 中）本应都是叶子节点，但我们希望在快速分派边界上对它们
+# 进行拆包与重新打包。若不在这个注册表里注册这类类型，快速分派路径就不
+# 知道该如何把它们当作参数来处理，而会始终报告“缓存未命中”并走慢路径分派。
 dispatch_registry = pytree.PyTreeRegistry(
     enable_none=True, enable_tuple=True, enable_namedtuple=True,
     enable_list=True, enable_dict=True)
@@ -86,13 +88,13 @@ _all_registries = (
 def tree_flatten(tree: Any,
                  is_leaf: Callable[[Any], bool] | None = None
                  ) -> tuple[list[Leaf], PyTreeDef]:
-  """Alias of :func:`jax.tree.flatten`."""
+  """`jax.tree.flatten` 的别名。"""
   return default_registry.flatten(tree, is_leaf)
 
 
 @export
 def tree_unflatten(treedef: PyTreeDef, leaves: Iterable[Leaf]) -> Any:
-  """Alias of :func:`jax.tree.unflatten`."""
+  """`jax.tree.unflatten` 的别名。"""
   return treedef.unflatten(leaves)
 
 
@@ -100,7 +102,7 @@ def tree_unflatten(treedef: PyTreeDef, leaves: Iterable[Leaf]) -> Any:
 def tree_leaves(tree: Any,
                 is_leaf: Callable[[Any], bool] | None = None
                 ) -> list[Leaf]:
-  """Alias of :func:`jax.tree.leaves`."""
+  """`jax.tree.leaves` 的别名。"""
   return default_registry.flatten(tree, is_leaf)[0]
 
 
@@ -115,22 +117,22 @@ def tree_leaves_checked(treedef_expected: PyTreeDef, tree: Any) -> list[Leaf]:
 def tree_structure(tree: Any,
                    is_leaf: None | (Callable[[Any],
                                               bool]) = None) -> PyTreeDef:
-  """Alias of :func:`jax.tree.structure`."""
+  """`jax.tree.structure` 的别名。"""
   return default_registry.flatten(tree, is_leaf)[1]
 
-# TODO: get rid of the tree registry system altogether (use FlatTree instead)
+# TODO: 彻底去掉这套树注册表机制（改用 FlatTree）
 def treedef_tuple_tracing_registry(treedefs: Iterable[PyTreeDef]) -> PyTreeDef:
   return pytree.treedef_tuple(tracing_registry, list(treedefs))
 
 @export
 def treedef_tuple(treedefs: Iterable[PyTreeDef]) -> PyTreeDef:
-  """Makes a tuple treedef from an iterable of child treedefs.
+  """由子 treedef 的可迭代对象构造出一个元组 treedef。
 
   Args:
-    treedefs: iterable of PyTree structures
+    treedefs: PyTree 结构的可迭代对象
 
   Returns:
-    a single treedef representing a tuple of the structures
+    一个表示这些结构所组成的元组的单一 treedef
 
   Examples:
     >>> import jax
@@ -150,13 +152,13 @@ def treedef_tuple(treedefs: Iterable[PyTreeDef]) -> PyTreeDef:
 
 @export
 def treedef_children(treedef: PyTreeDef) -> list[PyTreeDef]:
-  """Return a list of treedefs for immediate children
+  """返回直接子节点的 treedef 列表
 
   Args:
-    treedef: a single PyTreeDef
+    treedef: 单个 PyTreeDef
 
   Returns:
-    a list of PyTreeDefs representing the children of treedef.
+    一个 PyTreeDef 列表，表示 treedef 的各子节点。
 
   Examples:
     >>> import jax
@@ -175,13 +177,13 @@ def treedef_children(treedef: PyTreeDef) -> list[PyTreeDef]:
 
 @export
 def treedef_is_leaf(treedef: PyTreeDef) -> bool:
-  """Return True if the treedef represents a leaf.
+  """若该 treedef 表示一个叶子则返回 True。
 
   Args:
-    treedef: tree to check
+    treedef: 待检查的树
 
   Returns:
-    True if treedef is a leaf (i.e. has a single node); False otherwise.
+    若 treedef 是一个叶子（即只有一个节点）则为 True；否则为 False。
 
   Examples:
     >>> import jax
@@ -195,7 +197,7 @@ def treedef_is_leaf(treedef: PyTreeDef) -> bool:
   return treedef.num_nodes == 1
 
 
-# treedef_is_strict_leaf is not exported.
+# treedef_is_strict_leaf 不对外导出。
 def treedef_is_strict_leaf(treedef: PyTreeDef) -> bool:
   return treedef.num_nodes == 1 and treedef.num_leaves == 1
 
@@ -203,17 +205,16 @@ def treedef_is_strict_leaf(treedef: PyTreeDef) -> bool:
 @export
 def all_leaves(iterable: Iterable[Any],
                is_leaf: Callable[[Any], bool] | None = None) -> bool:
-  """Tests whether all elements in the given iterable are all leaves.
+  """检验给定可迭代对象中的所有元素是否都是叶子。
 
-  This function is useful in advanced cases, for example if a library allows
-  arbitrary map operations on a flat iterable of leaves it may want to check
-  if the result is still a flat iterable of leaves.
+  该函数在高级场景中很有用：例如某个库允许对所展平的叶子序列做任意 map 操作，
+  它可能想检查结果是否仍然是叶子所构成的一维序列。
 
   Args:
-    iterable: Iterable of leaves.
+    iterable: 叶子的可迭代对象。
 
   Returns:
-    A boolean indicating if all elements in the input are leaves.
+    一个布尔值，表示输入中的所有元素是否都是叶子。
 
   Examples:
     >>> import jax
@@ -233,14 +234,14 @@ def all_leaves(iterable: Iterable[Any],
 
 @export
 def is_tree_node(typ: type) -> bool:
-  """Returns True if the type is a registered PyTree node type.
+  """若该类型是已注册的 PyTree 节点类型则返回 True。
 
   Args:
-    typ: The type to check.
+    typ: 要检查的类型。
 
   Returns:
-    True if the type is a registered PyTree node type (built-in or custom)
-    or a namedtuple type.
+    若该类型是已注册的 PyTree 节点类型（内置或自定义）或 namedtuple
+    类型，则为 True。
   """
   return default_registry.is_node(typ)
 
@@ -262,30 +263,28 @@ def register_pytree_node(
         Callable[[T], tuple[KeyLeafPairs, _AuxData]] | None
     ) = None,
 ) -> None:
-  """Extends the set of types that are considered internal nodes in pytrees.
+  """扩充被视为 pytree 内部节点的类型集合。
 
-  See :ref:`example usage <pytrees>`.
+  参见 :ref:`使用示例 <pytrees>`。
 
   Args:
-    nodetype: a Python type to register as a pytree.
-    flatten_func: a function to be used during flattening, taking a value of
-      type ``nodetype`` and returning a pair, with (1) an iterable for the
-      children to be flattened recursively, and (2) some hashable auxiliary data
-      to be stored in the treedef and to be passed to the ``unflatten_func``.
-    unflatten_func: a function taking two arguments: the auxiliary data that was
-      returned by ``flatten_func`` and stored in the treedef, and the
-      unflattened children. The function should return an instance of
-      ``nodetype``.
+    nodetype: 要注册为 pytree 的 Python 类型。
+    flatten_func: 展平时使用的函数，接受一个 ``nodetype`` 类型的值并返回
+      一个二元组，其中 (1) 是一个可迭代对象，给出需要被递归展平的子节点，
+      (2) 是一些可哈希的辅助数据，会被存入 treedef 并传给 ``unflatten_func``。
+    unflatten_func: 接受两个参数的函数：由 ``flatten_func`` 返回并存入
+      treedef 的辅助数据，以及已重建的子节点。该函数应返回一个
+      ``nodetype`` 的实例。
 
-  See also:
-    - :func:`~jax.tree_util.register_static`: simpler API for registering a static pytree.
-    - :func:`~jax.tree_util.register_dataclass`: simpler API for registering a dataclass.
+  See Also:
+    - :func:`~jax.tree_util.register_static`：用于注册静态 pytree 的更简单 API。
+    - :func:`~jax.tree_util.register_dataclass`：用于注册 dataclass 的更简单 API。
     - :func:`~jax.tree_util.register_pytree_with_keys`
     - :func:`~jax.tree_util.register_pytree_node_class`
     - :func:`~jax.tree_util.register_pytree_with_keys_class`
 
   Examples:
-    First we'll define a custom type:
+    首先定义一个自定义类型：
 
     >>> class MyContainer:
     ...   def __init__(self, size):
@@ -293,8 +292,8 @@ def register_pytree_node(
     ...     self.y = jnp.ones(size)
     ...     self.size = size
 
-    If we try using this in a JIT-compiled function, we'll get an error because JAX
-    does not yet know how to handle this type:
+    如果直接在 JIT 编译的函数中使用它，就会报错，因为 JAX 尚不知道
+    如何处理这个类型：
 
     >>> m = MyContainer(size=5)
     >>> def f(m):
@@ -304,8 +303,7 @@ def register_pytree_node(
       ...
     TypeError: Cannot interpret value of type <class 'jax.tree_util.MyContainer'> as an abstract array; it does not have a dtype attribute
 
-    In order to make our object recognized by JAX, we must register it as
-    a pytree:
+    为了让 JAX 能识别我们的对象，必须把它注册为一个 pytree：
 
     >>> def flatten_func(obj):
     ...   children = (obj.x, obj.y)  # children must contain arrays & pytrees
@@ -321,7 +319,7 @@ def register_pytree_node(
     ...
     >>> jax.tree_util.register_pytree_node(MyContainer, flatten_func, unflatten_func)
 
-    Now with this defined, we can use instances of this type in JIT-compiled functions.
+    这样定义之后，就可以在 JIT 编译的函数中使用该类型的实例了。
 
     >>> jax.jit(f)(m)
     Array([1., 2., 3., 4., 5.], dtype=float32)
@@ -335,29 +333,26 @@ def register_pytree_node(
 
 @export
 def register_pytree_node_class(cls: Typ) -> Typ:
-  """Extends the set of types that are considered internal nodes in pytrees.
+  """扩充被视为 pytree 内部节点的类型集合。
 
-  This function is a thin wrapper around ``register_pytree_node``, and provides
-  a class-oriented interface.
+  本函数是 ``register_pytree_node`` 的薄包装，提供面向类的接口。
 
   Args:
-    cls: a type to register as a pytree
+    cls: 要注册为 pytree 的类型
 
   Returns:
-    The input class ``cls`` is returned unchanged after being added to JAX's pytree
-    registry. This return value allows ``register_pytree_node_class`` to be used as
-    a decorator.
+    输入类 ``cls`` 在加入 JAX 的 pytree 注册表后被原样返回。借助该返回值，
+    ``register_pytree_node_class`` 可以用作装饰器。
 
-  See also:
-    - :func:`~jax.tree_util.register_static`: simpler API for registering a static pytree.
-    - :func:`~jax.tree_util.register_dataclass`: simpler API for registering a dataclass.
+  See Also:
+    - :func:`~jax.tree_util.register_static`：用于注册静态 pytree 的更简单 API。
+    - :func:`~jax.tree_util.register_dataclass`：用于注册 dataclass 的更简单 API。
     - :func:`~jax.tree_util.register_pytree_node`
     - :func:`~jax.tree_util.register_pytree_with_keys`
     - :func:`~jax.tree_util.register_pytree_with_keys_class`
 
   Examples:
-    Here we'll define a custom container that will be compatible with :func:`jax.jit`
-    and other JAX transformations:
+    这里定义一个与 :func:`jax.jit` 及其他 JAX 变换兼容的自定义容器：
 
     >>> import jax
     >>> @jax.tree_util.register_pytree_node_class
@@ -390,7 +385,7 @@ def tree_map(f: Callable[..., Any],
              tree: Any,
              *rest: Any,
              is_leaf: Callable[[Any], bool] | None = None) -> Any:
-  """Alias of :func:`jax.tree.map`."""
+  """`jax.tree.map` 的别名。"""
   leaves, treedef = tree_flatten(tree, is_leaf)
   try:
     all_leaves = [leaves] + [treedef.flatten_up_to(r2 := r) for r in rest]
@@ -403,7 +398,7 @@ def tree_map(f: Callable[..., Any],
 @export
 def tree_transpose(outer_treedef: PyTreeDef, inner_treedef: PyTreeDef | None,
                    pytree_to_transpose: Any) -> Any:
-  """Alias of :func:`jax.tree.transpose`."""
+  """`jax.tree.transpose` 的别名。"""
   flat, treedef = tree_flatten(pytree_to_transpose)
   if inner_treedef is None:
     inner_treedef = tree_structure(outer_treedef.flatten_up_to(pytree_to_transpose)[0])
@@ -421,9 +416,8 @@ def tree_transpose(outer_treedef: PyTreeDef, inner_treedef: PyTreeDef | None,
   return tree_unflatten(inner_treedef, subtrees)
 
 
-# TODO(mattjj): remove the Python-side registry when the C++-side registry is
-# sufficiently queryable that we can express _replace_nones. That may mean once
-# we have a flatten_one function.
+# TODO(mattjj): 当 C++ 侧的注册表可查询性足够强、足以表达 _replace_nones 时，
+# 就移除 Python 侧的注册表。那也许意味着等到我们有了 flatten_one 函数之后。
 _RegistryEntry = collections.namedtuple("_RegistryEntry", ["to_iter", "from_iter"])
 _registry: dict[type[Any], _RegistryEntry] = {
     tuple: _RegistryEntry(lambda xs: (xs, None), lambda _, xs: tuple(xs)),
@@ -443,7 +437,7 @@ def tree_reduce(function: Callable[[T, Any], T],
                 tree: Any,
                 initializer: T | Unspecified = Unspecified(),
                 is_leaf: Callable[[Any], bool] | None = None) -> T:
-  """Alias of :func:`jax.tree.reduce`."""
+  """`jax.tree.reduce` 的别名。"""
   if isinstance(initializer, Unspecified):
     return functools.reduce(function, tree_leaves(tree, is_leaf=is_leaf))
   else:
@@ -477,19 +471,19 @@ def tree_reduce_associative(
     identity: T | Unspecified = Unspecified(),
     is_leaf: Callable[[Any], bool] | None = None,
 ) -> T:
-  """Alias of :func:`jax.tree.reduce_associative`."""
+  """`jax.tree.reduce_associative` 的别名。"""
   sequence = tree_leaves(tree, is_leaf=is_leaf)
   return _parallel_reduce(sequence, operation, identity)
 
 
 @export
 def tree_all(tree: Any, *, is_leaf: Callable[[Any], bool] | None = None) -> bool:
-  """Alias of :func:`jax.tree.all`."""
+  """`jax.tree.all` 的别名。"""
   return all(tree_leaves(tree, is_leaf=is_leaf))
 
 
 class _HashableCallableShim:
-  """Object that delegates __call__, __hash__, and __eq__ to another object."""
+  """把 __call__、__hash__ 与 __eq__ 委托给另一个对象的对象。"""
 
   def __init__(self, fun):
     self.fun = fun
@@ -511,25 +505,23 @@ class _HashableCallableShim:
 
 @export
 class Partial(functools.partial):
-  """A version of functools.partial that works in pytrees.
+  """`functools.partial` 的一个可用于 pytree 的版本。
 
-  Use it for partial function evaluation in a way that is compatible with JAX's
-  transformations, e.g., ``Partial(func, *args, **kwargs)``.
+  当你需要以与 JAX 变换兼容的方式进行偏函数求值时使用它，例如
+  ``Partial(func, *args, **kwargs)``。
 
-  (You need to explicitly opt-in to this behavior because we didn't want to give
-  functools.partial different semantics than normal function closures.)
+  （你需要显式选择启用这种行为，因为我们不想让 `functools.partial` 的语义
+  与普通函数闭包不同。）
 
-  For example, here is a basic usage of ``Partial`` in a manner similar to
-  ``functools.partial``:
+  例如，下面是与 ``functools.partial`` 用法类似的一个 ``Partial`` 基本示例：
 
   >>> import jax.numpy as jnp
   >>> add_one = Partial(jnp.add, 1)
   >>> add_one(2)
   Array(3, dtype=int32, weak_type=True)
 
-  Pytree compatibility means that the resulting partial function can be passed
-  as an argument within transformed JAX functions, which is not possible with a
-  standard ``functools.partial`` function:
+  pytree 兼容意味着得到的偏函数可以作为参数传入经过变换的 JAX 函数，
+  而标准的 ``functools.partial`` 函数做不到这一点：
 
   >>> from jax import jit
   >>> @jit
@@ -539,18 +531,16 @@ class Partial(functools.partial):
   >>> call_func(add_one, 2)
   Array(3, dtype=int32, weak_type=True)
 
-  Passing zero arguments to ``Partial`` effectively wraps the original function,
-  making it a valid argument in JAX transformed functions:
+  向 ``Partial`` 传入零个参数实际上是把原函数包装起来，使它在 JAX 变换后的
+  函数中成为合法参数：
 
   >>> call_func(Partial(jnp.add), 1, 2)
   Array(3, dtype=int32, weak_type=True)
 
-  Had we passed ``jnp.add`` to ``call_func`` directly, it would have resulted in
-  a ``TypeError``.
+  若我们直接把 ``jnp.add`` 传给 ``call_func``，则会引发 ``TypeError``。
 
-  Note that if the result of ``Partial`` is used in the context where the
-  value is traced, it results in all bound arguments being traced when passed
-  to the partially-evaluated function:
+  注意：如果 ``Partial`` 的结果被用在需要追踪值的上下文中，那么当它被传给
+  这个已被部分求值的函数时，所有已绑定的参数都会被追踪：
 
   >>> print_zero = Partial(print, 0)
   >>> print_zero()
@@ -560,11 +550,10 @@ class Partial(functools.partial):
   """
 
   def __new__(klass, func, *args, **kw):
-    # In Python 3.10+, if func is itself a functools.partial instance,
-    # functools.partial.__new__ would merge the arguments of this Partial
-    # instance with the arguments of the func. We box func in a class that does
-    # not (yet) have a `func` attribute to defeat this optimization, since we
-    # care exactly which arguments are considered part of the pytree.
+    # 在 Python 3.10+ 中，如果 func 本身就是 functools.partial 的实例，
+    # functools.partial.__new__ 会把该 Partial 实例的参数与 func 的参数合并。
+    # 我们把 func 装进一个（目前）没有 `func` 属性的类里来破除这一优化，
+    # 因为我们关心的正是哪些参数被视为 pytree 的一部分。
     if isinstance(func, functools.partial):
       original_func = func
       func = _HashableCallableShim(original_func)
@@ -588,29 +577,27 @@ register_pytree_node(
 def tree_broadcast(prefix_tree: Any, full_tree: Any,
                    is_leaf: Callable[[Any], bool] | None = None
                   ) -> Any:
-  """Alias of :func:`jax.tree.broadcast`."""
+  """`jax.tree.broadcast` 的别名。"""
   broadcast_leaves = broadcast_prefix(prefix_tree, full_tree, is_leaf=is_leaf)
   return tree_structure(full_tree).unflatten(broadcast_leaves)
 
 
-# broadcast_prefix is not exported
+# broadcast_prefix 不对外导出
 def broadcast_prefix(prefix_tree: Any, full_tree: Any,
                      is_leaf: Callable[[Any], bool] | None = None
                      ) -> list[Any]:
-  """Broadcasts tree prefix leaves into the full set of leaves for a given full tree.
+  """把树前缀的叶子广播为给定完整树的全部叶子。
 
     Args:
-      prefix_tree: a pytree that is a tree prefix of full_tree.
-      full_tree: a pytree with the structure to broadcast the prefix leaves into.
-      is_leaf: an optionally specified function that will be called at each
-        flattening step for prefix_tree. It should return a boolean, with true
-        stopping the traversal and the whole subtree being treated as a leaf,
-        and false indicating the flattening should traverse the current object.
+      prefix_tree: 一个 pytree，它是 full_tree 的树前缀。
+      full_tree: 一个 pytree，其结构用于承载被广播的前缀叶子。
+      is_leaf: 一个可选指定的函数，会在 prefix_tree 的每个展平步骤上被调用。
+        它应返回一个布尔值：为真时停止遍历并把整棵子树当作一个叶子，
+        为假时表示展平应继续遍历当前对象。
 
     Returns:
-      A list of leaves matching the expected count for the full tree,
-      with the leaf of each prefix tree being duplicated to match the count of
-      its corresponding subtree.
+      一个叶子列表，其数量与完整树所期望的数量一致；其中每个前缀树的
+      叶子都被复制，以匹配其对应子树的数量。
   """
   result = []
   num_leaves = lambda t: tree_structure(t).num_leaves
@@ -623,42 +610,39 @@ def broadcast_prefix(prefix_tree: Any, full_tree: Any,
   return result
 
 
-# broadcast_flattened_prefix_with_treedef is not exported
+# broadcast_flattened_prefix_with_treedef 不对外导出
 def broadcast_flattened_prefix_with_treedef(
     prefix_leaves: list[Any],
     prefix_treedef: PyTreeDef,
     full_treedef: PyTreeDef,
 ) -> list[Any]:
-  """Broadcasts tree prefix leaves into the full set of leaves for a given full treedef.
+  """把树前缀的叶子广播为给定完整 treedef 的全部叶子。
 
     Args:
-      prefix_leaves: the leaves of a pytree that is a tree prefix
-        of full_treedef.
-      prefix_treedef: the PyTreeDef of a pytree that is a tree prefix of
-        full_treedef.
-      full_treedef: a PyTreeDef with the structure to broadcast the prefix
-        leaves into.
+      prefix_leaves: 某个 pytree 的叶子，该 pytree 是
+        full_treedef 的树前缀。
+      prefix_treedef: 某个 pytree 的 PyTreeDef，该 pytree 是
+        full_treedef 的树前缀。
+      full_treedef: 一个 PyTreeDef，其结构用于承载被广播的前缀叶子。
 
     Returns:
-      A list of leaves matching the expected count for the full tree,
-      with each leaf of prefix tree being duplicated to match the count of
-      its corresponding subtree.
+      一个叶子列表，其数量与完整树所期望的数量一致；其中前缀树的每个
+      叶子都被复制，以匹配其对应子树的数量。
   """
-  # NOTE: At the moment, `broadcast_flattened_prefix_with_treedef` is only
-  # called from `api_util.flatten_axes`, which replaces any raised exception
-  # with its own exception and error message.  The errors raised from this
-  # function should probably be improved before this function is used in
-  # more places.
+  # 注意：目前 `broadcast_flattened_prefix_with_treedef` 只被
+  # `api_util.flatten_axes` 调用，而后者会用自身的异常与错误信息替换
+  # 这里抛出的任何异常。在这个函数被更多地方使用之前，
+  # 它所抛出的错误信息大概应该先改进一下。
   #
-  # TODO(jburnim): Merge `broadcast_prefix` with this function?
+  # TODO(jburnim): 把 `broadcast_prefix` 与这个函数合并？
   # prefix_leaves, prefix_treedef = tree_flatten(prefix_tree, is_leaf)
   ret = []
 
-  # TODO(jburnim): Should this traversal be done in C++?
+  # TODO(jburnim): 这个遍历应该用 C++ 实现吗？
   def _broadcast(broadcast_fn, leaf_start, leaf_end, prefix_treedef, treedef):
     if treedef_is_strict_leaf(prefix_treedef):
-      # We have encountered a leaf in the prefix, so we repeat the prefix leaf
-      # for each leaf in the corresponding part of the tree.
+      # 我们在前缀中遇到了一个叶子，于是为树对应部分中的每个叶子
+      # 重复该前缀叶子。
       assert (leaf_end - leaf_start) == 1
       ret.extend(prefix_leaves[leaf_start:leaf_end] * treedef.num_leaves)
       return
@@ -679,26 +663,26 @@ def broadcast_flattened_prefix_with_treedef(
       )
       prefix_i += prefix_child.num_leaves
 
-  # Pass _broadcast as arg to avoid it being a free variable within its own
-  # closure, which creates a reference cycle.
+  # 把 _broadcast 作为参数传入，以免它成为自身闭包中的自由变量，
+  # 那会形成引用环。
   _broadcast(_broadcast, 0, len(prefix_leaves), prefix_treedef, full_treedef)
   return ret
 
 
 @export
 def flatten_one_level(tree: Any) -> tuple[Iterable[Any], Hashable]:
-  """Flatten the given pytree node by one level.
+  """把给定的 pytree 节点展平一层。
 
   Args:
-    tree: A valid pytree node, either built-in or registered via
-      :func:`register_pytree_node` or related functions.
+    tree: 一个合法的 pytree 节点，可以是内置的，也可以是通过
+      :func:`register_pytree_node` 或相关函数注册的。
 
   Returns:
-    A pair of the pytrees flattened children and its hashable metadata.
+    一个二元组，包含被展平的 pytree 子节点及其可哈希的元数据。
 
   Raises:
-    ValueError: If the given pytree is not a built-in or registered container
-    via ``register_pytree_node`` or ``register_pytree_with_keys``.
+    ValueError: 如果给定的 pytree 既不是内置容器，也不是通过
+    ``register_pytree_node`` 或 ``register_pytree_with_keys`` 注册的容器。
 
   Examples:
     >>> import jax
@@ -720,7 +704,7 @@ def flatten_one_level(tree: Any) -> tuple[Iterable[Any], Hashable]:
 def flatten_one_level_with_keys(
     tree: Any,
 ) -> tuple[Iterable[KeyLeafPair], Hashable]:
-  """Flatten the given pytree node by one level, with keys."""
+  """把给定的 pytree 节点展平一层，并带上键。"""
   out = default_registry.flatten_one_level_with_keys(tree)
   if out is None:
     raise ValueError(f"can't tree-flatten type: {type(tree)}")
@@ -728,21 +712,21 @@ def flatten_one_level_with_keys(
     return out
 
 
-# prefix_errors is not exported
+# prefix_errors 不对外导出
 def prefix_errors(prefix_tree: Any, full_tree: Any,
                   is_leaf: Callable[[Any], bool] | None = None,
                   ) -> list[Callable[[str], ValueError]]:
   return list(_prefix_error((), prefix_tree, full_tree, is_leaf))
 
 
-# equality_errors is not exported
+# equality_errors 不对外导出
 def equality_errors(
     tree1: Any, tree2: Any, is_leaf: Callable[[Any], bool] | None = None,
 ) -> Iterable[tuple[KeyPath, str, str, str]]:
-  """Helper to describe structural differences between two pytrees.
+  """用于描述两个 pytree 之间结构差异的辅助函数。
 
   Args:
-    tree1, tree2: pytrees known to have different structure.
+    tree1, tree2: 已知结构不同的 pytree。
 
   Usage:
 
@@ -760,26 +744,26 @@ def equality_errors(
 def equality_errors_pytreedef(
     tree1: PyTreeDef,
     tree2: PyTreeDef) -> Iterable[tuple[KeyPath, str, str, str]]:
-  """Like `equality_errors` but invoked on PyTreeDef."""
-  # TODO(mattjj): make equality_errors not print type name, avoid metaclass
+  """与 `equality_errors` 类似，但作用于 PyTreeDef。"""
+  # TODO(mattjj): 让 equality_errors 不再打印类型名，从而避免元类
   leaf = type("LeafMeta", (type,), dict(__repr__=lambda _: "pytree leaf")
               )("Leaf", (), {})()
   return equality_errors(tree_unflatten(tree1, [leaf] * tree1.num_leaves),
                          tree_unflatten(tree2, [leaf] * tree2.num_leaves))
 
-# TODO(mattjj): maybe share some logic with _prefix_error?
+# TODO(mattjj): 也许与 _prefix_error 共用一部分逻辑？
 def _equality_errors(path, t1, t2, is_leaf):
-  # If both are leaves, this isn't a structure equality error.
+  # 如果二者都是叶子，这就不算结构相等性错误。
   if (treedef_is_strict_leaf(tree_structure(t1, is_leaf=is_leaf)) and
       treedef_is_strict_leaf(tree_structure(t2, is_leaf=is_leaf))): return
 
-  # The trees may disagree because they are different types:
+  # 两棵树可能因为它们类型不同而不一致：
   if type(t1) != type(t2):
     yield path, str(type(t1)), str(type(t2)), 'their Python types differ'
-    return  # no more errors to find
+    return  # 不再查找更多错误
 
-  # Or they may disagree because their roots have different numbers or keys of
-  # children (with special-case handling of list/tuple):
+  # 或者它们可能因为根节点的子节点数量或键不同而不一致
+  #（对 list/tuple 做特殊处理）：
   if isinstance(t1, (list, tuple)):
     assert type(t1) == type(t2)
     if len(t1) != len(t2):
@@ -787,7 +771,7 @@ def _equality_errors(path, t1, t2, is_leaf):
              f'{type(t1).__name__} of length {len(t1)}',
              f'{type(t2).__name__} of length {len(t2)}',
              'the lengths do not match')
-      return  # no more errors to find
+      return  # 不再查找更多错误
   t1_children, t1_meta = flatten_one_level(t1)
   t2_children, t2_meta = flatten_one_level(t2)
   t1_children = tuple(t1_children)
@@ -807,18 +791,18 @@ def _equality_errors(path, t1, t2, is_leaf):
            'the numbers of children do not match' +
            (diff and f', with the symmetric difference of key sets: {{{diff}}}')
            )
-    return  # no more errors to find
+    return  # 不再查找更多错误
 
-  # Or they may disagree if their roots have different pytree metadata:
+  # 或者它们可能因为根节点的 pytree 元数据不同而不一致：
   if t1_meta != t2_meta:
     yield (path,
            f'{type(t1)} with pytree metadata {t1_meta}',
            f'{type(t2)} with pytree metadata {t2_meta}',
            'the pytree node metadata does not match')
-    return  # no more errors to find
+    return  # 不再查找更多错误
 
-  # If the root types and numbers of children agree, there must be a mismatch in
-  # a subtree, so recurse:
+  # 如果根节点类型与子节点数量都一致，那么不匹配一定出现在某棵子树中，
+  # 于是递归下去：
   assert t1_keys == t2_keys, \
       f"equal pytree nodes gave different tree keys: {t1_keys} and {t2_keys}"
   for k, c1, c2 in zip(t1_keys, t1_children, t2_children):
@@ -833,18 +817,17 @@ FlattenedIndexKey: Any = pytree.FlattenedIndexKey
 
 @export
 def keystr(keys: KeyPath, *, simple: bool = False, separator: str = '') -> str:
-  """Helper to pretty-print a tuple of keys.
+  """用于把键的元组美观地打印出来的辅助函数。
 
   Args:
-    keys: A tuple of ``KeyEntry`` or any class that can be converted to string.
-    simple: If True, use a simplified string representation for keys. The
-      simple representation of keys will be more compact than the default, but
-      is ambiguous in some cases (for example "0" might refer to the first item
-      in a list or a dictionary key for the integer 0 or string "0").
-    separator: The separator to use to join string representations of the keys.
+    keys: 一个由 ``KeyEntry`` 组成的元组，或任何可转换为字符串的类。
+    simple: 若为 True，则对键使用简化后的字符串表示。键的简化表示会比默认
+      表示更紧凑，但在某些情况下有歧义（例如 "0" 可能指列表中的第一项，
+      也可能指整数 0 或字符串 "0" 对应的字典键）。
+    separator: 用于连接各键字符串表示的连接符。
 
   Returns:
-    A string that joins all string representations of the keys.
+    一个把所有键的字符串表示连接起来的字符串。
 
   Examples:
     >>> import jax
@@ -884,29 +867,27 @@ def register_pytree_with_keys(
     unflatten_func: Callable[[_AuxData, Iterable[Any]], T],
     flatten_func: None | (Callable[[T], tuple[Iterable[Any], _AuxData]]) = None,
 ):
-  """Extends the set of types that are considered internal nodes in pytrees.
+  """扩充被视为 pytree 内部节点的类型集合。
 
-  This is a more powerful alternative to ``register_pytree_node`` that allows
-  you to access each pytree leaf's key path when flattening and tree-mapping.
+  这是 ``register_pytree_node`` 的一个更强的替代方案，允许你在展平与树映射时
+  访问每个 pytree 叶子的键路径。
 
   Args:
-    nodetype: a Python type to treat as an internal pytree node.
-    flatten_with_keys: a function to be used during flattening, taking a value
-      of type ``nodetype`` and returning a pair, with (1) an iterable for tuples
-      of each key path and its child, and (2) some hashable auxiliary data to be
-      stored in the treedef and to be passed to the ``unflatten_func``.
-    unflatten_func: a function taking two arguments: the auxiliary data that was
-      returned by ``flatten_func`` and stored in the treedef, and the
-      unflattened children. The function should return an instance of
-      ``nodetype``.
-    flatten_func: an optional function similar to ``flatten_with_keys``, but
-      returns only children and auxiliary data. It must return the children
-      in the same order as ``flatten_with_keys``, and return the same aux data.
-      This argument is optional and only needed for faster traversal when
-      calling functions without keys like ``tree_map`` and ``tree_flatten``.
+    nodetype: 要当作 pytree 内部节点的 Python 类型。
+    flatten_with_keys: 展平时使用的函数，接受一个 ``nodetype`` 类型的值并返回
+      一个二元组，其中 (1) 是一个可迭代对象，给出每个键路径及其子节点组成的
+      元组，(2) 是一些可哈希的辅助数据，会被存入 treedef 并传给
+      ``unflatten_func``。
+    unflatten_func: 接受两个参数的函数：由 ``flatten_func`` 返回并存入
+      treedef 的辅助数据，以及已重建的子节点。该函数应返回一个
+      ``nodetype`` 的实例。
+    flatten_func: 一个可选的函数，与 ``flatten_with_keys`` 类似，但只返回
+      子节点与辅助数据。它返回子节点的顺序必须与 ``flatten_with_keys`` 相同，
+      返回的辅助数据也必须相同。该参数是可选的，只在调用 ``tree_map``、
+      ``tree_flatten`` 这类不带键的函数时用于加速遍历。
 
   Examples:
-    First we'll define a custom type:
+    首先定义一个自定义类型：
 
     >>> class MyContainer:
     ...   def __init__(self, size):
@@ -914,7 +895,7 @@ def register_pytree_with_keys(
     ...     self.y = jnp.ones(size)
     ...     self.size = size
 
-    Now register it using a key-aware flatten function:
+    现在用一个能感知键的展平函数来注册它：
 
     >>> from jax.tree_util import register_pytree_with_keys_class, GetAttrKey
     >>> def flatten_with_keys(obj):
@@ -932,7 +913,8 @@ def register_pytree_with_keys(
     ...
     >>> jax.tree_util.register_pytree_node(MyContainer, flatten_with_keys, unflatten)
 
-    Now this can be used with functions like :func:`~jax.tree_util.tree_flatten_with_path`:
+    这样它就可以与 :func:`~jax.tree_util.tree_flatten_with_path` 这类函数
+    一起使用了：
 
     >>> m = MyContainer(4)
     >>> leaves, treedef = jax.tree_util.tree_flatten_with_path(m)
@@ -950,25 +932,23 @@ def register_pytree_with_keys(
 
 @export
 def register_pytree_with_keys_class(cls: Typ) -> Typ:
-  """Extends the set of types that are considered internal nodes in pytrees.
+  """扩充被视为 pytree 内部节点的类型集合。
 
-  This function is similar to ``register_pytree_node_class``, but requires a
-  class that defines how it could be flattened with keys.
+  本函数与 ``register_pytree_node_class`` 类似，但要求类中定义好了如何带键
+  展平。
 
-  It is a thin wrapper around ``register_pytree_with_keys``, and
-  provides a class-oriented interface:
+  它是 ``register_pytree_with_keys`` 的薄包装，并提供面向类的接口：
 
   Args:
-    cls: a type to register as a pytree
+    cls: 要注册为 pytree 的类型
 
   Returns:
-    The input class ``cls`` is returned unchanged after being added to JAX's pytree
-    registry. This return value allows ``register_pytree_node_class`` to be used as
-    a decorator.
+    输入类 ``cls`` 在加入 JAX 的 pytree 注册表后被原样返回。借助该返回值，
+    ``register_pytree_node_class`` 可以用作装饰器。
 
   See also:
-    - :func:`~jax.tree_util.register_static`: simpler API for registering a static pytree.
-    - :func:`~jax.tree_util.register_dataclass`: simpler API for registering a dataclass.
+    - :func:`~jax.tree_util.register_static`：用于注册静态 pytree 的更简单 API。
+    - :func:`~jax.tree_util.register_dataclass`：用于注册 dataclass 的更简单 API。
     - :func:`~jax.tree_util.register_pytree_node`
     - :func:`~jax.tree_util.register_pytree_with_keys`
     - :func:`~jax.tree_util.register_pytree_node_class`
@@ -1004,45 +984,42 @@ def register_dataclass(
     meta_fields: Sequence[str] | None = None,
     drop_fields: Sequence[str] = (),
 ) -> Typ:
-  """Extends the set of types that are considered internal nodes in pytrees.
+  """扩充被视为 pytree 内部节点的类型集合。
 
-  This differs from ``register_pytree_with_keys_class`` in that the C++
-  registries use the optimized C++ dataclass builtin instead of the argument
-  functions.
+  它与 ``register_pytree_with_keys_class`` 的区别在于：C++ 侧的注册表会使用
+  优化过的 C++ dataclass 内建实现，而不是这些参数函数。
 
-  See :ref:`pytrees-custom-pytree-nodes` for more information about registering pytrees.
+  关于注册 pytree 的更多信息，参见 :ref:`pytrees-custom-pytree-nodes`。
 
   Args:
-    nodetype: a Python type to treat as an internal pytree node. This is assumed
-      to have the semantics of a :obj:`~dataclasses.dataclass`: namely, class
-      attributes represent the whole of the object state, and can be passed
-      as keywords to the class constructor to create a copy of the object.
-      All defined attributes should be listed among ``meta_fields`` or ``data_fields``.
-    meta_fields: metadata field names: these are attributes which will be treated as
-      :term:`static` when this pytree is passed to :func:`jax.jit`. ``meta_fields`` is
-      optional only if ``nodetype`` is a dataclass, in which case individual fields can
-      be marked static via :func:`dataclasses.field` (see examples below).
-      Metadata fields *must* be static, hashable, immutable objects, as these objects
-      are used to generate JIT cache keys. In particular, metadata fields cannot contain
-      :class:`jax.Array` or :class:`numpy.ndarray` objects.
-    data_fields: data field names: these are attributes which will be treated as non-static
-      when this pytree is passed to :func:`jax.jit`. ``data_fields`` is optional only if
-      ``nodetype`` is a dataclass, in which case fields are assumed data fields unless
-      marked via :func:`dataclasses.field` (see examples below) or present in drop_fields.
-      Data fields *must* be JAX-compatible objects such as arrays (:class:`jax.Array`
-      or :class:`numpy.ndarray`), scalars, or pytrees whose leaves are arrays or scalars.
-      Note that ``None`` is a valid data field, as JAX recognizes this as an empty pytree.
-    drop_fields: only referenced if ``nodetype`` is a dataclass. Specify a sequence of
-      field names from among ``dataclasses.fields(nodetype)`` to be excluded from pytree
-      registration.
+    nodetype: 要当作 pytree 内部节点的 Python 类型。这里假定它具备
+      :obj:`~dataclasses.dataclass` 的语义：即类属性代表对象的全部状态，
+      并且可以作为关键字参数传给类构造函数来创建对象的一份副本。
+      所有已定义的属性都应列在 ``meta_fields`` 或 ``data_fields`` 中。
+    meta_fields: 元数据字段名：当该 pytree 被传给 :func:`jax.jit` 时，这些属性
+      会被视为 :term:`static` 静态值。只有当 ``nodetype`` 是 dataclass 时，
+      ``meta_fields`` 才可以省略；此时可通过 :func:`dataclasses.field` 把各个
+      字段标记为静态（见下面的示例）。元数据字段*必须*是静态、可哈希、
+      不可变的对象，因为这些对象会被用来生成 JIT 缓存键。特别地，元数据字段
+      不能包含 :class:`jax.Array` 或 :class:`numpy.ndarray` 对象。
+    data_fields: 数据字段名：当该 pytree 被传给 :func:`jax.jit` 时，这些属性会被
+      视为非静态值。只有当 ``nodetype`` 是 dataclass 时，``data_fields`` 才可以
+      省略；此时除非通过 :func:`dataclasses.field` 标记（见下面的示例）或出现在
+      drop_fields 中，字段都默认视为数据字段。数据字段*必须*是与 JAX 兼容的对象，
+      例如数组（:class:`jax.Array` 或 :class:`numpy.ndarray`）、标量，或以数组
+      或标量为叶子的 pytree。注意 ``None`` 是合法的数据字段，因为 JAX 会把它
+      识别为空 pytree。
+    drop_fields: 仅当 ``nodetype`` 是 dataclass 时才起作用。指定一个
+      ``dataclasses.fields(nodetype)`` 中字段名的序列，这些字段将被排除在
+      pytree 注册之外。
 
   Returns:
-    The input class ``nodetype`` is returned unchanged after being added to JAX's
-    pytree registry, so that :func:`register_dataclass` can be used as a decorator.
+    输入类 ``nodetype`` 在加入 JAX 的 pytree 注册表后被原样返回，因此
+    :func:`register_dataclass` 可以用作装饰器。
 
   Examples:
-    In JAX v0.4.35 or older, you must specify ``data_fields`` and ``meta_fields``
-    in order to use this decorator:
+    在 JAX v0.4.35 及更早版本中，必须指定 ``data_fields`` 与 ``meta_fields``
+    才能使用这个装饰器：
 
     >>> import jax
     >>> from dataclasses import dataclass
@@ -1061,9 +1038,10 @@ def register_dataclass(
     >>> m
     MyStruct(x=Array([1., 1., 1.], dtype=float32), y=Array([0, 1, 2], dtype=int32), op='add')
 
-    Starting in JAX v0.4.36, the ``data_fields`` and ``meta_fields`` arguments are optional
-    for :func:`~dataclasses.dataclass` inputs, with fields defaulting to ``data_fields``
-    unless marked as static using `static` metadata in :func:`dataclasses.field`.
+    从 JAX v0.4.36 开始，对于 :func:`~dataclasses.dataclass` 输入，
+    ``data_fields`` 与 ``meta_fields`` 参数变为可选：字段默认归入
+    ``data_fields``，除非用 :func:`dataclasses.field` 的 `static` 元数据
+    标记为静态。
 
     >>> import jax
     >>> from dataclasses import dataclass, field
@@ -1079,8 +1057,8 @@ def register_dataclass(
     >>> m
     MyStruct(x=Array([1., 1., 1.], dtype=float32), y=Array([0, 1, 2], dtype=int32), op='add')
 
-    Once this class is registered, it can be used with functions in :mod:`jax.tree` and
-    :mod:`jax.tree_util`:
+    该类注册之后，就可以与 :mod:`jax.tree` 和 :mod:`jax.tree_util` 中的函数
+    一起使用了：
 
     >>> leaves, treedef = jax.tree.flatten(m)
     >>> leaves
@@ -1090,9 +1068,9 @@ def register_dataclass(
     >>> jax.tree.unflatten(treedef, leaves)
     MyStruct(x=Array([1., 1., 1.], dtype=float32), y=Array([0, 1, 2], dtype=int32), op='add')
 
-    In particular, this registration allows ``m`` to be passed seamlessly through code
-    wrapped in :func:`jax.jit` and other JAX transformations, with ``data_fields`` being
-    treated as dynamic arguments, and ``meta_fields`` being treated as static arguments:
+    特别地，这一注册使得 ``m`` 能够无缝地穿过用 :func:`jax.jit` 及其他 JAX
+    变换包装的代码：其中 ``data_fields`` 被当作动态参数，而 ``meta_fields``
+    被当作静态参数：
 
     >>> @jax.jit
     ... def compiled_func(m):
@@ -1125,9 +1103,8 @@ def register_dataclass(
   assert meta_fields is not None
   assert data_fields is not None
 
-  # Store inputs as immutable tuples in this scope, because we close over them
-  # for later evaluation. This prevents potentially confusing behavior if the
-  # caller were to pass in lists that are later mutated.
+  # 在当前作用域内把输入存为不可变元组，因为后续求值会闭包捕获它们。
+  # 这样可以避免调用方传入的列表之后被修改而带来的、可能令人困惑的行为。
   meta_fields = tuple(meta_fields)
   data_fields = tuple(data_fields)
 
@@ -1190,19 +1167,19 @@ register_pytree_with_keys(
 
 @export
 def register_static(cls: type[H]) -> type[H]:
-  """Registers `cls` as a pytree with no leaves.
+  """把 `cls` 注册为一个不含叶子的 pytree。
 
-  Instances are treated as static by :func:`jax.jit`, :func:`jax.pmap`, etc. This can
-  be an alternative to labeling inputs as static using ``jit``'s ``static_argnums``
-  and ``static_argnames`` kwargs, ``pmap``'s ``static_broadcasted_argnums``, etc.
+  这类实例会被 :func:`jax.jit`、:func:`jax.pmap` 等视为静态值。这可以替代
+  用 ``jit`` 的 ``static_argnums`` 与 ``static_argnames`` 关键字参数、
+  ``pmap`` 的 ``static_broadcasted_argnums`` 等把参数标记为静态的做法。
 
   Args:
-    cls: type to be registered as static. Must be hashable, as defined in
-      https://docs.python.org/3/glossary.html#term-hashable.
+    cls: 要注册为静态的类型。必须是可哈希的，定义见
+      https://docs.python.org/3/glossary.html#term-hashable。
 
   Returns:
-    The input class ``cls`` is returned unchanged after being added to JAX's
-    pytree registry. This allows ``register_static`` to be used as a decorator.
+    输入类 ``cls`` 在加入 JAX 的 pytree 注册表后被原样返回。这使得
+    ``register_static`` 可以用作装饰器。
 
   Examples:
     >>> import jax
@@ -1210,8 +1187,8 @@ def register_static(cls: type[H]) -> type[H]:
     ... class StaticStr(str):
     ...   pass
 
-    This static string can now be used directly in :func:`jax.jit`-compiled
-    functions, without marking the variable static using ``static_argnums``:
+    现在就可以在 :func:`jax.jit` 编译的函数中直接使用这个静态字符串，
+    而无需用 ``static_argnums`` 把该变量标记为静态：
 
     >>> @jax.jit
     ... def f(x, y, s):
@@ -1231,7 +1208,7 @@ def tree_flatten_with_path(
     tree: Any, is_leaf: Callable[..., bool] | None = None,
     is_leaf_takes_path: bool = False,
 ) -> tuple[list[tuple[KeyPath, Any]], PyTreeDef]:
-  """Alias of :func:`jax.tree.flatten_with_path`."""
+  """`jax.tree.flatten_with_path` 的别名。"""
   is_leaf_with_kp: Callable[[Any, Any], bool] | None = is_leaf
   if not is_leaf_takes_path and is_leaf is not None:
     is_leaf_with_kp = lambda _, x: is_leaf(x)
@@ -1243,7 +1220,7 @@ def tree_leaves_with_path(
     tree: Any, is_leaf: Callable[..., bool] | None = None,
     is_leaf_takes_path: bool = False,
 ) -> list[tuple[KeyPath, Any]]:
-  """Alias of :func:`jax.tree.leaves_with_path`."""
+  """`jax.tree.leaves_with_path` 的别名。"""
   return tree_flatten_with_path(tree, is_leaf, is_leaf_takes_path)[0]
 generate_key_paths = tree_leaves_with_path
 
@@ -1256,7 +1233,7 @@ def tree_map_with_path(
     is_leaf: Callable[..., bool] | None = None,
     is_leaf_takes_path: bool = False,
 ) -> Any:
-  """Alias of :func:`jax.tree.map_with_path`."""
+  """`jax.tree.map_with_path` 的别名。"""
   keypath_leaves, treedef = tree_flatten_with_path(
       tree, is_leaf, is_leaf_takes_path
   )
@@ -1280,11 +1257,11 @@ def _prefix_error(
     full_tree: Any,
     is_leaf: Callable[[Any], bool] | None = None,
 ) -> Iterable[Callable[[str], ValueError]]:
-  # A leaf is a valid prefix of any tree:
+  # 叶子是任何树的合法前缀：
   if treedef_is_strict_leaf(tree_structure(prefix_tree, is_leaf=is_leaf)):
     return
 
-  # The subtrees may disagree because their roots are of different types:
+  # 两棵子树可能因为根节点类型不同而不一致：
   if type(prefix_tree) != type(full_tree):
     yield lambda name: ValueError(
       "pytree structure error: different types at key path\n"
@@ -1293,20 +1270,19 @@ def _prefix_error(
       f"    {type(prefix_tree)}\n"
       f"but at the same key path the full pytree has a subtree of different type\n"
       f"    {type(full_tree)}.")
-    return  # don't look for more errors in this subtree
+    return  # 不再在这棵子树中查找更多错误
 
-  # Or they may disagree if their roots have different numbers or keys of
-  # children. Because both prefix_tree and full_tree have the same type at this
-  # point, and because prefix_tree is not a leaf, each can be flattened once:
+  # 或者它们可能因为根节点的子节点数量或键不同而不一致。此时 prefix_tree
+  # 与 full_tree 类型相同，且 prefix_tree 不是叶子，因此二者都可以展平一层：
   prefix_tree_children, prefix_tree_meta = flatten_one_level(prefix_tree)
   full_tree_children, full_tree_meta = flatten_one_level(full_tree)
   prefix_tree_children = tuple(prefix_tree_children)
   full_tree_children = tuple(full_tree_children)
   prefix_tree_keys = _child_keys(prefix_tree)
   full_tree_keys = _child_keys(full_tree)
-  # First we check special case types (list and tuple, though if they were
-  # pytrees we could check strings and sets here, basically Sequences) so that
-  # we can report length disagreement rather than integer keys:
+  # 我们首先检查特殊类型（list 与 tuple；如果它们也是 pytree，这里其实还可以
+  # 检查字符串和集合，基本上就是 Sequence），这样就能报告长度不一致而不是
+  # 整数键不一致：
   if isinstance(prefix_tree, (list, tuple)):
     if len(prefix_tree) != len(full_tree):
       ty = type(prefix_tree)
@@ -1316,9 +1292,9 @@ def _prefix_error(
           f"At that key path, the prefix pytree {name} has a subtree of type "
           f"{ty.__name__} of length {len(prefix_tree)}, but the full pytree "
           f"has a subtree of the same type but of length {len(full_tree)}.")
-      return  # don't look for more errors in this subtree
+      return  # 不再在这棵子树中查找更多错误
   else:
-    # Next we handle the general case of checking child keys.
+    # 接下来处理检查子键的一般情况。
     try:
       diff = set(prefix_tree_keys).symmetric_difference(set(full_tree_keys))
     except:
@@ -1337,9 +1313,9 @@ def _prefix_error(
         + ("" if diff is None else
            f"so the symmetric difference on key sets is\n"
            f"    {' '.join(str(k) for k in diff)}"))
-      return  # don't look for more errors in this subtree
+      return  # 不再在这棵子树中查找更多错误
 
-  # Or they may disagree if their roots have different pytree metadata:
+  # 或者它们可能因为根节点的 pytree 元数据不同而不一致：
   if prefix_tree_meta != full_tree_meta:
     prefix_tree_meta_str = str(prefix_tree_meta)
     full_tree_meta_str = str(full_tree_meta)
@@ -1360,10 +1336,10 @@ def _prefix_error(
       f"    {full_tree_meta_str}\n"
       f"so the diff in the metadata at these pytree nodes is\n"
       f"{metadata_diff}")
-    return  # don't look for more errors in this subtree
+    return  # 不再在这棵子树中查找更多错误
 
-  # If the root types and numbers of children agree, there must be an error
-  # in a subtree, so recurse:
+  # 如果根节点类型与子节点数量都一致，那么错误一定出现在某棵子树中，
+  # 于是递归下去：
   assert prefix_tree_keys == full_tree_keys, \
     ("equal pytree nodes gave differing prefix_tree_keys: "
      f"{prefix_tree_keys} and {full_tree_keys}")
@@ -1372,7 +1348,7 @@ def _prefix_error(
 
 def _ensure_inbounds(allow_invalid: bool, num_args: int, argnums: Sequence[int]
                      ) -> tuple[int, ...]:
-  """Ensure argnum is within bounds. Also resolves negative argnums."""
+  """确保 argnum 在界内。同时解析负数 argnum。"""
   result = []
   for i in argnums:
     if i >= num_args and allow_invalid: continue
@@ -1381,5 +1357,5 @@ def _ensure_inbounds(allow_invalid: bool, num_args: int, argnums: Sequence[int]
           "Positional argument indices, e.g. for `static_argnums`, must have "
           "value greater than or equal to -len(args) and less than len(args), "
           f"but got value {i} for len(args) == {num_args}.")
-    result.append(i % num_args)  # Resolve negative
+    result.append(i % num_args)  # 解析负值
   return tuple(result)

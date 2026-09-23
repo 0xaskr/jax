@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 `jax.checkpoint` / `jax.remat` 的梯度检查点（重物化）机制。
+# 反向模式自动微分默认保存前向过程中的全部线性化点，本模块允许改为只保存少量
+# 输入/中间值、其余在反向传播时重物化，以计算换内存。核心包括：可选的保存策略
+# 集合 `checkpoint_policies`（按名称、点积、offload 等选择残差）、面向用户的
+# `checkpoint` / `remat` / `checkpoint_name` 装饰器与 API，以及 `remat_p` 原语
+# 在 JVP、部分求值、转置、batching、DCE、MLIR 降级等各变换下的规则实现。
+
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence, Iterable
@@ -65,15 +72,15 @@ logger = logging.getLogger(__name__)
 ### Policies
 
 def everything_saveable(*_, **__) -> bool:
-  """The default strategy, as if ``jax.checkpoint`` were not being used at all.
+  """默认策略，等同于完全没有使用 ``jax.checkpoint``。
 
-  This is the effective policy without any use of jax.remat."""
+  这是不使用 jax.remat 时实际生效的策略。"""
   return True
 
 def nothing_saveable(*_, **__) -> bool:
-  """Rematerialize everything, as if a custom policy were not being used at all.
+  """重物化一切，等同于完全没有使用自定义策略。
 
-  This is the effective policy when using jax.remat without explicit policy."""
+  这是使用 jax.remat 但未显式给出策略时实际生效的策略。"""
   return False
 
 @dataclass(frozen=True)
@@ -85,8 +92,8 @@ class DotsSaveable:
         (_, _), (lhs_b, rhs_b) = params['dimension_numbers']
         if not lhs_b and not rhs_b:
           return True
-      if prim.name == "scaled_matmul_wrapper":  # avoid importing cudnn
-        return args[0].shape[0] == 1  # Only save the dot if batch dim size 1
+      if prim.name == "scaled_matmul_wrapper":  # 避免导入 cudnn
+        return args[0].shape[0] == 1  # 仅当批维大小为 1 时才保存该 dot
       return False
     else:
       ps = {lax_internal.dot_general_p, lax_convolution.conv_general_dilated_p}
@@ -108,24 +115,24 @@ class OffloadDotWithNoBatchDims:
     return pe.Recompute
 
 def offload_dot_with_no_batch_dims(offload_src, offload_dst):
-  """Same as ``dots_with_no_batch_dims_saveable``, but offload to CPU memory
-  instead of recomputing.
+  """与 ``dots_with_no_batch_dims_saveable`` 相同，但改为卸载到 CPU 内存
+  而不是重算。
 
-  This is a useful heuristic for transformers."""
+  这对 transformer 是一个有用的启发式策略。"""
   return OffloadDotWithNoBatchDims(offload_src, offload_dst)
 
 
 name_p = core.Primitive('name')
 
 
-# TODO TODO this policy probably just doesn't work, split off this change
+# TODO TODO 这个策略大概根本行不通，把这项改动单独拆出去
 def save_anything_except_these_names(*names_not_to_save):
-  """Save any values (not just named ones) excluding the names given."""
+  """保存任何值（不限于已命名值），但排除给定的名字。"""
   return lambda *_, **__: True
 
 def save_any_names_but_these(*names_not_to_save):
-  """Save only named values, i.e. any outputs of `checkpoint_name`, excluding
-  the names given."""
+  """只保存已命名的值，即 `checkpoint_name` 的任何输出，但排除给定的
+  名字。"""
   return SaveAnyNamesButThese(frozenset(names_not_to_save))
 
 @dataclass(frozen=True)
@@ -134,7 +141,7 @@ class SaveOnlyTheseNames:
   def __call__(self, prim, *_, **params):
     if prim is name_p:
       return params['name'] in self.saveable_names
-    return False  # not saveable unless it's in the allow-list
+    return False  # 除非在允许列表中，否则不可保存
 
 @dataclass(frozen=True)
 class SaveAnyNamesButThese:
@@ -142,10 +149,10 @@ class SaveAnyNamesButThese:
   def __call__(self, prim, *_, **params):
     if prim is name_p:
       return params['name'] not in self.names
-    return False  # only allow saving named values
+    return False  # 只允许保存已命名的值
 
 def save_only_these_names(*names_which_can_be_saved):
-  """Save only named values, and only among the names given."""
+  """只保存已命名的值，且仅限给定的那些名字。"""
   return SaveOnlyTheseNames(frozenset(names_which_can_be_saved))
 
 @dataclass(frozen=True)
@@ -160,13 +167,13 @@ class SaveAndOffloadOnlyTheseNames:
       return pe.Saveable
     if prim is name_p and params['name'] in self.names_which_can_be_offloaded:
       return pe.Offloadable(src=self.offload_src, dst=self.offload_dst)
-    return pe.Recompute  # not saveable unless it's in the allow-list
+    return pe.Recompute  # 除非在允许列表中，否则不可保存
 
 def save_and_offload_only_these_names(
     *, names_which_can_be_saved, names_which_can_be_offloaded,
     offload_src, offload_dst):
-  """Same as ``save_only_these_names``, but offload to CPU memory instead of
-  recomputing."""
+  """与 ``save_only_these_names`` 相同，但改为卸载到 CPU 内存而不是
+  重算。"""
   names_which_can_be_saved = frozenset(names_which_can_be_saved)
   names_which_can_be_offloaded = frozenset(names_which_can_be_offloaded)
   intersection = names_which_can_be_saved & names_which_can_be_offloaded
@@ -183,9 +190,9 @@ def save_and_offload_only_these_names(
 
 
 def save_from_both_policies(policy_1, policy_2):
-  """Logical OR of the given policies.
+  """给定两个策略的逻辑或。
 
-  A residual is saveable iff it is saveable according to either policy."""
+  当且仅当某个残差按其中任一策略可保存时，它才可保存。"""
   def policy(prim, *args, **params):
     out1 = policy_1(prim, *args, **params)
     out2 = policy_2(prim, *args, **params)
@@ -198,8 +205,7 @@ def save_from_both_policies(policy_1, policy_2):
   return policy
 
 
-# Please update the file docs/gradient-checkpointing.md with any new
-# policies to keep the doc in sync.
+# 若有新增策略，请同步更新 docs/gradient-checkpointing.md 以保证文档一致。
 checkpoint_policies = types.SimpleNamespace(
     SaveOnlyTheseNames=SaveOnlyTheseNames,
     SaveAnyNamesButThese=SaveAnyNamesButThese,
@@ -225,75 +231,57 @@ def checkpoint(fun: Callable, *, prevent_cse: bool | Sequence[bool] = True,
                policy: Callable[..., bool] | None = None,
                static_argnums: int | tuple[int, ...] = (),
                static_argnames: str | Iterable[str] = ()) -> Callable:
-  """Make ``fun`` recompute internal linearization points when differentiated.
+  """让 ``fun`` 在被微分时重新计算内部的线性化点。
 
-  The :func:`jax.checkpoint` decorator, aliased to :func:`jax.remat`, provides a
-  way to trade off computation time and memory cost in the context of automatic
-  differentiation, especially with reverse-mode autodiff like :func:`jax.grad`
-  and :func:`jax.vjp` but also with :func:`jax.linearize`.
+  :func:`jax.checkpoint` 装饰器（别名为 :func:`jax.remat`）提供了一种在自动
+  微分的场景下权衡计算时间与内存开销的方式，尤其适用于 :func:`jax.grad` 和
+  :func:`jax.vjp` 这类反向模式自动微分，也适用于 :func:`jax.linearize`。
 
-  When differentiating a function in reverse-mode, by default all the
-  linearization points (e.g. inputs to elementwise nonlinear primitive
-  operations) are stored when evaluating the forward pass so that they can be
-  reused on the backward pass. This evaluation strategy can lead to a high
-  memory cost, or even to poor performance on hardware accelerators where memory
-  access is much more expensive than FLOPs.
+  在反向模式微分一个函数时，默认情况下所有线性化点（例如逐元素非线性原语
+  运算的输入）都会在前向求值时被保存下来，以便在反向过程中复用。这种求值策略
+  可能导致很高的内存开销，甚至在访存比 FLOPs 昂贵得多的硬件加速器上导致性能
+  变差。
 
-  An alternative evaluation strategy is for some of the linearization points to
-  be recomputed (i.e. rematerialized) rather than stored. This approach can
-  reduce memory usage at the cost of increased computation.
+  另一种求值策略是让其中一些线性化点被重新计算（即重物化）而不是被保存。
+  这种做法可以以增加计算量为代价降低内存占用。
 
-  This function decorator produces a new version of ``fun`` which follows
-  the rematerialization strategy rather than the default store-everything
-  strategy. That is, it returns a new version of ``fun`` which, when
-  differentiated, doesn't store any of its intermediate linearization points.
-  Instead, these linearization points are recomputed from the function's saved
-  inputs.
+  本函数装饰器会生成 ``fun`` 的一个新版本，它遵循重物化策略而不是默认的
+  “保存一切”策略。也就是说，它返回的 ``fun`` 新版本在被微分时不会保存任何
+  中间线性化点，而是根据函数保存下来的输入重新计算这些线性化点。
 
-  See the examples below.
+  参见下面的示例。
 
   Args:
-    fun: Function for which the autodiff evaluation strategy is to be changed
-      from the default of storing all intermediate linearization points to
-      recomputing them. Its arguments and return value should be arrays,
-      scalars, or (nested) standard Python containers (tuple/list/dict) thereof.
-    prevent_cse: Optional, boolean keyword-only argument indicating whether to
-      prevent common subexpression elimination (CSE) optimizations in the HLO
-      generated from differentiation. This CSE prevention has costs because it
-      can foil other optimizations, and because it can incur high overheads on
-      some backends, especially GPU. The default is True because otherwise,
-      under a :func:`~jax.jit` or :func:`~jax.pmap`, CSE can defeat the purpose
-      of this decorator.
-      But in some settings, like when used inside a :func:`~jax.lax.scan`, this
-      CSE prevention mechanism is unnecessary, in which case ``prevent_cse`` can
-      be set to False.
-      ``prevent_cse`` may also be a pytree prefix of the arguments with bool
-      leaves — or equivalently a tuple-tree prefix (bools and tuples only,
-      with tuples matched against argument containers by their number of
-      children) — selecting which arguments' saved values to pin. Computed
-      (policy-saved) residuals are always pinned when any prevention is on.
-      Under ``jax_remat3``, cotangents are likewise pinned unless the
-      ``jax_remat_barrier_no_cotangents`` upgrade flag is enabled.
-    static_argnums: Optional, int or sequence of ints, a keyword-only argument
-      indicating which argument values on which to specialize for tracing and
-      caching purposes. Specifying arguments as static can avoid
-      ConcretizationTypeErrors when tracing, but at the cost of more retracing
-      overheads. See the example below.
-    policy: Optional, callable keyword-only argument. It should be one of the
-      attributes of ``jax.checkpoint_policies``. The callable takes as input a
-      type-level specification of a first-order primitive application and
-      returns a boolean indicating whether the corresponding output value(s) can
-      be saved as residuals (or instead must be recomputed in the (co)tangent
-      computation if needed).
+    fun: 需要把自动微分求值策略从默认的“保存全部中间线性化点”改为“重新计算
+      它们”的函数。其参数与返回值应为数组、标量，或它们的（嵌套）标准 Python
+      容器（tuple/list/dict）。
+    prevent_cse: 可选的、仅限关键字的布尔参数，表示是否要阻止由微分生成的 HLO
+      中的公共子表达式消除（CSE）优化。这种 CSE 阻止是有代价的，因为它可能
+      妨碍其他优化，并且在某些后端上（尤其是 GPU）会带来很高的开销。默认值为
+      True，因为否则在 :func:`~jax.jit` 或 :func:`~jax.pmap` 下，CSE 会使这个
+      装饰器失去意义。
+      但在某些场景中，例如在 :func:`~jax.lax.scan` 内部使用时，这种 CSE 阻止
+      机制并无必要，此时可以把 ``prevent_cse`` 设为 False。
+      ``prevent_cse`` 也可以是一个与参数结构匹配的 pytree 前缀，其叶子为 bool
+      —— 等价地也可以是由 bool 和 tuple 构成的元组树前缀（tuple 按其子元素
+      个数与参数容器匹配）—— 用来选择固定哪些参数的已保存值。只要有任一阻止
+      生效，由策略保存的计算残差就总会被固定。
+      在 ``jax_remat3`` 下，除非启用 ``jax_remat_barrier_no_cotangents``
+      升级标志，否则余切也同样会被固定。
+    static_argnums: 可选的 int 或 int 序列，仅限关键字的参数，表示要把哪些参数
+      值视为静态值以便追踪与缓存。把参数指定为静态可以避免追踪时出现
+      ConcretizationTypeError，但代价是更多的重复追踪开销。参见下面的示例。
+    policy: 可选的、可调用的仅限关键字参数。它应当是
+      ``jax.checkpoint_policies`` 的某个属性。该可调用对象接受一阶原语应用的
+      类型级描述作为输入，返回一个布尔值，表示相应的输出值能否作为残差被保存
+      （还是必须在（余）切向量计算中按需重新计算）。
 
   Returns:
-    A function (callable) with the same input/output behavior as ``fun`` but
-    which, when differentiated using e.g. :func:`jax.grad`, :func:`jax.vjp`, or
-    :func:`jax.linearize`, recomputes rather than stores intermediate
-    linearization points, thus potentially saving memory at the cost of extra
-    computation.
+    一个（可调用的）函数，其输入/输出行为与 ``fun`` 相同，但在使用例如
+    :func:`jax.grad`、:func:`jax.vjp` 或 :func:`jax.linearize` 微分时，会重新
+    计算而不是保存中间的线性化点，从而可能以额外的计算量换取内存的节省。
 
-  Here is a simple example:
+  下面是一个简单的例子：
 
   >>> import jax
   >>> import jax.numpy as jnp
@@ -307,25 +295,20 @@ def checkpoint(fun: Callable, *, prevent_cse: bool | Sequence[bool] = True,
   >>> jax.value_and_grad(g)(2.0)
   (Array(0.78907233, dtype=float32, weak_type=True), Array(-0.2556391, dtype=float32, weak_type=True))
 
-  Here, the same value is produced whether or not the :func:`jax.checkpoint`
-  decorator is present. When the decorator is not present, the values
-  ``jnp.cos(2.0)`` and ``jnp.cos(jnp.sin(2.0))`` are computed on the forward
-  pass and are stored for use in the backward pass, because they are needed
-  on the backward pass and depend only on the primal inputs. When using
-  :func:`jax.checkpoint`, the forward pass will compute only the primal outputs
-  and only the primal inputs (``2.0``) will be stored for the backward pass.
-  At that time, the value ``jnp.sin(2.0)`` is recomputed, along with the values
-  ``jnp.cos(2.0)`` and ``jnp.cos(jnp.sin(2.0))``.
+  这里，无论是否加上 :func:`jax.checkpoint` 装饰器，得到的值都相同。没有该
+  装饰器时，``jnp.cos(2.0)`` 和 ``jnp.cos(jnp.sin(2.0))`` 会在前向过程中被
+  计算并保存下来供反向过程使用，因为它们在反向过程中需要且只依赖原始输入。
+  使用 :func:`jax.checkpoint` 时，前向过程只会计算原始输出，并且只有原始输入
+  （``2.0``）会被保存下来供反向过程使用。届时，``jnp.sin(2.0)`` 以及
+  ``jnp.cos(2.0)`` 和 ``jnp.cos(jnp.sin(2.0))`` 都会被重新计算。
 
-  While :func:`jax.checkpoint` controls what values are stored from the
-  forward-pass to be used on the backward pass, the total amount of memory
-  required to evaluate a function or its VJP depends on many additional internal
-  details of that function. Those details include which numerical primitives are
-  used, how they're composed, where jit and control flow primitives like scan
-  are used, and other factors.
+  虽然 :func:`jax.checkpoint` 控制从前向过程保存哪些值供反向过程使用，但求值
+  一个函数或其 VJP 所需的总内存还取决于该函数的许多其他内部细节，包括使用了
+  哪些数值原语、它们如何组合、在何处使用了 jit 和 scan 这类控制流原语，以及
+  其他因素。
 
-  The :func:`jax.checkpoint` decorator can be applied recursively to express
-  sophisticated autodiff rematerialization strategies. For example:
+  :func:`jax.checkpoint` 装饰器可以递归套用来表达精巧的自动微分重物化策略。
+  例如：
 
   >>> def recursive_checkpoint(funs):
   ...   if len(funs) == 1:
@@ -339,9 +322,8 @@ def checkpoint(fun: Callable, *, prevent_cse: bool | Sequence[bool] = True,
   ...     return lambda x: f1(jax.checkpoint(f2)(x))
   ...
 
-  If ``fun`` involves Python control flow that depends on argument values,
-  it may be necessary to use the ``static_argnums`` parameter. For example,
-  consider a boolean flag argument::
+  如果 ``fun`` 包含依赖参数值的 Python 控制流，可能就需要使用
+  ``static_argnums`` 参数。例如，考虑一个布尔标志参数::
 
     from functools import partial
 
@@ -352,12 +334,10 @@ def checkpoint(fun: Callable, *, prevent_cse: bool | Sequence[bool] = True,
       else:
         ...
 
-  Here, the use of ``static_argnums`` allows the ``if`` statement's condition
-  to depends on the value of ``is_training``. The cost to using
-  ``static_argnums`` is that it introduces re-tracing overheads across calls:
-  in the example, ``foo`` is re-traced every time it is called with a new value
-  of ``is_training``. In some situations, ``jax.ensure_compile_time_eval``
-  is needed as well::
+  这里使用 ``static_argnums`` 可以让 ``if`` 语句的条件依赖于 ``is_training``
+  的值。使用 ``static_argnums`` 的代价是会引入跨调用的重复追踪开销：在这个
+  例子中，每次用新的 ``is_training`` 值调用 ``foo`` 时都会重新追踪它。在某些
+  情况下还需要用到 ``jax.ensure_compile_time_eval``::
 
     @partial(jax.checkpoint, static_argnums=(1,))
     def foo(x, y):
@@ -368,9 +348,9 @@ def checkpoint(fun: Callable, *, prevent_cse: bool | Sequence[bool] = True,
       else:
         ...
 
-  As an alternative to using ``static_argnums`` (and
-  ``jax.ensure_compile_time_eval``), it may be easier to compute some values
-  outside the :func:`jax.checkpoint`-decorated function and then close over them.
+  除了使用 ``static_argnums``（以及 ``jax.ensure_compile_time_eval``），
+  另一种也许更简单的做法是在 :func:`jax.checkpoint` 装饰的函数外部计算某些值，
+  然后通过闭包捕获它们。
   """
   if isinstance(static_argnums, int):
     static_argnums = static_argnums,
@@ -411,14 +391,13 @@ def checkpoint(fun: Callable, *, prevent_cse: bool | Sequence[bool] = True,
 def remat(fun: Callable, *, prevent_cse: bool = True,
           policy: Callable[..., bool] | None = None,
           static_argnums: int | tuple[int, ...] = ()) -> Callable:
-  """Alias of :func:`jax.checkpoint`."""
+  """:func:`jax.checkpoint` 的别名。"""
   return checkpoint(fun, prevent_cse=prevent_cse, policy=policy,
                     static_argnums=static_argnums)
 
-# This function is similar to api_util.argnums_partial, except the error
-# messages are specific to jax.remat (and thus more actionable), the
-# hashing/caching behavior is slightly different, and this function accepts a
-# boolean for static_argnums. Perhaps the two could be de-duplicated.
+# 这个函数与 api_util.argnums_partial 类似，区别在于错误信息是针对 jax.remat
+# 定制的（因而更可操作），哈希/缓存行为略有不同，并且本函数还接受布尔值的
+# static_argnums。也许两者可以去重合并。
 def _remat_static_argnums(fun, static_argnums, args):
   if type(static_argnums) is int:
     static_argnums = (static_argnums,)
@@ -448,8 +427,8 @@ def _remat_static_argnums(fun, static_argnums, args):
 WrapHashably = api_util.WrapHashably
 _dyn_args_fun = api_util.dyn_args_fun
 
-# This helper is similar to those in control_flow/common.py, but with
-# remat-specific errors.
+# 这个辅助函数与 control_flow/common.py 中的那些类似，但带有 remat 专有的
+# 错误信息。
 @weakref_lru_cache
 def _trace_to_jaxpr(fun: Callable,
                     in_tree: PyTreeDef,
@@ -502,7 +481,7 @@ def _saved_residuals(jaxpr: core.Jaxpr,
   res_lits = [x for x in jaxpr.outvars if     isinstance(x, core.Literal)]
   res_vars = {x for x in jaxpr.outvars if not isinstance(x, core.Literal)}
 
-  # don't count reduce_precision_p as the producer, look through it instead
+  # 不要把 reduce_precision_p 算作生产者，而是透过它继续向前看
   subst = {e.outvars[0]: e.invars[0] for e in jaxpr.eqns
            if e.primitive is lax_internal.reduce_precision_p}
   res_vars = {subst.get(v, v) for v in res_vars}
@@ -531,8 +510,8 @@ def _saved_residuals(jaxpr: core.Jaxpr,
           and isinstance(p := eqn.params['_prim'], CheckpointName)):
       return p.name
 
-  # TODO(mattjj): actually we want to flag this case as problematic, ie some
-  # other consumer of the input to a name_p
+  # TODO(mattjj): 其实我们想把这种情况标记为有问题，也就是 name_p 的
+  # 输入还有别的消费者
   # named_vars = {v: e for e in jaxpr.eqns if e.primitive is name_p
   #               for v in e.invars}
 
@@ -570,12 +549,12 @@ remat_p.bind = _remat_bind
 
 @remat_p.def_impl
 def remat_impl(*args, jaxpr, prevent_cse, differentiated, policy):
-  del prevent_cse, differentiated, policy  # Unused.
+  del prevent_cse, differentiated, policy  # 未使用。
   return core.eval_jaxpr(jaxpr, (), *args)
 
 @remat_p.def_effectful_abstract_eval
 def remat_abstract_eval(*args, jaxpr, prevent_cse, differentiated, policy):
-  del args, prevent_cse, differentiated, policy  # Unused.
+  del args, prevent_cse, differentiated, policy  # 未使用。
   return [v.aval for v in jaxpr.outvars], core.positional_effects(jaxpr)
 
 def remat_jvp(primals, tangents, jaxpr, prevent_cse, differentiated, policy):
@@ -609,28 +588,28 @@ def remat_partial_eval(trace: pe.JaxprTrace, *tracers: core.Tracer,
       pe.partial_eval_jaxpr_custom(
           jaxpr, in_unknowns, [True] * len(in_unknowns), False, False, policy)
 
-  # DCE jaxpr_staged, keeping only instantiated outputs which are unknown
+  # 对 jaxpr_staged 做 DCE，只保留那些已实例化且未知的输出
   _, out_inst_unknown = partition_list(out_inst, out_unknowns)
   jaxpr_unknown, in_used_staged = pe.dce_jaxpr(jaxpr_staged, out_inst_unknown)
   used_res, in_used_staged = split_list(in_used_staged, [num_res])
 
-  # DCE jaxpr_known, keeping all known outputs but discarding dce'd res
+  # 对 jaxpr_known 做 DCE，保留所有已知输出但丢弃被消除的 res
   out_used_known = [True] * (len(out_unknowns) - sum(out_unknowns)) + used_res
   jaxpr_known, in_used_known = pe.dce_jaxpr(jaxpr_known, out_used_known)
   num_res = sum(used_res)
 
-  # To avoid precision mismatches in fwd and bwd passes due to XLA excess
-  # precision, insert explicit x = reduce_precision(x, **finfo(x.dtype)) calls
-  # on producers of any residuals. See https://github.com/jax-ml/jax/pull/22244.
+  # 为了避免因 XLA 的过量精度导致前向和反向过程出现精度不一致，在任何残差的
+  # 生产者上插入显式的 x = reduce_precision(x, **finfo(x.dtype)) 调用。
+  # 参见 https://github.com/jax-ml/jax/pull/22244。
   jaxpr_known_ = _insert_reduce_precision(jaxpr_known, num_res)
 
-  # Compute known outputs and residuals (hoisted out of remat primitive)
+  # 计算已知输出与残差（提升到 remat 原语之外）
   _, in_consts_ = unzip2(t.pval for t in tracers if t.pval.is_known())
   _, in_consts = partition_list(in_used_known, in_consts_)
   out_consts = core.eval_jaxpr(jaxpr_known_, (), *in_consts)
   out_knowns, residuals = split_list(out_consts, [len(out_consts)-num_res])
 
-  # set up unknown outputs with a recipe to call remat
+  # 为未知输出建立调用 remat 的配方（recipe）
   res_tracers = map(trace.new_instantiated_const, residuals)
   _, tracers_staged = partition_list(in_used_staged, tracers)
   in_jaxpr_tracers = res_tracers + map(trace.instantiate_const, tracers_staged)  # pyrefly: ignore[bad-argument-type]
@@ -645,7 +624,7 @@ def remat_partial_eval(trace: pe.JaxprTrace, *tracers: core.Tracer,
                              new_params, core.positional_effects(jaxpr_unknown),
                              source_info_util.current())
 
-  # log info about saved residuals
+  # 记录所保存残差的信息
   log_level = logging.WARNING if config.log_checkpoint_residuals.value else logging.DEBUG
   if logger.isEnabledFor(log_level):
     try:
@@ -664,11 +643,11 @@ def remat_partial_eval(trace: pe.JaxprTrace, *tracers: core.Tracer,
                 *[v.aval.str_short() for v in res_invars],
                 *[elt for (a, s) in body_res for elt in [a.str_short(), s]])
     except:
-      pass  # just don't log anything on failure
+      pass  # 失败时干脆不记录任何日志
 
   for t in out_jaxpr_tracers: t.recipe = recipe
 
-  # zip together known and unknown outputs
+  # 把已知输出与未知输出 zip 到一起
   return merge_lists(out_unknowns, out_knowns, out_jaxpr_tracers)
 pe.custom_partial_eval_rules[remat_p] = remat_partial_eval
 
@@ -724,7 +703,7 @@ pe.partial_eval_jaxpr_custom_rules[remat_p] = \
             remat_partial_eval_custom_params_updater)
 
 def remat_transpose(out_cts, *args, jaxpr, prevent_cse, **params):
-  # TODO(mattjj): avoid round-tripping into UndefinedPrimals
+  # TODO(mattjj): 避免与 UndefinedPrimals 来回转换
   args_ = [ad.UndefinedPrimal(x.aval) if isinstance(x, ad.GradAccum) else x
            for x in args]
 
@@ -749,7 +728,7 @@ def remat_transpose(out_cts, *args, jaxpr, prevent_cse, **params):
   return logs
 ad.fancy_transposes[remat_p] = remat_transpose
 
-# TODO(mattjj): move this to ad.py
+# TODO(mattjj): 把它移到 ad.py
 def transpose_jaxpr(jaxpr: core.Jaxpr, in_linear: bool | Sequence[bool],
                     out_zeros: bool | Sequence[bool],
                     ) -> tuple[core.Jaxpr, list[bool], PyTreeDef]:
@@ -771,15 +750,15 @@ def _transpose_jaxpr(jaxpr: core.Jaxpr,
   def transposed(*args_flat):
     ins_flat, out_cts_flat = split_list(args_flat, [len(in_lin) - sum(in_lin)])
 
-    # Evaluate nonlinear parts using partial evaluation to get a linear jaxpr.
-    # TODO(mattjj): revise not to require disabling checks
+    # 通过部分求值来求值非线性部分，从而得到一个线性 jaxpr。
+    # TODO(mattjj): 改成不需要禁用检查
     with config.mutable_array_checks(False):
       jaxpr_rematted, lin_jaxpr, out_uk, res_avals = \
           pe.partial_eval_jaxpr_nounits(jaxpr, in_lin, False)
     with source_info_util.extend_name_stack('rematted_computation'):
       consts = core.jaxpr_as_fun(jaxpr_rematted)(*ins_flat)
 
-    # Transpose the linear jaxpr (which only has linear inputs).
+    # 转置该线性 jaxpr（它只有线性输入）。
     out_cts_iter = iter(out_cts_flat)
     out_cts = [ad_util.Zero(aval.to_ct_aval()) if zero else next(out_cts_iter)
                for aval, zero in zip(jaxpr.out_avals, out_zeros)]
@@ -791,8 +770,8 @@ def _transpose_jaxpr(jaxpr: core.Jaxpr,
                                     return_logs=True)
     in_cts = in_cts[len(consts):]
 
-    # Identify symbolic zeros in the resulting cotangents, and return nonzeros,
-    # with any backward-pass log leaves riding along as extra outputs.
+    # 找出所得余切中的符号零，并返回非零项，同时让反向过程的日志叶子作为
+    # 额外输出一并带出。
     in_zeros = cell.in_cts_zero = [type(ct) is ad_util.Zero for ct in in_cts]  # pyrefly: ignore[missing-attribute]
     in_cts_nz, _ = partition_list(in_zeros, in_cts)
     outs, cell.out_tree = tree_flatten((in_cts_nz, logs))  # pyrefly: ignore[missing-attribute]
@@ -816,7 +795,7 @@ def remat_vmap(axis_data, args, dims, *, jaxpr, **params):
   return remat_p.bind(*consts, *args, jaxpr=jaxpr_batched, **params), out_dims
 batching.fancy_primitive_batchers[remat_p] = remat_vmap
 
-# TODO(mattjj,sharadmv): de-duplicate with pe.dce_jaxpr_call_rule
+# TODO(mattjj,sharadmv): 与 pe.dce_jaxpr_call_rule 去重
 def remat_dce(used_outputs: list[bool], eqn: core.JaxprEqn
               ) -> tuple[list[bool], core.JaxprEqn | None]:
   if not any(used_outputs) and not pe.has_effects(eqn):
@@ -892,27 +871,24 @@ remat_p.to_lojax = _remat_to_lojax
 
 
 def checkpoint_name(x, name):
-  """Identifies a value with a name within :func:`jax.checkpoint`.
+  """在 :func:`jax.checkpoint` 内部用名字来标识一个值。
 
-  This function acts as an identity function at runtime (returning ``x``
-  unchanged) but attaches a string name to the value in the JAX trace.
-  These names can be targeted by specific checkpointing policies (see
-  :ref:`checkpoint-policies`) to control which intermediate values
-  are saved during the forward pass and which are recomputed during the
-  backward pass.
+  本函数在运行时的行为相当于恒等函数（原样返回 ``x``），但在 JAX 的追踪中给
+  该值附加了一个字符串名字。特定的检查点策略（参见
+  :ref:`checkpoint-policies`）可以针对这些名字，来控制前向过程中保存哪些中间
+  值、反向过程中重新计算哪些中间值。
 
   Args:
-    x: array or PyTree of arrays to be named.
-    name: A string name to associate with the value ``x``.
+    x: 要被命名的数组或数组 pytree。
+    name: 要与值 ``x`` 关联的字符串名字。
 
   Returns:
-    The input ``x``, unchanged.
+    输入 ``x``，保持不变。
 
   See Also:
-    - :func:`jax.checkpoint` (alias: :func:`jax.remat`): decorator to
-      enable checkpointing.
-    - :mod:`jax.checkpoint_policies`: a namespace containing policies
-      that use names marked via ``checkpoint_name`` to determine behavior.
+    - :func:`jax.checkpoint`（别名 :func:`jax.remat`）：启用检查点的装饰器。
+    - :mod:`jax.checkpoint_policies`：一个命名空间，其中包含使用
+      ``checkpoint_name`` 标记的名字来决定行为的各种策略。
 
   Example:
     >>> import jax
@@ -929,8 +905,8 @@ def checkpoint_name(x, name):
     >>> policy = jax.checkpoint_policies.save_only_these_names("my_intermediate")
     >>> f_checkpointed = jax.checkpoint(f, policy=policy)
 
-    For further examples, see the `remat example notebook
-    <https://docs.jax.dev/en/latest/notebooks/autodiff_remat.html>`_.
+    更多示例请参见 `remat 示例笔记本
+    <https://docs.jax.dev/en/latest/notebooks/autodiff_remat.html>`_。
   """
   if config.remat3.value:
     return tree_map(lambda x: checkpoint_name3(name, x), x)
@@ -941,7 +917,7 @@ name_p.def_abstract_eval(lambda x, *, name: x)
 
 def name_jvp(primals, tangents, *, name):
   (x,), (xdot,) = primals, tangents
-  return name_p.bind(x, name=name), xdot  # don't name the tangent value
+  return name_p.bind(x, name=name), xdot  # 不给切向量命名
 ad.primitive_jvps[name_p] = name_jvp
 
 mlir.register_lowering(name_p, lambda ctx, x, *, name: [x])
@@ -972,27 +948,23 @@ def _remat_state_discharge_rule(
 # -------------------- Remat 3 --------------------
 
 # TODO
-#  [ ] zeros propagation (needs separate ruleset, maybe jax.vjp improvement)
+#  [ ] 零值传播（需要单独的规则集，也许还要改进 jax.vjp）
 
 def checkpoint_name3(name, x):
   return CheckpointName(name, typeof(x))(x)
 
 def remat3(f=None, /, policy=None, static_argnums=(), static_argnames=(),
            prevent_cse=True):
-  """Rematerialization decorator (new implementation, ``jax_remat3``).
+  """重物化装饰器（新实现，``jax_remat3``）。
 
-  Note on interaction with :func:`jax.custom_vjp`: when differentiating
-  rematted code, a custom_vjp application that appears *inside another
-  custom_vjp's fwd rule* is rematerialized as an opaque unit. For the
-  conventional idiom of a fwd rule calling its own custom_vjp-decorated
-  function to compute the primal output, that is exactly the intended
-  semantics. Values and gradients are unaffected at every order of
-  differentiation. The one observable consequence arises only under
-  higher-order AD: differentiating a second time runs the inner application's
-  own fwd rule (at first order it never runs, since the outer bwd rule
-  discharges the derivative), and values inside it (e.g.
-  ``checkpoint_name``-tagged intermediates) cannot be marked saveable by the
-  checkpoint ``policy`` there; they are always recomputed.
+  关于与 :func:`jax.custom_vjp` 交互的说明：在微分经过重物化的代码时，出现在
+  *另一个 custom_vjp 的 fwd 规则内部* 的 custom_vjp 应用会被作为一个不透明的
+  单元整体重物化。对于“fwd 规则调用自身被 custom_vjp 装饰的函数来计算原始
+  输出”这一惯用写法而言，这正是预期的语义。在任意阶微分下，值与梯度都不受
+  影响。唯一可观察到的后果只出现在高阶自动微分下：再次微分时会运行内层应用
+  自己的 fwd 规则（在一阶时它从不运行，因为外层的 bwd 规则已经完成了求导），
+  而其中的值（例如用 ``checkpoint_name`` 标记的中间值）无法在那里被检查点的
+  ``policy`` 标记为可保存；它们总会被重新计算。
   """
   kwargs = dict(policy=policy, static_argnums=static_argnums,
                 static_argnames=static_argnames, prevent_cse=prevent_cse)
@@ -1006,9 +978,8 @@ def _remat3(f, *, policy, static_argnums, static_argnames, prevent_cse=True):
   @wraps(f)
   def decorator(*args, **kwargs):
     if static_argnums or static_argnames:
-      # Like classic remat (and custom_vjp3), support unhashable static
-      # values by closing over them instead of threading them through the
-      # tracing machinery, which hashes them.
+      # 与经典 remat（以及 custom_vjp3）一样，对于不可哈希的静态值，改为通过
+      # 闭包捕获它们，而不是把它们穿过会对它们做哈希的追踪机制。
       args_ = api_util.resolve_kwargs(f, args, kwargs)
       argnums_ = (static_argnums,) if type(static_argnums) is int else static_argnums
       argnums = frozenset(i % len(args_) for i in _static_argnums(
@@ -1056,7 +1027,7 @@ def dce(traced, policy):
           "the rematted computation's closure contains a mutable array "
           f"reference of type {v.aval.str_short()} that is not one of the "
           "rematted function's inputs, but such refs cannot be saved")
-  # dce_jaxpr preserves attached consts (constvars are never pruned).
+  # dce_jaxpr 会保留附加的常量（constvars 从不被裁剪）。
   jaxpr, used = pe.dce_jaxpr(jaxpr, True)
   keep = [u or i in {*in_fwd} for i, u in enumerate(used)]
   kept_idx = {i: p for p, i in enumerate(i for i, k in enumerate(keep) if k)}
@@ -1100,7 +1071,7 @@ class RematTraced(VJPHiPrimitive):
     return core.eval_jaxpr_p.bind(*args, call_jaxpr=self.jaxpr)
 
   def vjp_fwd(self, nzs_in, *primals):
-    # TODO eval_jaxpr_p trace time
+    # TODO eval_jaxpr_p 的追踪耗时
     self._check_differentiable()
     traced = core.jaxpr_as_fun(self.jaxpr)
     primals_out, fwd2 = remat_transform(self.policy, traced, *primals,
@@ -1146,7 +1117,7 @@ class RematTraced(VJPHiPrimitive):
 
   def jvp(self, primals, tangents):
     traced = core.jaxpr_as_fun(self.jaxpr)
-    tangents = tuple(map(ad_util.instantiate, tangents))  # TODO don't instantiate
+    tangents = tuple(map(ad_util.instantiate, tangents))  # TODO 不要实例化
     return api.jvp(traced, primals, tangents)
 
   def lin(self, nzs_in, *primals):
@@ -1240,11 +1211,11 @@ class CheckpointName(VJPHiPrimitive):
           return primal_left_tangent_right(x_dev, x_rem)
         return x, rem
       else:
-        return x, lambda x: x  # full remat
+        return x, lambda x: x  # 完全重物化
     elif policy is everything_saveable:
       return x, partial(primal_left_tangent_right, x)
     else:
-      return x, lambda x: x  # full remat
+      return x, lambda x: x  # 完全重物化
 
   def jvp(self, primals, tangents):
     (x,), (xdot,) = primals, tangents
@@ -1299,38 +1270,32 @@ def primal_left_tangent_right(x, _x):
 
 def custom_remat(f, f_fwd, f_rem, f_bwd, *, static_argnums=(),
                  static_argnames=()):
-  """Wrap ``f`` with custom rematerialization behavior for reverse-mode AD.
+  """用自定义的重物化行为包装 ``f``，用于反向模式自动微分。
 
-  Where :func:`jax.checkpoint` policies select saveable values by name, a
-  ``custom_remat``-wrapped function carries its own rematerialization rules,
-  which can depend on the ambient checkpoint policy. Requires the
-  ``jax_remat3`` implementation.
+  与 :func:`jax.checkpoint` 的策略按名字选择可保存的值不同，被
+  ``custom_remat`` 包装的函数带有自己的重物化规则，这些规则可以依赖当前的
+  检查点策略。需要 ``jax_remat3`` 实现。
 
   Args:
-    f: the function to wrap, called (or traced) for ordinary evaluation.
-    f_fwd: forward-pass rule under rematerialized differentiation, of
-      signature ``f_fwd(policy, *args) -> (out, res)``. It receives the
-      ambient checkpoint policy along with the arguments of ``f``, and
-      returns the primal output paired with residuals to save (which may be
-      ``None``, to save nothing).
-    f_rem: rematerialization rule, of signature
-      ``f_rem(res, *args) -> (out, res2)``. On the backward pass it receives
-      the residuals saved by ``f_fwd`` and the arguments of ``f``, and
-      recomputes the primal output paired with the residuals that ``f_bwd``
-      needs.
-    f_bwd: backward-pass rule, of signature
-      ``f_bwd(res2, out_ct) -> args_ct``, returning a tuple of cotangents
-      with one entry per argument of ``f``.
-    static_argnums: as in :func:`jax.jit`.
-    static_argnames: as in :func:`jax.jit`.
+    f: 要包装的函数，在普通求值时被调用（或被追踪）。
+    f_fwd: 重物化微分下的前向规则，签名为
+      ``f_fwd(policy, *args) -> (out, res)``。它接收当前的检查点策略以及
+      ``f`` 的参数，返回原始输出与需要保存的残差（残差可以为 ``None``，
+      表示什么都不保存）。
+    f_rem: 重物化规则，签名为 ``f_rem(res, *args) -> (out, res2)``。在反向
+      过程中它接收 ``f_fwd`` 保存的残差以及 ``f`` 的参数，重新计算原始输出
+      以及 ``f_bwd`` 所需的残差。
+    f_bwd: 反向规则，签名为 ``f_bwd(res2, out_ct) -> args_ct``，返回一个
+      余切元组，其中每个 ``f`` 的参数对应一项。
+    static_argnums: 同 :func:`jax.jit`。
+    static_argnames: 同 :func:`jax.jit`。
 
   Returns:
-    A wrapped version of ``f`` with the same call behavior, but with the
-    given rules applied when it is differentiated in reverse mode under
-    rematerialization (e.g. under :func:`jax.checkpoint`). Forward-mode
-    differentiation falls back to differentiating ``f``.
+    包装后的 ``f``，调用行为相同，但在重物化下进行反向模式微分（例如在
+    :func:`jax.checkpoint` 下）时会应用给定的规则。前向模式微分则回退为直接
+    微分 ``f``。
   """
-  # TODO reverse-mode only... use hijax instead of custom_vjp
+  # TODO 仅支持反向模式……改用 hijax 而不是 custom_vjp
   helper = custom_derivatives.custom_vjp(lambda _, *args: f(*args))
   helper.defvjp(f_rem, lambda res, g: (None, *f_bwd(res, g)))
   def call(*args, **kwargs):

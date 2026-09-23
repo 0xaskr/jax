@@ -12,16 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Thread-safe utilities for catching and testing for warnings.
+# 文件职责：提供线程安全的 Python 警告捕获与断言工具，供 JAX 测试使用。
+# 由于标准库 `warnings` 模块（截至 Python 3.13）并非线程安全，
+# `catch_warnings()` 天然存在竞态，这里改用自定义 `showwarning` 钩子。
+# 每个线程维护一份处理器栈，从而提供自己的警告过滤与记录机制。
+# 主要接口：`raise_on_warnings`、`record_warnings`、`ignore_warning`
+# 三个上下文管理器，以及安装钩子的 `install_threadsafe_warning_handlers`。
+
+# 用于捕获与测试警告的线程安全工具。
 #
-# The Python warnings module, at least as of Python 3.13, is not thread-safe.
-# The catch_warnings() feature is inherently racy, see
+# Python 的 `warnings` 模块（至少到 Python 3.13 为止）不是线程安全的。
+# `catch_warnings()` 这一特性天然存在竞态，参见
 # https://py-free-threading.github.io/porting/#the-warnings-module-is-not-thread-safe
 #
-# This module offers a thread-safe way to catch and record warnings. We install
-# a custom showwarning hook with the Python warning module, and then rely on
-# the CPython warnings module to call our show warning function. We then use it
-# to create our own thread-safe warning filtering utilities.
+# 本模块提供了一种线程安全地捕获并记录警告的方式。我们向 Python 的
+# `warnings` 模块安装一个自定义的 showwarning 钩子，然后依赖
+# CPython 的 `warnings` 模块调用我们自己的显示警告函数。接着我们用它
+# 来构造自己的线程安全警告过滤工具。
 
 import contextlib
 import re
@@ -30,7 +37,7 @@ import warnings
 
 
 class _WarningContext(threading.local):
-  "Thread-local state that contains a list of warning handlers."
+  "保存警告处理器列表的线程局部状态。"
 
   def __init__(self):
     self.handlers = []
@@ -39,8 +46,8 @@ class _WarningContext(threading.local):
 _context = _WarningContext()
 
 
-# Callback that applies the handlers in reverse order. If no handler matches,
-# we raise an error.
+# 回调函数：按相反顺序应用各处理器。若没有处理器匹配，
+# 我们就抛出错误。
 def _showwarning(message, category, filename, lineno, file=None, line=None):
   for handler in reversed(_context.handlers):
     if handler(message, category, filename, lineno, file, line):
@@ -50,7 +57,7 @@ def _showwarning(message, category, filename, lineno, file=None, line=None):
 
 @contextlib.contextmanager
 def raise_on_warnings():
-  "Context manager that raises an exception if a warning is raised."
+  "在出现警告时抛出异常的上下文管理器。"
   if warnings.showwarning is not _showwarning:
     with warnings.catch_warnings():
       warnings.simplefilter("error")
@@ -69,7 +76,7 @@ def raise_on_warnings():
 
 @contextlib.contextmanager
 def record_warnings():
-  "Context manager that yields a list of warnings that are raised."
+  "产出所抛出警告列表的上下文管理器。"
   if warnings.showwarning is not _showwarning:
     with warnings.catch_warnings(record=True) as w:
       warnings.simplefilter("always")
@@ -91,7 +98,7 @@ def record_warnings():
 
 @contextlib.contextmanager
 def ignore_warning(*, message: str | None = None, category: type = Warning):
-  "Context manager that ignores any matching warnings."
+  "忽略所有匹配警告的上下文管理器。"
   if warnings.showwarning is not _showwarning:
     with warnings.catch_warnings():
       warnings.filterwarnings(
@@ -122,11 +129,11 @@ def ignore_warning(*, message: str | None = None, category: type = Warning):
 
 
 def install_threadsafe_warning_handlers():
-  # Hook the showwarning method. The warnings module explicitly notes that
-  # this is a function that users may replace.
+  # 挂接 showwarning 方法。`warnings` 模块明确指出
+  # 这是一个允许用户替换的函数。
   warnings.showwarning = _showwarning
 
-  # Set the warnings module to always display warnings. We hook into it by
-  # overriding the "showwarning" method, so it's important that all warnings
-  # are "shown" by the usual mechanism.
+  # 让 `warnings` 模块始终显示警告。我们通过
+  # 覆盖 "showwarning" 方法来挂接，因此所有警告都必须
+  # 由常规机制“显示”出来，这一点很重要。
   warnings.simplefilter("always")

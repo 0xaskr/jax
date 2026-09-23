@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# 文件职责：提供自动微分（AD）所需的基础抽象，主要是各种“零”的表示与求和/截断梯度原语。
+# 其中 `Zero` 是 jaxpr 内部使用的抽象零，只携带抽象值（aval），
+# 而 `SymbolicZero` 是面向用户的符号零，属性访问会转发给其 aval。
+# 还定义 `add_jaxvals`（对应原语 `add_any`）用于把两个值相加，
+# 以及 `stop_gradient` 原语，并给出由原值/抽象值构造零切向量、
+# 零余切向量的辅助函数，供线性化与转置等 AD 规则使用。
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -105,7 +111,7 @@ stop_gradient_p.def_impl(_stop_gradient_impl)
 stop_gradient_p.def_abstract_eval(lambda x: x)
 
 
-# User-facing version of `Zero`
+# `Zero` 的面向用户版本
 class SymbolicZero:
   def __init__(self, aval: core.AbstractValue) -> None:
     self.aval = aval
@@ -113,10 +119,10 @@ class SymbolicZero:
   def __repr__(self) -> str:
     return self.__class__.__name__
 
-  # TODO(mattjj,frostig): this forwards attr lookup to self.aval delegate;
-  # should dedup with core.Tracer.__getattr__ which does the same thing
+  # TODO(mattjj,frostig): 这里把属性查找转发给 self.aval 委托对象；
+  # 应与做同样事情的 core.Tracer.__getattr__ 去重
   def __getattr__(self, name):
-    # if the aval property raises an AttributeError, gets caught here
+    # 若 aval 属性抛出 AttributeError，会在这里被捕获
     try:
       attr = getattr(self.aval, name)
     except KeyError as err:
@@ -154,5 +160,5 @@ def replace_rule_output_symbolic_zeros(
   return Zero(x.aval) if type(x) is SymbolicZero else x
 
 
-# TODO(mattjj): remove these after fixing downstream users relying on them
+# TODO(mattjj): 在修复依赖这些的调用方之后移除它们
 zeros_like_p: Primitive = Primitive('zeros_like')

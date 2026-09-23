@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：为已暂存的 JAX 计算提供运行时错误检查机制。
+# `set_error_if` 在计算内部记录错误码与回溯但不立即中断执行，
+# `raise_if_error` 在计算结束后统一抛出 `JaxValueError`。
+# 错误码保存在线程局部的 `core.Ref` 中，其形状随上下文 mesh 变化，
+# 因此多设备显式模式下需用 `error_checking_context` 重新初始化。
+# `wrap_for_export` / `unwrap_from_import` 让错误检查状态可随 AOT
+# 导出与导入函数一起序列化，从而接入导入进程的全局错误状态。
+
 from __future__ import annotations
 
 import dataclasses
@@ -40,21 +48,20 @@ traceback_util.register_exclusion(__file__)
 
 
 class JaxValueError(ValueError):
-  """Exception raised for runtime errors detected within JAX computations."""
+  """在 JAX 计算内部检测到运行时错误时抛出的异常。"""
 
 
-#: The default error code for no error.
+#: 表示无错误的默认错误码。
 #:
-#: This value is chosen because we can use `jnp.min()` to obtain the
-#: first error when performing reductions.
+#: 选择该值是因为在做规约时可以用 `jnp.min()` 取得第一个错误。
 _NO_ERROR = np.iinfo(np.uint32).max
 
 
 _error_list_lock = threading.RLock()
-# (error_message, traceback) pairs. Traceback is `str` when imported from AOT.
+# (错误信息, 回溯) 对。从 AOT 导入时回溯为 `str`。
 _error_list: list[tuple[str, TracebackType | str]] = []
 
-# Standard error message for invalid/corrupted error codes from AOT import.
+# AOT 导入时无效/损坏错误码的标准错误信息。
 _INVALID_ERROR_CODE_MSG = (
     "An unknown error occurred during execution of an AOT-imported function. "
     "This may indicate data corruption during AOT serialization/deserialization, "
@@ -73,19 +80,19 @@ _error_storage = _ErrorStorage()
 
 
 def _initialize_error_code_ref() -> None:
-  """Initialize the error code ref in the current thread.
+  """在当前线程中初始化错误码引用。
 
-  The shape and size of the error code array depend on the mesh in the context.
-  In single-device environments, the array is a scalar. In multi-device
-  environments, its shape and size match those of the mesh.
+  错误码数组的形状与大小取决于上下文中的 mesh。
+  在单设备环境中该数组是标量；在多设备环境中，
+  其形状与大小与 mesh 一致。
   """
-  # Get mesh from the context.
+  # 从上下文中获取 mesh。
   mesh = mesh_lib.get_concrete_mesh()
 
-  if mesh.empty:  # single-device case.
+  if mesh.empty:  # 单设备情形。
     error_code: ArrayLike = np.uint32(_NO_ERROR)
 
-  else:  # multi-device case.
+  else:  # 多设备情形。
     sharding = NamedSharding(mesh, P(*mesh.axis_names))
     error_code = lax.full(
         mesh.axis_sizes,
@@ -97,18 +104,17 @@ def _initialize_error_code_ref() -> None:
 
 
 class error_checking_context:
-  """Redefine the internal error state based on the mesh in the context.
+  """依据上下文中的 mesh 重新定义内部错误状态。
 
-  When using JAX in multi-device environments in explicit mode, error tracking
-  needs to be properly aligned with the device mesh. This context manager
-  ensures that the internal error state is correctly initialized based on the
-  current mesh configuration.
+  在显式模式下于多设备环境中使用 JAX 时，错误跟踪需要与设备 mesh
+  正确对齐。该上下文管理器确保内部错误状态能依据当前 mesh 配置被
+  正确初始化。
 
-  This context manager should be used when starting a multi-device computation,
-  or when switching between different device meshes.
+  在启动多设备计算时，或在不同设备 mesh 之间切换时，应使用该上下文
+  管理器。
 
-  On entering the context, it initializes a new error state based on the mesh in
-  the context. On exiting the context, it restores the previous error state.
+  进入该上下文时，它会依据上下文中的 mesh 初始化新的错误状态；
+  退出该上下文时，它会恢复先前的错误状态。
   """
 
   __slots__ = ("old_ref",)
@@ -127,34 +133,30 @@ class error_checking_context:
 
 
 def set_error_if(pred: Array, /, msg: str) -> None:
-  """Set the internal error state if any element of `pred` is `True`.
+  """若 `pred` 的任一元素为 `True`，则设置内部错误状态。
 
-  This function is used inside JAX computations to detect runtime errors without
-  immediately halting execution. When this function is traced (e.g., inside
-  :func:`jax.jit`), the corresponding error message and its traceback are
-  recorded. At execution time, if `pred` contains any `True` values, the error
-  state is set, but execution continues without interruption. The recorded error
-  can later be raised using :func:`raise_if_error`.
+  该函数在 JAX 计算内部使用，用于在不立即中止执行的前提下检测运行时
+  错误。当该函数被追踪时（例如在 :func:`jax.jit` 内部），相应的错误
+  信息及其回溯会被记录下来。在执行时，若 `pred` 含有任何 `True` 值，
+  则会设置错误状态，但执行会继续而不被中断。记录下来的错误随后可用
+  :func:`raise_if_error` 抛出。
 
-  If the error state has already been set, subsequent errors are ignored and
-  will not override the existing error.
+  若错误状态已被设置，则后续错误会被忽略，不会覆盖已有的错误。
 
-  For multi-device environments, in explicit mode, users must call
-  :func:`error_checking_context` to initialize a new error tracking state that
-  matches the device mesh. In auto mode, implicit cross-device communication may
-  occur inside this function, which could impact performance. A warning is
-  issued in such cases.
+  对于多设备环境，在显式模式下用户必须调用
+  :func:`error_checking_context` 来初始化一个与设备 mesh 匹配的新错误
+  跟踪状态。在自动模式下，该函数内部可能发生隐式的跨设备通信，这可能
+  影响性能；此时会发出警告。
 
-  When exporting a function with `jax.export`, error checking must be explicitly
-  wrapped using :func:`wrap_for_export` before export and
-  :func:`unwrap_from_import` after import.
+  在使用 `jax.export` 导出函数时，必须在导出前用 :func:`wrap_for_export`
+  显式包装错误检查，并在导入后用 :func:`unwrap_from_import` 解开包装。
 
   Args:
-    pred: A JAX boolean array. If any element of `pred` is `True`, the internal
-      error state will be set.
-    msg: The corresponding error message to be raised later.
+    pred: 一个 JAX 布尔数组。若 `pred` 的任一元素为 `True`，
+      则会设置内部错误状态。
+    msg: 稍后要抛出的对应错误信息。
   """
-  # TODO(jakevdp): remove this import and express the following using lax APIs.
+  # TODO(jakevdp): 移除这个导入，改用 lax API 表达下面的逻辑。
   import jax.numpy as jnp  # pyrefly: ignore[missing-import]
 
   if _error_storage.ref is None:
@@ -162,7 +164,7 @@ def set_error_if(pred: Array, /, msg: str) -> None:
       _initialize_error_code_ref()
     assert _error_storage.ref is not None
 
-  # Get the traceback.
+  # 获取回溯。
   traceback = source_info_util.current().traceback
   assert traceback is not None
   traceback = traceback.as_python_traceback()
@@ -177,12 +179,12 @@ def set_error_if(pred: Array, /, msg: str) -> None:
   out_sharding = core.typeof(_error_storage.ref).sharding
   in_sharding: NamedSharding = core.typeof(pred).sharding
 
-  # Reduce `pred`.
-  if all(dim is None for dim in out_sharding.spec):  # single-device case.
+  # 对 `pred` 做规约。
+  if all(dim is None for dim in out_sharding.spec):  # 单设备情形。
     pred = pred.any()
-  else:  # multi-device case.
+  else:  # 多设备情形。
     has_auto_axes = mesh_lib.AxisType.Auto in in_sharding.mesh.axis_types
-    if has_auto_axes:  # auto mode.
+    if has_auto_axes:  # 自动模式。
       warnings.warn(
           "When at least one mesh axis of `pred` is in auto mode, calling"
           " `set_error_if` will cause implicit communication between devices."
@@ -190,8 +192,8 @@ def set_error_if(pred: Array, /, msg: str) -> None:
           " explicit mode.",
           RuntimeWarning,
       )
-      pred = pred.any()  # reduce to a single scalar
-    else:  # explicit mode.
+      pred = pred.any()  # 规约为单个标量
+    else:  # 显式模式。
       if out_sharding.mesh != in_sharding.mesh:
         raise ValueError(
             "The error code state and the predicate must be on the same mesh, "
@@ -204,33 +206,32 @@ def set_error_if(pred: Array, /, msg: str) -> None:
           mesh=out_sharding.mesh,
           in_specs=in_sharding.spec,
           out_specs=out_sharding.spec,
-      )(pred)  # perform per-device reduction
+      )(pred)  # 执行逐设备规约
 
   error_code = _error_storage.ref[...]
   should_update = jnp.logical_and(error_code == jnp.uint32(_NO_ERROR), pred)
   error_code = jnp.where(should_update, new_error_code, error_code)
-  # TODO(ayx): support vmap and shard_map.
+  # TODO(ayx): 支持 vmap 与 shard_map。
   _error_storage.ref[...] = error_code
 
 
 def raise_if_error() -> None:
-  """Raise an exception if the internal error state is set.
+  """若内部错误状态已被设置，则抛出异常。
 
-  This function should be called after a computation completes to check for any
-  errors that were marked during execution via `set_error_if()`. If an error
-  exists, it raises a `JaxValueError` with the corresponding error message.
+  该函数应在计算完成后调用，以检查执行期间通过 `set_error_if()` 标记的
+  任何错误。若存在错误，它会抛出带有相应错误信息的 `JaxValueError`。
 
-  This function should not be called inside a traced function (e.g., inside
-  :func:`jax.jit`). Doing so will raise a `ValueError`.
+  不应在被追踪的函数内部（例如 :func:`jax.jit` 内部）调用该函数。
+  这样做会抛出 `ValueError`。
 
   Raises:
-    JaxValueError: If the internal error state is set.
-    ValueError: If called within a traced JAX function.
+    JaxValueError: 若内部错误状态已被设置。
+    ValueError: 若在被追踪的 JAX 函数内部调用。
   """
-  if _error_storage.ref is None:  # if not initialized, do nothing
+  if _error_storage.ref is None:  # 若未初始化，则什么也不做
     return
 
-  error_code = _error_storage.ref[...].min()  # reduce to a single error code
+  error_code = _error_storage.ref[...].min()  # 规约为单个错误码
   if isinstance(error_code, core.Tracer):
     raise ValueError(
         "raise_if_error() should not be called within a traced context, such as"
@@ -242,17 +243,17 @@ def raise_if_error() -> None:
       _error_storage.ref.shape,
       np.uint32(_NO_ERROR),
       sharding=_error_storage.ref.sharding,
-  )  # clear the error code
+  )  # 清除错误码
 
   with _error_list_lock:
     if error_code < 0 or error_code >= len(_error_list):
-      # Handle invalid error codes gracefully with a standard error message.
-      # This can happen with corrupted AOT serialization data or negative
-      # error codes that could lead to incorrect indexing.
+      # 用标准错误信息优雅地处理无效错误码。
+      # 这可能由损坏的 AOT 序列化数据引起，也可能由会导致索引错误的
+      # 负错误码引起。
       msg, traceback = _INVALID_ERROR_CODE_MSG, _INVALID_ERROR_CODE_TRACEBACK
     else:
       msg, traceback = _error_list[error_code]
-  if isinstance(traceback, str):  # from imported AOT functions
+  if isinstance(traceback, str):  # 来自导入的 AOT 函数
     exc = JaxValueError(
         f"{msg}\nThe original traceback is shown below:\n{traceback}"
     )
@@ -264,19 +265,17 @@ def raise_if_error() -> None:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _ErrorClass:
-  """A class to store error information for AOT compilation.
+  """用于为 AOT 编译保存错误信息的类。
 
-  This class is used internally by the wrapper functions `wrap_for_export` and
-  `unwrap_from_import` to encapsulate error-related data within an exported
-  function.
+  该类由包装函数 `wrap_for_export` 与 `unwrap_from_import` 在内部使用，
+  以便把与错误相关的数据封装在导出的函数中。
 
   Attributes:
-    error_code (jax.Array): A JAX array representing the final error state of
-      the function to be exported. This value is local to the wrapper function.
-    error_list (list[tuple[str, str]]): A list of `(error_message, traceback)`
-      pairs containing error messages and corresponding stack traces. This error
-      list is local to the wrapper function, and does not contain pairs of error
-      information from other functions.
+    error_code (jax.Array): 一个 JAX 数组，表示待导出函数的最终错误状态。
+      该值局部于包装函数。
+    error_list (list[tuple[str, str]]): 一个 `(error_message, traceback)`
+      对的列表，包含错误信息及对应的栈回溯。该错误列表局部于包装函数，
+      不包含来自其他函数的错误信息对。
   """
 
   error_code: Array
@@ -297,43 +296,38 @@ _export.register_pytree_node_serialization(
 
 
 def _traceback_to_str(traceback: TracebackType) -> str:
-  """Convert a traceback to a string for export."""
+  """把回溯转换为字符串以便导出。"""
   return "".join(tb_lib.format_list(tb_lib.extract_tb(traceback))).rstrip("\n")
 
 
 def wrap_for_export(f):
-  """Wrap a function with error checking to make it compatible with AOT mode.
+  """用错误检查包装函数，使其兼容 AOT 模式。
 
-  Error checking relies on global state, which cannot be serialized across
-  processes. This wrapper ensures that the error state remains within the
-  function scope, making it possible to export the function and later import in
-  other processes.
+  错误检查依赖全局状态，而全局状态无法跨进程序列化。该包装器确保错误
+  状态保持在函数作用域内，从而可以导出函数并在之后于其他进程中导入。
 
-  When the function is later imported, it must be wrapped with
-  :func:`unwrap_from_import` to integrate the error checking mechanism of the
-  imported function into the global error checking mechanism of the current
-  process.
+  当该函数之后被导入时，必须用 :func:`unwrap_from_import` 包装，以便把
+  被导入函数的错误检查机制接入当前进程的全局错误检查机制。
 
-  This function should only be applied once to a function; wrapping the same
-  function multiple times is unnecessary.
+  该函数只应作用于一个函数一次；对同一函数多次包装是不必要的。
   """
 
   def inner(*args, **kwargs):
     global _error_list
 
-    # 1. Save the old state and initialize a new state.
+    # 1. 保存旧状态并初始化新状态。
     with core.eval_context():
       old_ref = _error_storage.ref
     _initialize_error_code_ref()
     with _error_list_lock:
       old_error_list, _error_list = _error_list, []
 
-      # 2. Trace the function.
+      # 2. 追踪该函数。
       out = f(*args, **kwargs)
       assert _error_storage.ref is not None
       error_code = _error_storage.ref[...].min()
 
-      # 3. Restore the old state.
+      # 3. 恢复旧状态。
       _error_list, new_error_list = old_error_list, _error_list
     with core.eval_context():
       _error_storage.ref = old_ref
@@ -347,15 +341,13 @@ def wrap_for_export(f):
 
 
 def unwrap_from_import(f):
-  """Unwrap a function after AOT import to restore error checking.
+  """在 AOT 导入后解开函数包装以恢复错误检查。
 
-  When an AOT-exported function is imported in a new process, its error state is
-  separate from the global error state of the current process. This wrapper
-  ensures that errors detected during execution are correctly integrated into
-  the global error checking mechanism of the current process.
+  当 AOT 导出的函数在新进程中被导入时，其错误状态与当前进程的全局错误
+  状态是分离的。该包装器确保执行期间检测到的错误被正确接入当前进程的
+  全局错误检查机制。
 
-  This function should only be applied to functions that were previously wrapped
-  with :func:`wrap_for_export` before export.
+  该函数只应作用于导出前曾用 :func:`wrap_for_export` 包装过的函数。
   """
   if _error_storage.ref is None:
     with core.eval_context():
@@ -366,12 +358,12 @@ def unwrap_from_import(f):
     out, error_class = f(*args, **kwargs)
     new_error_code, error_list = error_class.error_code, error_class.error_list
 
-    # Update the global error list.
+    # 更新全局错误列表。
     with _error_list_lock:
       offset = len(_error_list)
       _error_list.extend(error_list)
 
-    # Update the global error code array.
+    # 更新全局错误码数组。
     assert _error_storage.ref is not None
     error_code = _error_storage.ref[...]
     should_update = lax.bitwise_and(
@@ -380,7 +372,7 @@ def unwrap_from_import(f):
     )
     error_code = lax.select(should_update, new_error_code + offset, error_code)
 
-    # TODO(ayx): support vmap and shard_map.
+    # TODO(ayx): 支持 vmap 与 shard_map。
     _error_storage.ref[...] = error_code
 
     return out

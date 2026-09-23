@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：收集并展示本地环境与 JAX 安装信息，供提问或提交 issue 时一并附上。
+# `print_environment_info` 汇总 jax、jaxlib、numpy、python 的版本、设备与进程数量、
+# 平台信息，以及所有以 `JAX_`、`XLA_` 开头的环境变量；可用时还会附上 `nvidia-smi` 输出。
+# 它以 `jax.print_environment_info` 的名字对外导出，是用户报告问题时的标准诊断入口。
+
 from __future__ import annotations
 
 import os
@@ -32,16 +37,15 @@ def try_nvidia_smi() -> str | None:
 
 
 def print_environment_info(return_string: bool = False) -> str | None:
-  """Returns a string containing local environment & JAX installation information.
+  """返回一个包含本地环境与 JAX 安装信息的字符串。
 
-  This is useful information to include when asking a question or filing a bug.
+  在提问或提交 bug 时，附上这些信息很有用。
 
-  Args: return_string (bool) : if True, return the string rather than printing
-  to stdout.
+  Args: return_string (bool) : 若为 True，则返回该字符串而不打印到 stdout。
   """
   from jax import version
 
-  # TODO(jakevdp): should we include other info, e.g. jax.config.values?
+  # TODO(jakevdp): 是否应包含其他信息，例如 jax.config.values？
   python_version = sys.version.replace('\n', ' ')
   info = textwrap.dedent(f"""\
   jax:    {version.__version__}

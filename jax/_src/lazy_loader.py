@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A LazyLoader class."""
+# 文件职责：为 JAX 的包提供惰性加载子模块的通用工具。
+# `attach` 在包的 `__init__.py` 中被调用，用按需导入的 `__getattr__`、`__dir__`
+# 与 `__all__` 替换包中原有的同名定义，使子模块只在首次访问时才真正被导入。
+# 导入完成后会把结果写回模块的全局名字，后续访问不再走 `__getattr__`。
+# 使用方包括 `jax.scipy`、`jax._src.lib.mlir.dialects` 等希望加快导入速度的包。
+
+"""惰性加载器类。"""
 
 from collections.abc import Callable, Sequence
 import importlib
@@ -25,15 +31,15 @@ def attach(package_name: str, submodules: Sequence[str]) -> tuple[
     Callable[[], list[str]],
     list[str],
 ]:
-  """Lazily loads submodules of a package.
+  """惰性加载某个包的子模块。
 
   Returns:
-    A tuple of ``__getattr__``, ``__dir__`` function and ``__all__`` --
-    a list of available global names, which can be used to replace the
-    corresponding definitions in the package.
+    一个元组，包含 ``__getattr__``、``__dir__`` 函数和 ``__all__`` ——
+    ``__all__`` 是可用全局名字的列表，可用来替换包中
+    对应的定义。
 
   Raises:
-    RuntimeError: If the ``__name__`` of the caller cannot be determined.
+    RuntimeError: 若无法确定调用者的 ``__name__``。
   """
   owner_name = sys._getframe(1).f_globals.get("__name__")
   if owner_name is None:
@@ -44,8 +50,8 @@ def attach(package_name: str, submodules: Sequence[str]) -> tuple[
   def __getattr__(name: str) -> Any:
     if name in submodules:
       value = importlib.import_module(f"{package_name}.{name}")
-      # Update module-level globals to avoid calling ``__getattr__`` again
-      # for this ``name``.
+      # 更新模块级全局名字，避免为这个 ``name``
+      # 再次调用 ``__getattr__``。
       assert owner_name is not None  # pyrefly#40
       setattr(sys.modules[owner_name], name, value)
       return value

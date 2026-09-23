@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 JAX 的多主机分布式运行时入口（`jax.distributed.initialize` 等）。
+# 它在用户执行任何 JAX 计算之前启动分布式运行时：进程 0 上创建协调器服务，
+# 各进程分别创建运行时客户端并连接协调器，从而让进程互相发现、共享拓扑并做健康检查。
+# 模块用全局单例 `global_state`（`State`）保存服务、客户端、进程号、分区索引等状态，
+# 并负责可见设备环境变量、代理环境变量告警以及抢占同步管理器的初始化与关闭。
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -112,8 +118,8 @@ class State:
 
     self.coordinator_address = coordinator_address
 
-    # The default value of [::]:port tells the coordinator to bind to all
-    # available addresses on the same port as coordinator_address.
+    # [::]:port 这个默认值告诉协调器在与 coordinator_address 相同的端口上
+    # 绑定所有可用地址。
     default_coordinator_bind_address = '[::]:' + coordinator_address.rsplit(':', 1)[1]
     coordinator_bind_address = (coordinator_bind_address or
                                 os.environ.get('JAX_COORDINATOR_BIND_ADDRESS',
@@ -180,7 +186,7 @@ class State:
       if jax_partition_index is not None:
         partition_index = int(jax_partition_index)
       elif jax_slice_index is not None:
-        # Deprecation added 2025-08-05. Should be removed after 3 months.
+        # 弃用于 2025-08-05 添加。应在 3 个月后移除。
         warnings.warn(
             'JAX_SLICE_INDEX has been deprecated. Please use'
             ' JAX_PARTITION_INDEX instead.',
@@ -191,8 +197,8 @@ class State:
 
   def shutdown(self):
     if self.preemption_sync_manager:
-      # It's important to shut down the preemption sync manager before the
-      # client because the preemption sync manager depends on the client.
+      # 必须在客户端之前关闭抢占同步管理器，
+      # 因为抢占同步管理器依赖客户端。
       self.preemption_sync_manager.shutdown()
       self.preemption_sync_manager = None
     if self.client:
@@ -230,90 +236,90 @@ def initialize(coordinator_address: str | None = None,
                coordinator_bind_address: str | None = None,
                slice_index: int | None = None,
                partition_index: int | None = None):
-  """Initializes the JAX distributed system.
+  """初始化 JAX 分布式系统。
 
-  Calling :func:`~jax.distributed.initialize` prepares JAX for execution on
-  multi-host GPU and Cloud TPU. :func:`~jax.distributed.initialize` must be
-  called before performing any JAX computations.
+  调用 :func:`~jax.distributed.initialize` 会让 JAX 做好在多主机 GPU 和
+  Cloud TPU 上执行的准备。必须在执行任何 JAX 计算之前调用
+  :func:`~jax.distributed.initialize`。
 
-  The JAX distributed system serves a number of roles:
+  JAX 分布式系统承担多项职责：
 
-    * It allows JAX processes to discover each other and share topology information,
-    * It performs health checking, ensuring that all processes shut down if any process dies, and
-    * It is used for distributed checkpointing.
+    * 让各个 JAX 进程能够相互发现并共享拓扑信息，
+    * 执行健康检查，确保任一进程死亡时所有进程都会关闭，以及
+    * 用于分布式检查点。
 
-  If you are using TPU, Slurm, or Open MPI, all arguments are optional: if omitted, they
-  will be chosen automatically.
+  如果你使用 TPU、Slurm 或 Open MPI，所有参数都是可选的：省略时会
+  自动选取。
 
-  The ``cluster_detection_method`` may be used to choose a specific method for detecting those
-  distributed arguments. You may pass any of the automatic ``spec_detect_methods`` to this
-  argument though it is not necessary in the TPU, Slurm, or Open MPI cases.  For other MPI
-  installations, if you have a functional ``mpi4py`` installed, you may pass
-  ``cluster_detection_method="mpi4py"`` to bootstrap the required arguments.
+  可以用 ``cluster_detection_method`` 指定检测这些分布式参数的具体方法。
+  你可以把任意一种自动检测的 ``spec_detect_methods`` 传给这个参数，
+  不过在 TPU、Slurm 或 Open MPI 场景下没有必要。对于其他 MPI
+  安装，如果你的 ``mpi4py`` 可以正常工作，可以传入
+  ``cluster_detection_method="mpi4py"`` 来引导出所需参数。
 
-  Otherwise, you must provide the ``coordinator_address``,
-  ``num_processes``, ``process_id``, and ``local_device_ids`` arguments
-  to :func:`~jax.distributed.initialize`. When all four arguments are provided, cluster
-  environment auto detection will be skipped.
+  否则，你必须向 :func:`~jax.distributed.initialize` 提供
+  ``coordinator_address``、``num_processes``、``process_id`` 和
+  ``local_device_ids`` 参数。当这四个参数全部提供时，将跳过集群
+  环境自动检测。
 
-  Please note: on some systems, particularly HPC clusters that only access external networks
-  through proxy variables such as HTTP_PROXY, HTTPS_PROXY, etc., the call to
-  :func:`~jax.distributed.initialize` may timeout.  You may need to unset these variables
-  prior to application launch.
+  请注意：在某些系统上，尤其是只能通过 HTTP_PROXY、HTTPS_PROXY 等
+  代理变量访问外部网络的 HPC 集群，对
+  :func:`~jax.distributed.initialize` 的调用可能会超时。你可能需要在启动
+  应用之前取消设置这些变量。
 
   Args:
-    coordinator_address: the IP address of process `0` and a port on which that
-      process should launch a coordinator service. The choice of
-      port does not matter, so long as the port is available on the coordinator
-      and all processes agree on the port.
-      May be ``None`` only on supported environments, in which case it will be chosen automatically.
-      Note that special addresses like ``localhost`` or ``127.0.0.1`` usually mean that the program
-      will bind to a local interface and are not suitable when running in a multi-host environment.
-    num_processes: Number of processes. May be ``None`` only on supported environments, in
-      which case it will be chosen automatically.
-    process_id: The ID number of the current process. The ``process_id`` values across
-      the cluster must be a dense range ``0``, ``1``, ..., ``num_processes - 1``.
-      May be ``None`` only on supported environments; if ``None`` it will be chosen automatically.
-    local_device_ids: Restricts the visible devices of the current process to ``local_device_ids``.
-      If ``None``, defaults to all local devices being visible to the process except when processes
-      are launched via Slurm and Open MPI on GPUs. In that case, it will default to a single device per process.
-    cluster_detection_method: An optional string to attempt to autodetect the configuration of the distributed
-      run.  Note that "mpi4py" method requires you to have a working ``mpi4py`` install in your environment,
-      and launch the applicatoin with an MPI-compatible job launcher such as ``mpiexec`` or ``mpirun``.
-      Legacy auto-detect options "ompi" (OMPI) and "slurm" (Slurm) remain enabled. "deactivate" bypasses
-      automatic cluster detection.
-    initialization_timeout: Time period (in seconds) for which connection will
-      be retried. If the initialization takes more than the timeout specified,
-      the initialization will error. Defaults to 300 secs i.e. 5 mins.
-    heartbeat_timeout_seconds: The time (in seconds) after which a process is
-      considered dead if it hasn't successfully sent any heartbeats. Defaults
-      to 100 seconds.
-    shutdown_timeout_seconds: The time (in seconds) a terminating process will
-      wait for all other processes to also terminate. Defaults to 300 seconds.
-    coordinator_bind_address: the address and port to which the coordinator service
-      on process `0` should bind. If this is not specified, the default is to bind to
-      all available addresses on the same port as ``coordinator_address``. On systems
-      that have multiple network interfaces per node it may be insufficient to only
-      have the coordinator service listen on one address/interface.
-    slice_index: DEPRECATED: Use ``partition_index`` instead.
-    partition_index: The partition index assigned to this process' local devices. If any process sets ``partition_index``,
-      then all processes must do so. If ``None`` the partition indices will be chosen automatically.
+    coordinator_address: 进程 `0` 的 IP 地址，以及该进程用于
+      启动协调器服务的端口。端口选择
+      无关紧要，只要该端口在协调器上可用，
+      且所有进程对该端口达成一致即可。
+      仅在受支持的环境中可以为 ``None``，此时会自动选取。
+      注意，像 ``localhost`` 或 ``127.0.0.1`` 这类特殊地址通常意味着程序
+      会绑定到本地接口，不适合在多主机环境中运行。
+    num_processes: 进程数量。仅在受支持的环境中可以为 ``None``，
+      此时会自动选取。
+    process_id: 当前进程的 ID 编号。整个集群中的 ``process_id`` 取值
+      必须是稠密区间 ``0``、``1``、…、``num_processes - 1``。
+      仅在受支持的环境中可以为 ``None``；若为 ``None`` 则自动选取。
+    local_device_ids: 把当前进程可见的设备限制为 ``local_device_ids``。
+      若为 ``None``，默认当前进程可见所有本地设备；但当进程是通过 Slurm 和 Open MPI
+      在 GPU 上启动时例外，此时默认为每个进程一个设备。
+    cluster_detection_method: 可选字符串，用于尝试自动检测分布式运行的
+      配置。注意 "mpi4py" 方式要求环境中已安装可用的 ``mpi4py``，
+      并且要用 ``mpiexec`` 或 ``mpirun`` 这类兼容 MPI 的作业启动器来启动应用。
+      旧版自动检测选项 "ompi"（OMPI）和 "slurm"（Slurm）仍然可用。"deactivate" 会绕过
+      自动集群检测。
+    initialization_timeout: 连接将被重试的时间长度（秒）。
+      如果初始化耗时超过指定的超时时间，
+      初始化将报错。默认 300 秒，即 5 分钟。
+    heartbeat_timeout_seconds: 若某进程在此时间（秒）内未成功
+      发送任何心跳，则被视为已死亡。
+      默认 100 秒。
+    shutdown_timeout_seconds: 正在终止的进程等待其他所有进程也终止的
+      时间（秒）。默认 300 秒。
+    coordinator_bind_address: 进程 `0` 上的协调器服务应绑定的地址和端口。
+      若未指定，默认绑定到与 ``coordinator_address`` 相同端口上的
+      所有可用地址。在每节点有多个网络接口的系统上，
+      只让协调器服务监听一个地址/接口
+      可能不够。
+    slice_index: 已弃用：请改用 ``partition_index``。
+    partition_index: 分配给本进程本地设备的分区索引。如果有任何进程设置了 ``partition_index``，
+      那么所有进程都必须设置。若为 ``None``，分区索引将自动选取。
 
   Raises:
-    RuntimeError: If :func:`~jax.distributed.initialize` is called more than once
-      or if called after the backend is already initialized.
+    RuntimeError: 如果 :func:`~jax.distributed.initialize` 被调用多次，
+      或者在后端已经初始化之后才被调用。
 
   Examples:
 
-  Suppose there are two GPU processes, and process 0 is the designated coordinator
-  with address ``10.0.0.1:1234``. To initialize the GPU cluster, run the
-  following commands before anything else.
+  假设有两个 GPU 进程，进程 0 是指定的协调器，
+  地址为 ``10.0.0.1:1234``。要初始化 GPU 集群，请在其他任何操作
+  之前先运行以下命令。
 
-  On process 0:
+  在进程 0 上：
 
   >>> jax.distributed.initialize(coordinator_address='10.0.0.1:1234', num_processes=2, process_id=0)  # doctest: +SKIP
 
-  On process 1:
+  在进程 1 上：
 
   >>> jax.distributed.initialize(coordinator_address='10.0.0.1:1234', num_processes=2, process_id=1)  # doctest: +SKIP
   """
@@ -323,7 +329,7 @@ def initialize(coordinator_address: str | None = None,
                         "This includes any computation, but also calls to jax.devices, jax.device_put, and others.")
   if partition_index is None:
     if slice_index is not None:
-      # Deprecation added 2025-08-05. Should be removed after 3 months.
+      # 弃用于 2025-08-05 添加。应在 3 个月后移除。
       warnings.warn(
           '`slice_index` has been deprecated. Please use `partition_index` instead.',
           DeprecationWarning,
@@ -338,12 +344,12 @@ def initialize(coordinator_address: str | None = None,
 
 
 def is_initialized() -> bool:
-  """Check if the JAX distributed system is initialized."""
+  """检查 JAX 分布式系统是否已初始化。"""
   return global_state.client is not None
 
 def shutdown():
-  """Shuts down the distributed system.
+  """关闭分布式系统。
 
-  Does nothing if the distributed system is not running.
+  如果分布式系统未在运行，则不做任何事。
   """
   global_state.shutdown()

@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现实验性的 `jax.experimental.buffer_callback`，注册一种直接在设备
+# 缓冲区上原地写入输出的宿主回调。
+# `buffer_callback` 把用户 Python 函数接入 JAX 的原语系统：本文件登记了它的
+# 效果化抽象求值、JVP/转置规则、批处理规则与 MLIR 降级规则；降级时借助 XLA 的
+# 宿主回调机制调用该函数，使 numpy、PyTorch、Cupy 等库可以直接读写设备内存。
+
 from collections.abc import Callable, Sequence
 import functools
 from typing import Any
@@ -44,16 +50,16 @@ def buffer_callback(
     input_output_aliases: dict[int, int] | None = None,
     command_buffer_compatible: bool = False,
 ):
-  """An experimental callback that operates in place on device buffers.
+  """一种在设备缓冲区上原地操作的实验性回调。
 
-  Only supported on CPU and GPU backends.
+  仅在 CPU 和 GPU 后端上受支持。
 
-  Note that the plan is for this to eventually be replaced by a consolidated
-  callback API built using JAX mutable arrays, but for now this provides a
-  mechanism for prototyping computational kernels using other Python libraries
-  including Numpy, PyTorch, Cupy, and others.
+  注意，计划是最终由基于 JAX 可变数组构建的统一回调 API 来取代它，
+  但就目前而言，它提供了一种机制，用于借助其他 Python 库来
+  原型验证计算内核，这些库包括 Numpy、PyTorch、
+  Cupy 以及其它类似的库。
 
-  Let's start with a simple example:
+  让我们从一个简单的例子开始：
 
     >>> def py_add_one_inplace(ctx, out, x):
     ...   np.asarray(out)[...] = np.asarray(x) + 1
@@ -64,68 +70,68 @@ def buffer_callback(
     >>> add_one(x)  # doctest: +SKIP
     Array(42, dtype=int32)
 
-  In this example, we're executing a numpy computation via JAX, and this could
-  have been implemented using :func:`jax.pure_callback`, but in this case, the
-  output is being populated in-place. This means that JAX doesn't need to copy
-  the output arrays upon returning from the callback. Note that even though the
-  callback function operates on mutable buffers, JAX still sees this as an
-  operation that consumes and produces regular immutable JAX arrays.
+  在这个例子中，我们通过 JAX 执行一个 numpy 计算，
+  它本来也可以使用 :func:`jax.pure_callback` 来实现，
+  但在这里，输出是由回调函数原地填充的，这意味着
+  JAX 在从回调返回时无需再复制输出数组。注意，即使
+  回调函数操作的是可变缓冲区，JAX 仍然把它视为一个
+  消费并产生普通不可变 JAX 数组的操作。
 
-  Unlike the other JAX callback APIs, ``buffer_callback`` requires that the
-  user-defined Python function have the following signature:
+  与其它 JAX 回调 API 不同，``buffer_callback`` 要求用户定义的
+  Python 函数具有如下签名：
 
   .. code-block:: python
 
     def callback(ctx: ExecutionContext, out, *args) -> None:
       ...
 
-  where ``ctx`` is an instance of
-  :class:`~jax.experimental.buffer_callback.ExecutionContext`, which mainly
-  provides access to XLA's computation stream when running on GPU, ``out`` is a
-  pytree of mutable :class:`~jax.experimental.buffer_callback.Buffer` objects,
-  and the ``args`` arguments have the same pytree structure as the inputs, but
-  each leaf is :class:`~jax.experimental.buffer_callback.Buffer`. This callback
-  should not return any values, and it should overwrite the ``out`` buffers in
-  place to output values back to JAX.
+  其中 ``ctx`` 是
+  :class:`~jax.experimental.buffer_callback.ExecutionContext` 的实例，
+  它主要在 GPU 上运行时提供对 XLA 计算流的访问；``out`` 是可变的
+  :class:`~jax.experimental.buffer_callback.Buffer` 对象组成的 pytree，
+  而 ``args`` 参数与输入具有相同的 pytree 结构，但每个叶子都是
+  :class:`~jax.experimental.buffer_callback.Buffer`。该回调不应返回
+  任何值，而是应当原地覆写 ``out`` 缓冲区，
+  从而把值输出回 JAX。
 
-  It's important to note that this Python function can't really be called
-  except via ```buffer_callback`` itself, because it's not (yet!) possible to
-  construct mutable JAX buffers directly in Python.
+  需要特别注意的是，这个 Python 函数实际上无法在别处调用，只能经由
+  ``buffer_callback`` 本身调用，因为目前（还！）无法在 Python 中
+  直接构造可变的 JAX 缓冲区。
 
-  The bespoke :class:`~jax.experimental.buffer_callback.Buffer` type is an
-  array-like object that supports the ``__array__`` protocol on CPU, the
-  ``__cuda_array_interface__`` protocol on GPU, and the ``__dlpack__`` protocol
-  on both CPU and GPU.
+  专门设计的 :class:`~jax.experimental.buffer_callback.Buffer` 类型是一种
+  类数组对象，它在 CPU 上支持 ``__array__`` 协议，在 GPU 上支持
+  ``__cuda_array_interface__`` 协议，并且在 CPU 和 GPU 上都支持
+  ``__dlpack__`` 协议。
 
   Args:
-    callback: A Python function with the signature and behavior described above.
-    result_shape_dtypes: A pytree whose leaves have ``shape`` and ``dtype``
-      attributes, with a structure that matches the expected output of the
-      callback function at runtime. :class:`jax.ShapeDtypeStruct` is often used
-      to define leaf values.
-    has_side_effect: Whether the callback has side effects.
-    vmap_method: A string specifying how the callback transforms under
-      :func:`~jax.vmap` as described in the docs for :func:`~jax.pure_callback`.
-    input_output_aliases: a dictionary mapping the index of some inputs to
-      the index of the output that aliases them. These indices are in the
-      flattened inputs and outputs.
-    command_buffer_compatible: if ``True``, the callback will be traced into
-      the command buffer. This means that the Python code should only be
-      executed once, and then the operations will be replayed for every
-      subsequent call.
+    callback: 具有上述签名与行为的 Python 函数。
+    result_shape_dtypes: 一个 pytree，其叶子带有 ``shape`` 和
+      ``dtype`` 属性，并且其结构与回调函数在运行时的预期输出
+      相匹配。:class:`jax.ShapeDtypeStruct` 常被用来定义其中的
+      叶子值。
+    has_side_effect: 回调是否具有副作用。
+    vmap_method: 一个字符串，用于指定回调在
+      :func:`~jax.vmap` 下如何变换，详见 :func:`jax.pure_callback` 的文档。
+    input_output_aliases: 一个字典，把某些输入的索引映射到与它们
+      形成别名的输出的索引。这些索引是相对于展平后的输入和
+      输出而言的。
+    command_buffer_compatible: 若为 ``True``，回调会被追踪进
+      命令缓冲区。这意味着其中的 Python 代码应当只被
+      执行一次，随后每次调用都会重放这些操作。
 
   Returns:
-    A new callable that accepts :class:`jax.Array` inputs (and pytrees thereof),
-    and  pytree of :class:`jax.Array` objects whose structure matches that
-    of ``result_shape_dtypes``.
+    一个新的可调用对象，它接受 :class:`jax.Array` 输入
+    （以及由它们构成的 pytree），并返回由
+    :class:`jax.Array` 对象构成的 pytree，其结构与
+    ``result_shape_dtypes`` 相匹配。
 
   See Also:
-    - :func:`jax.pure_callback`: callback designed for pure host functions.
-    - :func:`jax.experimental.io_callback`: callback designed for impure host
-      functions.
-    - :func:`jax.debug.callback`: callback designed for general-purpose
-      debugging.
-    - :func:`jax.debug.print`: callback designed for printing.
+    - :func:`jax.pure_callback`：为纯主机函数设计的回调。
+    - :func:`jax.experimental.io_callback`：为非纯主机函数
+      设计的回调。
+    - :func:`jax.debug.callback`：为通用调试设计的
+      回调。
+    - :func:`jax.debug.print`：为打印设计的回调。
   """
   flat_shape_dtypes, out_tree = tree_util.tree_flatten(result_shape_dtypes)
   flat_result_avals = tuple(

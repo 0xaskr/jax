@@ -11,6 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# 文件职责：实现 `jax.shard_map` / `jax.smap`，即按设备网格（`Mesh`）的数据分片
+# 手工映射函数的高阶 API。它让用户以 SPMD 风格编写单设备视角的代码，并显式写出
+# 跨分片的集合通信（如 `psum`、`all_gather`），而不依赖 GSPMD 自动分片。
+# 关键概念：`in_specs`/`out_specs` 描述参数的进出分片方式，`axis_names` 决定哪
+# 些网格轴为手动（manual）轴；本模块还负责 `shard_map_p` 原语的暂存、类型检查、
+# 降级（含 Shardy 路径）、即时求值以及 jvp/转置/DCE 等高阶变换规则。
 from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Sequence, Set
@@ -105,59 +112,47 @@ def shard_map(f: None = None, /, *, out_specs: Specs,
               ) -> Callable[[G], G]:
   ...
 
-# See https://github.com/jax-ml/jax/pull/30753 to understand why `in_specs`
-# defaults to `Infer`.
+# 关于 `in_specs` 为何默认取 `Infer`，参见
+# https://github.com/jax-ml/jax/pull/30753。
 def shard_map(f: F | None = None, /, *, out_specs: Specs,
               in_specs: Specs | None | InferFromArgs = Infer,
               mesh: Mesh | AbstractMesh | None = None,
               axis_names: Set[AxisName] = frozenset(), check_vma: bool = True
               ) -> F | Callable[[G], G]:
-  """Map a function over shards of data using a mesh of devices.
+  """使用设备网格把函数映射到数据各分片之上。
 
-  See the docs at https://docs.jax.dev/en/latest/notebooks/shard_map.html.
+  参见 https://docs.jax.dev/en/latest/notebooks/shard_map.html 上的文档。
 
   Args:
-    f: callable to be mapped. Each application of ``f``, or "instance" of ``f``,
-      takes as input a shard of the mapped-over arguments and produces a shard
-      of the output.
-    mesh: (optional, default None) a ``jax.sharding.Mesh`` representing the
-      array of devices over which to shard the data and on which to execute
-      instances of ``f``. The names of the ``Mesh`` can be used in collective
-      communication operations in ``f``. If mesh is None, it will be inferred
-      from the context which can be set via `jax.set_mesh` context
-      manager.
-    in_specs: (optional, default `Infer`) a pytree with
-      ``jax.sharding.PartitionSpec`` instances as leaves, with a tree structure
-      that is a tree prefix of the args tuple to be mapped over. Similar to
-      ``jax.sharding.NamedSharding``, each ``PartitionSpec`` represents how the
-      corresponding argument (or subtree of arguments) should be sharded along
-      the named axes of ``mesh``. In each ``PartitionSpec``, mentioning a
-      ``mesh`` axis name at a position expresses sharding the corresponding
-      argument array axis along that positional axis; not mentioning an axis
-      name expresses replication.
-      If ``Infer``, all mesh axes must be of type
-      `Explicit`, in which case the in_specs are inferred from the argument types.
-      If ``None``, inputs will be treated as static.
-    out_specs: a pytree with ``PartitionSpec`` instances as leaves, with a tree
-      structure that is a tree prefix of the output of ``f``. Each
-      ``PartitionSpec`` represents how the corresponding output shards should be
-      concatenated. In each ``PartitionSpec``, mentioning a ``mesh`` axis name
-      at a position expresses concatenation of that mesh axis's shards along the
-      corresponding positional axis; not mentioning a ``mesh`` axis name
-      expresses a promise that the output values are equal along that mesh axis,
-      and that rather than concatenating only a single value should be produced.
-    axis_names: (optional, default set()) set of axis names from ``mesh`` over
-      which the function ``f`` is manual. If empty, ``f``, is manual
-      over all mesh axes.
-    check_vma: (optional) boolean (default True) representing whether to enable
-      additional validity checks and automatic differentiation optimizations.
-      The validity checks concern whether any mesh axis names not mentioned in
-      ``out_specs`` are consistent with how the outputs of ``f`` are replicated.
+    f: 要被映射的可调用对象。``f`` 的每次应用（即 ``f`` 的每个“实例”）以被映射
+      参数的一个分片为输入，并产生输出的一个分片。
+    mesh: （可选，默认为 None）一个 ``jax.sharding.Mesh``，表示用于分片数据、
+      并用于执行 ``f`` 各实例的设备数组。``Mesh`` 中的名字可在 ``f`` 内的集合
+      通信操作中使用。若 mesh 为 None，则将从上下文中推断，该上下文可通过
+      `jax.set_mesh` 上下文管理器设置。
+    in_specs: （可选，默认为 `Infer`）一个以 ``jax.sharding.PartitionSpec``
+      实例为叶子的 pytree，其树结构是被映射参数元组的树前缀。与
+      ``jax.sharding.NamedSharding`` 类似，每个 ``PartitionSpec`` 表示对应参数
+      （或参数的子树）应当如何沿 ``mesh`` 的具名轴分片。在每个
+      ``PartitionSpec`` 中，某个位置提到 ``mesh`` 轴名，表示把对应参数数组的
+      那个位置轴沿该轴分片；不提某个轴名则表示复制。
+      若取 ``Infer``，则所有网格轴都必须是 `Explicit` 类型，此时 in_specs 由
+      参数的类型推断得到。
+      若取 ``None``，则输入将被视为静态的。
+    out_specs: 一个以 ``PartitionSpec`` 实例为叶子的 pytree，其树结构是 ``f``
+      的输出的树前缀。每个 ``PartitionSpec`` 表示对应的输出分片应当如何拼接。
+      在每个 ``PartitionSpec`` 中，某个位置提到 ``mesh`` 轴名，表示把该网格轴
+      的各个分片沿对应的位置轴拼接起来；不提某个 ``mesh`` 轴名则表示承诺输出值
+      沿该网格轴相等，因而只应产生单个值而不进行拼接。
+    axis_names: （可选，默认为 set()）来自 ``mesh`` 的轴名集合，函数 ``f`` 在
+      这些轴上是手动的。若为空，则 ``f`` 在所有网格轴上都是手动的。
+    check_vma: （可选）布尔值（默认为 True），表示是否启用额外的有效性检查和
+      自动微分优化。有效性检查关注 ``out_specs`` 中未提到的网格轴名是否与 ``f``
+      的输出的复制方式一致。
 
   Returns:
-    A callable representing a mapped version of ``f``, which accepts positional
-    arguments corresponding to those of ``f`` and produces output corresponding
-    to that of ``f``.
+    一个可调用对象，表示 ``f`` 的映射版本，它接受与 ``f`` 对应的位置参数，并
+    产生与 ``f`` 对应的输出。
   """
   kwargs = dict(mesh=mesh, in_specs=in_specs, out_specs=out_specs,
                 axis_names=axis_names, check_vma=check_vma)
@@ -183,30 +178,24 @@ def smap(f: F | None = None, /, *,
          in_axes: int | None | InferFromArgs | tuple[Any, ...] = Infer,
          out_axes: Any, axis_name: AxisName
          ) -> F | Callable[[G], G]:
-  """Single axis shard_map that maps a function `f` one axis at a time.
+  """单轴的 shard_map，一次沿一个轴映射函数 `f`。
 
   Args:
-    f: Callable to be mapped. Each application of ``f``, or "instance" of ``f``,
-      takes as input a shard of the mapped-over arguments and produces a shard
-      of the output.
-    in_axes: (optional) An integer, None, or sequence of values specifying which
-      input array axes to map over. If not specified, `smap` will try to infer
-      the axes from the arguments only under `Explicit` mode.
-      An integer or ``None`` indicates which array axis to map over for all
-      arguments (with ``None`` indicating not to map any axis), and a tuple
-      indicates which axis to map for each corresponding positional argument.
-      Axis integers must be in the range ``[-ndim, ndim)`` for each array,
-      where ``ndim`` is the number of dimensions (axes) of the corresponding
-      input array.
-    out_axes: An integer, None, or (nested) standard Python container
-      (tuple/list/dict) thereof indicating where the mapped axis should appear
-      in the output.
-    axis_name: ``mesh`` axis name over which the function ``f`` is manual.
+    f: 要被映射的可调用对象。``f`` 的每次应用（即 ``f`` 的每个“实例”）以被映射
+      参数的一个分片为输入，并产生输出的一个分片。
+    in_axes: （可选）一个整数、None，或一组值，指定要映射哪些输入数组轴。若未
+      指定，`smap` 只会在 `Explicit` 模式下尝试从参数推断轴。
+      一个整数或 ``None`` 表示为所有参数映射哪个数组轴（``None`` 表示不映射任何
+      轴），而元组表示为每个对应的位置参数映射哪个轴。
+      轴整数必须落在每个数组的 ``[-ndim, ndim)`` 范围内，其中 ``ndim`` 是
+      对应输入数组的维度（轴）数。
+    out_axes: 一个整数、None，或（嵌套的）标准 Python 容器（tuple/list/dict），
+      表示被映射的轴应当出现在输出中的位置。
+    axis_name: 函数 ``f`` 在其上为手动的 ``mesh`` 轴名。
 
   Returns:
-    A callable representing a mapped version of ``f``, which accepts positional
-    arguments corresponding to those of ``f`` and produces output corresponding
-    to that of ``f``.
+    一个可调用对象，表示 ``f`` 的映射版本，它接受与 ``f`` 对应的位置参数，并
+    产生与 ``f`` 对应的输出。
   """
   kwargs = dict(in_axes=in_axes, out_axes=out_axes, axis_name=axis_name)
   if f is None:
@@ -282,7 +271,7 @@ def _shard_map(f: F, *, mesh: Mesh | AbstractMesh | None,
     _check_specs_vs_args(f, mesh, in_tree, in_specs, dyn_argnums,
                          in_specs_flat, dyn_args)
 
-    # TODO(yashkatariya): Add support for partial manual
+    # TODO(yashkatariya): 增加对部分手动（partial manual）的支持
     mesh_axis_names_wo_vmap = (
         frozenset(mesh.axis_names) - core.get_axis_env().explicit_mesh_axis_names)
     if (mesh_axis_names_wo_vmap == axis_names and
@@ -434,7 +423,7 @@ def _manual_spec(manual_axes, spec: P, mesh) -> P:
   return spec.update(partitions=tuple(out))
 
 
-# Error checking and messages
+# 错误检查与错误消息
 
 SpecErrorType = enum.Enum('SpecErrorType', ['input', 'out'])
 
@@ -445,7 +434,7 @@ def _check_unreduced(error_type, mesh, manual_axes, specs):
   specs_flat, _ = tree_flatten(specs)
   for s in specs_flat:
     if isinstance(s, HiPspec):
-      continue  # TODO(mattjj,yashkatariya): add user validation method
+      continue  # TODO(mattjj,yashkatariya): 添加用户校验方法
     if not s.unreduced and not s.reduced:
       continue
     if not full_manual:
@@ -477,7 +466,7 @@ def _check_specs(error_type: SpecErrorType, specs: Any, manual_axes) -> None:
 
   def check_spec(p):
     if isinstance(p, HiPspec):
-      return True  # TODO(mattjj,yashkatariya): add user validation method
+      return True  # TODO(mattjj,yashkatariya): 添加用户校验方法
     if not isinstance(p, PartitionSpec):
       return False
     for names in p.partitions:
@@ -578,7 +567,7 @@ def _spec_rank_error(
         f"{base}{keystr(fail_key)}{extra} has shape {aval.str_short()}, "
         f"which has rank {aval.ndim} (and {aval.ndim} < {len(spec)})")
   assert msgs
-  if len(msgs) == 1: msgs = [msgs[0][2:]]  # remove the bullet point
+  if len(msgs) == 1: msgs = [msgs[0][2:]]  # 去掉项目符号
   msg = (f"shard_map applied to the function '{fun_name}' was given an "
          f"{prefix}_specs entry which is too long to be compatible with the "
          f"corresponding {prefix}put value from the function:\n\n"
@@ -628,7 +617,7 @@ def _spec_divisibility_error(
             f"{axis} (of {total}size {sz}), but {sz} does not evenly divide "
             f"{aval.shape[d]}")
   assert msgs
-  if len(msgs) == 1: msgs = [msgs[0][2:]]  # remove the bullet point
+  if len(msgs) == 1: msgs = [msgs[0][2:]]  # 去掉项目符号
   msg = (f"shard_map applied to the function '{fun_name}' was given argument "
          f"arrays with axis sizes that are not evenly divisible by the "
          f"corresponding mesh axis sizes:\n\n"
@@ -666,7 +655,7 @@ def _inout_vma_error(f: Callable, mesh: Mesh | AbstractMesh, tree: PyTreeDef,
           f"corresponding output value is replicated across mesh axis "
           f"'{need_rep_}', but could not infer replication over any axes")
   assert msgs
-  if len(msgs) == 1: msgs = [msgs[0][2:]]  # remove the bullet point
+  if len(msgs) == 1: msgs = [msgs[0][2:]]  # 去掉项目符号
   msg = (f"shard_map applied to the function '{fun_name}' was given "
          f"out_specs which require replication which can't be statically "
          f"inferred given the mesh:\n\n"
@@ -701,12 +690,11 @@ def _iter_paths(tree: PyTreeDef, specs: Specs, fails: list[T | NoFail]
   return [(s, (fail_key, fail_data)) for s, (fail_key, fail_data)
           in zip(specs_aug, failures_aug)
           if s is not None and fail_data is not no_fail]
-
 class Tup:
   def __init__(self, vals): self.vals = vals
   def __iter__(self): return iter(self.vals)
 
-# Primitive
+# 原语
 
 JaxType = Any
 MaybeTracer = JaxType | Tracer
@@ -717,10 +705,10 @@ class ShardMapPrimitive(core.Primitive):
 
   def bind_with_trace(self, trace, args, avals, params, /):
     fun, = params.pop('subfuns')
-    # fun returns a FlatTree containing a tuple of the user-level data and a flat,
-    # broadcasted out_specs wrapped in `Static`.
-    # The result of `bind_with_trace` is a `FlatTree` of tracer-like things and
-    # doesn't include the `Static` out_specs.
+    # fun 返回一个 FlatTree，其中含用户级数据构成的元组，以及一个被 `Static`
+    # 包裹的、已广播的 out_specs。
+    # `bind_with_trace` 的结果是追踪器之类对象组成的 `FlatTree`，
+    # 其中不包含 `Static` 的 out_specs。
     return trace.process_shard_map(shard_map_p, fun, args, **params)
 
   def get_bind_params(self, params):
@@ -737,7 +725,7 @@ class ShardMapPrimitive(core.Primitive):
 
 shard_map_p = ShardMapPrimitive('shard_map')
 
-# Lojax lowering
+# Lojax 降级
 
 shard_map_p.is_high = lambda *_, jaxpr, **__: jaxpr.is_high
 
@@ -775,7 +763,7 @@ def _shard_map_to_lojax(*hi_args, jaxpr, in_specs, out_specs, **params):
   return [a.raise_val2(y) for a, y in zip(hi_out_avals, lo_outs.unpack())]
 shard_map_p.to_lojax = _shard_map_to_lojax
 
-# Staging
+# 暂存
 
 @util.cache(max_size=256, trace_context_in_key=False)
 def _as_manual_mesh(mesh, manual_axes: frozenset) -> AbstractMesh:
@@ -839,7 +827,7 @@ def _shard_map_staging(
   return out_avals_ft.update(out)
 pe.DynamicJaxprTrace.process_shard_map = _shard_map_staging
 
-# TODO add underscore version, for direct-linearize to consume
+# TODO 增加下划线版本，供 direct-linearize 使用
 
 def _spec_to_names(spec: PartitionSpec):
   return {i: names if isinstance(names, tuple) else (names,)
@@ -924,17 +912,17 @@ def _unshard_shaped_array(mesh: Mesh, check_vma, spec, aval: core.ShapedArray
   new_sharding = NamedSharding(new_mesh, out_spec)
   manual_axes = set(new_mesh.manual_axes)
   vma = frozenset(v for v in aval.mat.varying if v in manual_axes)
-  # TODO(yashkatariya): Handle partial manual unreduced/reduced.
+  # TODO(yashkatariya): 处理部分手动的 unreduced/reduced。
   out_mat = core.ManualAxisType(varying=vma)
   return aval.update(shape=new_shape, sharding=new_sharding,
                      manual_axis_type=out_mat)
 core.unshard_aval_handlers[core.ShapedArray] = _unshard_shaped_array
 
-# Type-checking
+# 类型检查
 
 def _shard_map_typecheck(_, *in_atoms, jaxpr, mesh, in_specs, out_specs,
                          check_vma, newly_manual_axes):
-  # TODO(mattjj,parkers): check auto
+  # TODO(mattjj,parkers): 检查 auto
   for v, x, in_spec in zip(jaxpr.invars, in_atoms, in_specs):
     sharded_aval = shard_aval(mesh, newly_manual_axes, check_vma, in_spec, x.aval)
     if not core.typecompat(v.aval, sharded_aval):
@@ -963,7 +951,7 @@ def _valid_repeats(mesh: Mesh, mat: core.ManualAxisType, spec) -> bool:
     return False
   return True
 
-# Lowering
+# 降级
 
 def _shardy_shard_map_sharding(
     ctx: mlir.LoweringRuleContext, mesh, manual_axes, spec, aval_in
@@ -973,7 +961,7 @@ def _shardy_shard_map_sharding(
     ns = sharding_impls.physical_sharding(aval_in, ns)
     aval_in = core.physical_aval(aval_in)
   if len(manual_axes) < len(mesh.axis_names):
-    # In partial manual case, mark all dims as open.
+    # 在部分手动（partial manual）的情形下，把所有维度都标记为开放的。
     return ns._to_sdy_sharding(aval_in.ndim, modify_wrt_axis_types=True)
   else:
     return ns._to_sdy_sharding(aval_in.ndim)
@@ -1006,7 +994,7 @@ def _shard_map_lowering_shardy(
   num_tokens = len(tokens)
   newly_manual_axes = order_wrt_mesh(mesh, newly_manual_axes)
   if prod([mesh.shape[a] for a in newly_manual_axes]) == 1:
-    # No need for a `ManualComputationOp` if all manual axes are size 1.
+    # 如果所有手动轴的大小都是 1，则无需 `ManualComputationOp`。
     with (_extend_axis_env(mesh, set(newly_manual_axes)),
           config._check_vma(check_vma)):
       out_nodes, tokens_out = mlir.jaxpr_subcomp(
@@ -1029,8 +1017,8 @@ def _shard_map_lowering_shardy(
       mlir.ir_constants(c, const_lowering=ctx.const_lowering, aval=aval)
       for c, aval in const_args_and_avals
   ])
-  # TODO(necula,yashkatariya): how to construct consts shardy shardings from
-  #  consts that can be ndarray or jax.Array?
+  # TODO(necula,yashkatariya): 如何从可能是 ndarray 或 jax.Array 的常量构造
+  #  Shardy 的常量分片？
   const_args_shardings = tuple(
       _shardy_shard_map_sharding(ctx, mesh, newly_manual_axes, P(), core.typeof(c))
       for c in const_args)
@@ -1179,7 +1167,7 @@ def _pspec_mhlo_attrs(spec, aval: core.AbstractValue) -> str:
     return str(map(names.get, range(aval.ndim)))
   return ''
 
-# Eager evaluation
+# 即时求值
 
 def get_mesh_from_args(args_flat, mesh):
   for a in args_flat:
@@ -1351,7 +1339,7 @@ def _maybe_check_special(outs):
 class ShardMapTrace(core.Trace):
   __slots__ = ("mesh", "manual_axes", "check", "amesh")
 
-  mesh: Mesh  # outer concrete or abstract mesh
+  mesh: Mesh  # 外层具体（concrete）或抽象网格
   manual_axes: frozenset[AxisName]
   check: bool
 
@@ -1408,12 +1396,12 @@ class ShardMapTrace(core.Trace):
 
   def process_shard_map(self, prim, fun, args, mesh, in_specs,
                         check_vma, newly_manual_axes, debug_info):
-    # Check consistency between outer and inner shmaps on explicitly passed
-    # mesh and check_vma.
+    # 检查显式传入的 mesh 与 check_vma 在外层 shard_map 和内层 shard_map
+    # 之间是否一致。
     if isinstance(mesh, Mesh):
       if mesh != self.mesh: raise Exception
     del mesh
-    if check_vma != self.check:  # TODO(mattjj): add check in jit path
+    if check_vma != self.check:  # TODO(mattjj): 在 jit 路径中增加检查
       raise Exception
     del check_vma
 
@@ -1425,7 +1413,7 @@ class ShardMapTrace(core.Trace):
     trace = ShardMapTrace(self.mesh, newly_manual_axes | self.manual_axes, self.check)
     in_vals_ = [_unmatch_spec2(self.mesh, self.manual_axes, spec, x)
                 for x, spec in zip(in_vals, in_specs)]
-    # TODO(yashkatariya): Handle unreduced/reduced correctly.
+    # TODO(yashkatariya): 正确处理 unreduced/reduced。
     in_mats_ = [core.ManualAxisType(varying=mat.varying | _spec_to_vma(s))
                 for mat, s in zip(in_mats, in_specs)]
     in_tracers = map(partial(ShardMapTracer, trace), in_mats_, in_vals_)
@@ -1437,14 +1425,14 @@ class ShardMapTrace(core.Trace):
       out_vals_, out_mats_ = ans.map(trace.to_val_mat_pair).unzip2()
     out_vals = out_vals_.map2(
         out_specs, lambda x, spec: _match_spec2(self.mesh, self.manual_axes, spec, x))
-    # TODO(yashkatariya): Handle unreduced/reduced correctly.
+    # TODO(yashkatariya): 正确处理 unreduced/reduced。
     out_mats = [core.ManualAxisType(varying=mat.varying - _spec_to_vma(spec))
                 for mat, spec in zip(out_mats_, out_specs)]
     return out_vals.map2(out_mats,
                          lambda val, vma: ShardMapTracer(self, vma, val))
 
   def process_custom_jvp_call(self, prim, fun, jvp, tracers, /, *, symbolic_zeros):
-    # Since ShardMapTrace is only used as a base main, we can drop the jvp.
+    # 由于 ShardMapTrace 只用作底层 main 追踪，我们可以丢弃 jvp。
     del prim, jvp, symbolic_zeros
     in_vals, in_mat = unzip2(map(self.to_val_mat_pair, tracers))
     out_vals, out_mat = _run_shmap_lu(fun, self.mesh, self.manual_axes, in_vals,
@@ -1506,7 +1494,7 @@ class ShardMapTracer(core.Tracer[ShardMapTrace]):
         f"On {device} at mesh coordinates {axis_names} = {idx}:\n{block}\n"
         for (idx, device), block in zip(np.ndenumerate(mesh.devices), blocks))
 
-  __repr__ = __str__  # for debuggers, like `p x`
+  __repr__ = __str__  # 供调试器使用，例如 `p x`
 
 def _prim_applier(prim, check_vma, params_tup, concrete_mesh, manual_axes,
                   in_specs, out_specs, *args):
@@ -1537,7 +1525,7 @@ def _ref_raise_valueerror(*args, **kwargs):
 eager_rules[core.ref_p] = _ref_raise_valueerror
 eager_rules[core.empty_ref_p] = _ref_raise_valueerror
 
-# Batching
+# 批处理
 
 def used_axis_names(spec):
   return _spec_to_mat(spec).vur
@@ -1585,8 +1573,8 @@ def _shard_map_batch(
 
   new_params = dict(mesh=mesh, in_specs=new_in_specs, check_vma=check_vma,
                     newly_manual_axes=newly_manual_axes, debug_info=debug_info)
-  # TODO(yashkatariya): Remove remove_explicit_mesh_axis_names when vmap
-  # mesh ctx is correctly set.
+  # TODO(yashkatariya): 当 vmap 的 mesh 上下文被正确设置后，移除
+  # remove_explicit_mesh_axis_names。
   with (core.set_current_trace(trace.parent_trace),
         core.remove_explicit_mesh_axis_names(trace.axis_data.explicit_mesh_axis)):
     out_vals = prim.bind(*in_vals, subfuns=(fun_batched,), **new_params)
@@ -1615,7 +1603,7 @@ def _batch_out_specs(spmd_name, explicit_mesh_axis, dims, out_specs):
             for sp, d in zip(out_specs, dims)]
 
 
-# Autodiff
+# 自动微分
 
 def _shard_map_jvp(trace, shard_map_p, f, tracers, mesh, in_specs,
                    check_vma, newly_manual_axes, debug_info):
@@ -1703,7 +1691,7 @@ def _shard_map_partial_eval(trace: pe.JaxprTrace, shard_map_p,
   assert not jaxpr.constvars
   unk_out_specs, _ = pe.partition_list(out_knowns, out_specs)
   res = subs_list2(in_fwd, out_fwd, in_consts, out_consts, non_fwd_res)
-  # TODO make res_avals be the full set, not just the non-fwd ones
+  # TODO 让 res_avals 成为完整集合，而不只是非转发的那些
   res_avals_iter = iter(res_avals)
   res_specs = []
   for f1, f2 in zip(in_fwd, out_fwd):
@@ -1752,7 +1740,7 @@ def _shard_map_linearize(trace, shard_map_p, f: Callable,
       f, trace.is_vjp, trace.tag, nzs_in, debug_info, primals)
     primals_out, out_specs = ans_aux.unpack_aux()
     ures, sres = res.unpack()
-    # De-duplicate structured residuals by object id:
+    # 按对象 id 对结构化残差去重：
     idx_map = {id(x): i for i, x in enumerate((*primals_out, *ures))}
     n_out = len(primals_out) + len(ures)
     kept, keep, sres_fwd = [], [], []
@@ -1813,15 +1801,15 @@ def _shard_map_linearize(trace, shard_map_p, f: Callable,
       check_vma=check_vma, newly_manual_axes=newly_manual_axes,
       debug_info=lin_jaxpr.debug_info)
 
-  # TODO(mattjj): avoid round-tripping the jaxpr through eval_jaxpr here
+  # TODO(mattjj): 避免在这里让 jaxpr 往返经过 eval_jaxpr
   def f_tangent(*args):
     ans = core.eval_jaxpr(lin_jaxpr, (), *args)
     return ft.flatten(ans).with_aux(tangent_out_specs)
 
-  # Re-duplicate the forwarded structured residuals, restore their tree
-  # structure, and hand them to the outer trace's structured-residuals
-  # channel, binding the tangent shard_map on fresh tangent-trace args for
-  # them (one per tree position, like LinearizeTrace.process_primitive).
+  # 重新复制这些被转发的结构化残差，恢复它们的树结构，
+  # 并把它们交给外层追踪器的结构化残差通道，
+  # 为此在新创建的切向量追踪参数上为它们绑定切向量 shard_map
+  # （每个树位置一个，与 LinearizeTrace.process_primitive 类似）。
   outs_flat = [*primals_out, *non_fwd_ures, *kept_sres]
   sres_tree = sres_avals.update(outs_flat[w] for w in sres_fwd).unflatten()
   trace.structured_residuals.append(sres_tree)
@@ -1923,8 +1911,8 @@ def _promote_scalar_residuals_jaxpr(jaxpr: core.Jaxpr, which: Sequence[bool]):
 
 def _unmentioned2(mesh: Mesh, spec, manual_axes: frozenset[AxisName]
                   ) -> list[AxisName]:
-  # We use a filtered-down version of unmentioned to avoid defensive-psum over
-  # more chips than required in the transpose-no-check-vma case.
+  # 我们使用 unmentioned 的过滤版本，以避免在 transpose-no-check-vma
+  # 情形下对超出所需的芯片做防御性 psum。
   name_set = _spec_to_vma(spec) | spec.unreduced
   return [n for n in _all_mesh_names_except_spmd(mesh, manual_axes)
           if n not in name_set]
@@ -1958,8 +1946,8 @@ def _shard_map_transpose(out_cts, *args, jaxpr: core.Jaxpr, mesh, in_specs,
     left_specs_nz = tuple(
         s.to_ct_spec() for ct, s in zip(left_cts, in_specs)
         if ct is not None and type(ct) is not ad.Zero)
-    # Per-shard log values come out mesh-stacked along their leading axis
-    # (scalars are first promoted to shape (1,)).
+    # 每个分片的 log 值会沿其首轴按 mesh 堆叠输出
+    # （标量会先被提升为形状 (1,)）。
     logs = tree_map(lambda x: lax.broadcast(x, (1,))
                     if getattr(x, 'shape', None) == () else x, logs)
     log_specs = tuple(typeof(x).nospec(mesh, check_vma, all_names)
@@ -1987,7 +1975,7 @@ def _shard_map_transpose_fancy(out_cts, *args, **params):
   return logs
 ad.fancy_transposes[shard_map_p] = _shard_map_transpose_fancy
 
-# Remat
+# 重物化
 
 def _partial_eval_jaxpr_custom_rule(
     saveable: Callable[..., pe.RematCases_], unks_in: Sequence[bool],
@@ -2049,7 +2037,7 @@ pe.partial_eval_jaxpr_custom_rules[shard_map_p] = \
 def _add_reshapes(which: Sequence[bool],
                   jaxpr_known: core.Jaxpr,
                   jaxpr_staged: core.Jaxpr) -> tuple[core.Jaxpr, core.Jaxpr]:
-  # add singleton axes to residuals which are from jaxpr_known and are scalars
+  # 为来自 jaxpr_known 且为标量的残差添加单例轴
   which_ = [w and not v.aval.shape  # pyrefly: ignore[missing-attribute]
             for w, v in zip(which, jaxpr_staged.invars[:len(which)])]
   if not any(which_): return jaxpr_known, jaxpr_staged
@@ -2082,7 +2070,7 @@ def _add_reshapes(which: Sequence[bool],
 def _pe_custom_params(unks_in, inst_in, kept_outs_known, kept_outs_staged,
                       in_fwd, out_fwd, out_res_specs_known, staged_in_res_specs,
                       params_known, params_staged):
-  # prune inputs to jaxpr_known according to unks_in
+  # 根据 unks_in 裁剪 jaxpr_known 的输入
   in_specs_known, _ = partition_list(unks_in, params_known['in_specs'])
   _, out_specs_known = partition_list(kept_outs_known, params_known['out_specs'])
   out_specs_known = out_specs_known + out_res_specs_known
@@ -2090,7 +2078,7 @@ def _pe_custom_params(unks_in, inst_in, kept_outs_known, kept_outs_staged,
   new_params_known = dict(params_known, in_specs=tuple(in_specs_known),
                           out_specs=tuple(out_specs_known))
 
-  # added num_res new inputs to jaxpr_staged, pruning according to inst_in
+  # 向 jaxpr_staged 新增了 num_res 个输入，并根据 inst_in 进行裁剪
   _, in_specs_staged = partition_list(inst_in, params_staged['in_specs'])
   iter_staged = iter(staged_in_res_specs)
   res_specs = [in_specs_known[f1] if f1 is not None else
@@ -2103,7 +2091,7 @@ def _pe_custom_params(unks_in, inst_in, kept_outs_known, kept_outs_staged,
                            out_specs=tuple(out_specs_staged))
   return new_params_known, new_params_staged
 
-# TODO(mattjj): remove this mechanism when we revise mesh scopes
+# TODO(mattjj): 当我们修订 mesh 作用域时移除这一机制
 def _all_mesh_names_except_spmd(
     mesh: Mesh, manual_axes: frozenset[AxisName]) -> tuple[AxisName, ...]:
   axis_env = core.get_axis_env()
@@ -2119,16 +2107,16 @@ def _all_newly_manual_mesh_names(
     mesh = ctx_mesh
     already_manual_names = set(ctx_mesh.manual_axes)
   else:
-    # TODO(mattjj): remove this mechanism when we revise mesh scopes
-    already_manual_names = set(axis_env.axis_sizes)  # may include vmap axis_names
+    # TODO(mattjj): 当我们修订 mesh 作用域时移除这一机制
+    already_manual_names = set(axis_env.axis_sizes)  # 可能包含 vmap 的 axis_names
   return tuple(name for name in mesh.axis_names
                if (name not in vmap_spmd_names | already_manual_names and
                    name in manual_axes))
 
 
-# DCE
+# 死代码消除
 
-# TODO(mattjj): de-duplicate with pe.dce_jaxpr_call_rule, and/or _pmap_dce_rule?
+# TODO(mattjj): 与 pe.dce_jaxpr_call_rule 和/或 _pmap_dce_rule 去重？
 def _shard_map_dce(used_outputs: list[bool], eqn: core.JaxprEqn
                    ) -> tuple[list[bool], core.JaxprEqn | None]:
   if not any(used_outputs) and not pe.has_effects(eqn):
@@ -2156,7 +2144,7 @@ def _shard_map_dce(used_outputs: list[bool], eqn: core.JaxprEqn
     return used_inputs, new_eqn
 pe.dce_rules[shard_map_p] = _shard_map_dce
 
-# Mutable arrays / refs
+# 可变数组 / 引用
 
 @discharge.register_discharge_rule(shard_map_p)
 def _shard_map_discharge(
@@ -2191,7 +2179,7 @@ def _shard_map_discharge(
 def _repspec(aval):
   return aval.nospec(empty_abstract_mesh, False, ())
 
-# ----------------------- top level collectives --------------------------------
+# ----------------------- 顶层集合通信 --------------------------------
 
 def _top_level_ag(x, aval, out_sh_, multi_dim):
   assert aval.sharding.mesh.are_all_axes_explicit, aval.sharding.mesh
@@ -2211,8 +2199,7 @@ def _top_level_ag(x, aval, out_sh_, multi_dim):
     out_spec = remove_size_one_mesh_axis_from_spec(out_spec, out_sh.mesh)
 
   def f_shmap(x):
-    # Maybe this can just be 1 AG where we gather in a new dim and then do
-    # AG(new_dim) -> reshape -> transpose -> reshape but it might be expensive.
+    # 也许这可以只做 1 次 AG：先在新维度上 gather，再做 AG(new_dim) -> reshape -> transpose -> reshape，但这样可能开销较大。
     count = 0
     for axis, (i, o) in enumerate(zip(in_spec.partitions, out_spec.partitions)):
       if i == o:

@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：实现 JAX 运行时性能分析（profiling）的 Python 前端，负责启动/停止分析器
+# 服务器与追踪，并把 CPU/GPU/TPU 的执行追踪（含 Python 函数与 JAX 设备端操作）导出到
+# TensorBoard/Perfetto 日志目录，是 `jax.profiler` 公共 API 的底层实现。
+# 关键概念：`ProfileOptions` 用于配置采集器，`_ProfileState` 保存单例分析会话状态，
+# `TraceAnnotation`/`StepTraceAnnotation`/`annotate_function` 用于给代码打标记；设备内存
+# 分析（pprof 格式）与 PGLE 的 FDO profile 采集也在此实现。
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -47,34 +54,34 @@ logger = logging.getLogger(__name__)
 
 
 class ProfileOptions(_profiler.ProfileOptions):
-  """Profiler Options to configure the collectors for the profiler."""
+  """用于配置分析器采集器的分析器选项。"""
 
 
 def start_server(
     port: int, requires_backend: bool = True
 ) -> _profiler.ProfilerServer:
-  """Starts the profiler server on port `port`.
+  """在 `port` 端口上启动分析器服务器。
 
-  Using the "TensorFlow profiler" feature in `TensorBoard
-  <https://www.tensorflow.org/tensorboard>`_ 2.2 or newer, you can
-  connect to the profiler server and sample execution traces that show CPU,
-  GPU, and/or TPU device activity.
+  使用 `TensorBoard <https://www.tensorflow.org/tensorboard>`_ 2.2 或更新
+  版本中的“TensorFlow profiler”功能，你可以连接到该分析器服务器，
+  并采样执行追踪，
+  这些追踪会展示 CPU、GPU 和/或 TPU 设备活动。
 
   Args:
-    port: The port to start the profiler server on.
-    requires_backend: If False, the profiler server will not wait for backends
-      to be initialized before starting. Default is True.
+    port: 用于启动分析器服务器的端口。
+    requires_backend: 若为 False，分析器服务器在启动前不会等待后端
+      初始化。默认为 True。
   """
   global _profiler_server
   if _profiler_server is not None:
     raise ValueError("Only one profiler server can be active at a time.")
 
-  # Make sure backends are initialized before creating a profiler
-  # session. Otherwise on Cloud TPU, libtpu may not be initialized before
-  # creating the tracer, which will cause the TPU tracer initialization to
-  # fail and no TPU operations will be included in the profile.
-  # NOTE(skyewm): I'm not sure this is necessary for start_server (is definitely
-  # is for start_trace), but I'm putting it here to be safe.
+  # 确保在创建分析会话之前后端已初始化。
+  # 否则在 Cloud TPU 上，libtpu 可能还未在创建追踪器之前完成初始化，
+  # 这会导致 TPU 追踪器初始化失败，
+  # 并且分析结果中不会包含任何 TPU 操作。
+  # NOTE(skyewm): 我不确定 start_server 是否也需要这样做（start_trace 肯定
+  # 需要），但为了保险起见还是放在这里。
   if requires_backend:
     xla_bridge.get_backend()
 
@@ -83,37 +90,37 @@ def start_server(
 
 
 def stop_server():
-  """Stops the running profiler server."""
+  """停止正在运行的分析器服务器。"""
   global _profiler_server
   if _profiler_server is None:
     raise ValueError("No active profiler server.")
-  _profiler_server = None # Should destroy the profiler server
+  _profiler_server = None # 应当会销毁该分析器服务器
 
 
 def register_subprocess(pid: int, port: int) -> Callable[[], None]:
-  """Registers a subprocess's profiler server to be profiled alongside the current process.
+  """注册某个子进程的分析器服务器，使其与当前进程一起被分析。
 
-  When the current process collects a profile (either programmatically or via
-  its profiler server), it will propagate the request to all registered
-  subprocesses' profiler servers and subsequently, aggregate all their responses
-  into the main response returned by this process's profiler server.
+  当当前进程收集分析数据时（无论是通过编程方式还是经由其分析器服务器），
+  它都会把该请求传播到所有已注册子进程的分析器服务器，
+  随后把所有响应聚合到本进程分析器服务器返回的
+  主响应中。
 
-  This is helpful when running workers in separate processes that may affect the
-  performance of the main process (e.g. PyGrain).
+  当在独立进程中运行工作进程、且这些进程可能影响主进程性能时
+  （例如 PyGrain），这很有用。
 
-  NOTE: Currently, only CPU profiling of subprocesses is supported.
+  NOTE: 目前仅支持对子进程进行 CPU 分析。
 
   Args:
-    pid: The process ID of the subprocess.
-    port: The port of the profiler server in the subprocess.
+    pid: 子进程的进程 ID。
+    port: 子进程中分析器服务器的端口。
 
   Returns:
-    A function that when called or garbage collected will unregister the
-    subprocess from the main process's profiler.
+    一个函数，调用它或对其做垃圾回收时，会把该子进程从主进程的分析器中
+    注销。
 
   Raises:
-    RuntimeError: If the subprocess fails to be registered (e.g. already
-    registered, unable to connect, etc.).
+    RuntimeError: 若子进程注册失败（例如已注册、
+    无法连接等）。
   """
   return _profiler.register_subprocess(pid, port)
 
@@ -137,13 +144,13 @@ _profile_state = _ProfileState()
 
 
 def set_metadata(key: str, value: str) -> None:
-  """Sets metadata for the current profiling session."""
+  """为当前分析会话设置元数据。"""
   if hasattr(_profiler, "set_metadata"):
     return _profiler.set_metadata(key, value)
 
 
 def clear_metadata() -> None:
-  """Clears metadata for the current profiling session."""
+  """清除当前分析会话的元数据。"""
   if hasattr(_profiler, "clear_metadata"):
     return _profiler.clear_metadata()
 
@@ -154,41 +161,41 @@ def start_trace(
     create_perfetto_trace: bool = False,
     profiler_options: ProfileOptions | None = None,
 ) -> None:
-  """Starts a profiler trace.
+  """启动一次分析器追踪。
 
-  The trace will capture CPU, GPU, and/or TPU activity, including Python
-  functions and JAX on-device operations. Use :func:`stop_trace` to end the
-  trace
-  and save the results to ``log_dir``.
+  该追踪会捕获 CPU、GPU 和/或 TPU 活动，
+  包括 Python 函数和 JAX 设备端操作。
+  使用 :func:`stop_trace` 结束追踪
+  并把结果保存到 ``log_dir``。
 
-  The resulting trace can be viewed with TensorBoard. Note that TensorBoard
-  doesn't need to be running when collecting the trace.
+  生成的追踪可以用 TensorBoard 查看。注意收集追踪时不需要 TensorBoard
+  处于运行状态。
 
-  Only one trace may be collected at a time. A RuntimeError will be raised if
-  :func:`start_trace` is called while another trace is running.
+  同一时间只能收集一次追踪。若在另一个追踪运行期间调用
+  :func:`start_trace`，将抛出 RuntimeError。
 
   Args:
-    log_dir: The directory to save the profiler trace to (usually the
-      TensorBoard log directory).
-    create_perfetto_link: A boolean which, if true, creates and prints link to
-      the Perfetto trace viewer UI (https://ui.perfetto.dev). The program will
-      block until the link is opened and Perfetto loads the trace.
-    create_perfetto_trace: A boolean which, if true, additionally dumps a
-      ``perfetto_trace.json.gz`` file that is compatible for upload with the
-      Perfetto trace viewer UI (https://ui.perfetto.dev). The file will also be
-      generated if ``create_perfetto_link`` is true. This could be useful if you
-      want to generate a Perfetto-compatible trace without blocking the process.
-    profiler_options: Profiler options to configure the profiler for collection.
+    log_dir: 保存分析器追踪的目录（通常是
+      TensorBoard 日志目录）。
+    create_perfetto_link: 布尔值，若为 true，则创建并打印指向
+      Perfetto 追踪查看器 UI（https://ui.perfetto.dev）的链接。程序会
+      阻塞，直到该链接被打开并且 Perfetto 加载完追踪。
+    create_perfetto_trace: 布尔值，若为 true，则额外导出一个可与
+      Perfetto 追踪查看器 UI（https://ui.perfetto.dev）上传兼容的
+      ``perfetto_trace.json.gz`` 文件。若 ``create_perfetto_link`` 为 true
+      也会生成该文件。如果你想生成与 Perfetto 兼容的追踪而又不想阻塞进程，
+      这会很有用。
+    profiler_options: 用于配置分析器采集行为的分析器选项。
   """
   with _profile_state.lock:
     if _profile_state.profile_session is not None:
       raise RuntimeError("Profile has already been started. "
                          "Only one profile may be run at a time.")
     clear_metadata()
-    # Make sure backends are initialized before creating a profiler
-    # session. Otherwise on Cloud TPU, libtpu may not be initialized before
-    # creating the tracer, which will cause the TPU tracer initialization to
-    # fail and no TPU operations will be included in the profile.
+    # 确保在创建分析会话之前后端已初始化。
+    # 否则在 Cloud TPU 上，libtpu 可能还未在创建追踪器之前完成初始化，
+    # 这会导致 TPU 追踪器初始化失败，
+    # 并且分析结果中不会包含任何 TPU 操作。
     xla_bridge.get_backend()
 
     options = profiler_options
@@ -211,7 +218,7 @@ def start_trace(
 
 
 def _write_perfetto_trace_file(log_dir: os.PathLike | str):
-  # Navigate to folder with the latest trace dump to find `trace.json.jz`
+  # 进入包含最新追踪转储的文件夹，以找到 `trace.json.jz`
   trace_folders = (pathlib.Path(log_dir).absolute() / "plugins" / "profile").iterdir()
   latest_trace_folder = max(trace_folders, key=os.path.getmtime)
   trace_jsons = latest_trace_folder.glob("*.trace.json.gz")
@@ -221,10 +228,10 @@ def _write_perfetto_trace_file(log_dir: os.PathLike | str):
     raise ValueError(f"Invalid trace folder: {latest_trace_folder}") from value_error
 
   logger.info("Loading trace.json.gz and removing its metadata...")
-  # Perfetto doesn't like the `metadata` field in `trace.json` so we remove
-  # it.
-  # TODO(sharadmv): speed this up by updating the generated `trace.json`
-  # to not include metadata if possible.
+  # Perfetto 不喜欢 `trace.json` 中的 `metadata` 字段，所以我们
+  # 把它移除。
+  # TODO(sharadmv): 通过更新生成的 `trace.json` 使其尽可能不包含元数据，
+  # 来加快这一步。
   with gzip.open(trace_json, "rb") as fp:
     trace = json.load(fp)
     del trace["metadata"]
@@ -235,7 +242,7 @@ def _write_perfetto_trace_file(log_dir: os.PathLike | str):
   return perfetto_trace
 
 class _PerfettoServer(http.server.SimpleHTTPRequestHandler):
-  """Handles requests from `ui.perfetto.dev` for the `trace.json`"""
+  """处理来自 `ui.perfetto.dev` 对 `trace.json` 的请求。"""
 
   def end_headers(self):
     self.send_header('Access-Control-Allow-Origin', '*')
@@ -249,8 +256,8 @@ class _PerfettoServer(http.server.SimpleHTTPRequestHandler):
     self.send_error(404, "File not found")
 
 def _host_perfetto_trace_file(path: os.PathLike | str):
-  # ui.perfetto.dev looks for files hosted on `127.0.0.1:9001`. We set up a
-  # TCP server that is hosting the `perfetto_trace.json.gz` file.
+  # ui.perfetto.dev 会在 `127.0.0.1:9001` 上查找托管的文件。我们搭建一个
+  # TCP 服务器来托管 `perfetto_trace.json.gz` 文件。
   port = 9001
   orig_directory = pathlib.Path.cwd()
   directory, filename = os.path.split(path)
@@ -261,18 +268,18 @@ def _host_perfetto_trace_file(path: os.PathLike | str):
       url = f"https://ui.perfetto.dev/#!/?url=http://127.0.0.1:{port}/{filename}"
       print(f"Open URL in browser: {url}")
 
-      # Once ui.perfetto.dev acquires trace.json from this server we can close
-      # it down.
+      # 一旦 ui.perfetto.dev 从这个服务器获取到 trace.json，我们就可以
+      # 把它关掉。
       while httpd.__dict__.get('last_request') != '/' + filename:
         httpd.handle_request()
   finally:
     os.chdir(orig_directory)
 
 def stop_trace():
-  """Stops the currently-running profiler trace.
+  """停止当前正在运行的分析器追踪。
 
-  The trace will be saved to the ``log_dir`` passed to the corresponding
-  :func:`start_trace` call. Raises a RuntimeError if a trace hasn't been started.
+  追踪会被保存到对应的 :func:`start_trace` 调用所传入的 ``log_dir``。
+  若尚未启动任何追踪，则抛出 RuntimeError。
   """
   with _profile_state.lock:
     profile_session = _profile_state.profile_session
@@ -288,10 +295,10 @@ def stop_trace():
 
 
 def stop_and_get_fdo_profile() -> bytes | str:
-  """Stops the currently-running profiler trace and export fdo_profile.
+  """停止当前正在运行的分析器追踪并导出 fdo_profile。
 
-  Currently, this is only supported for GPU.
-  Raises a RuntimeError if a trace hasn't been started.
+  目前仅支持 GPU。
+  若尚未启动任何追踪，则抛出 RuntimeError。
   """
   with _profile_state.lock:
     profile_session = _profile_state.profile_session
@@ -311,29 +318,29 @@ def trace(
     create_perfetto_trace=False,
     profiler_options: ProfileOptions | None = None,
 ):
-  """Context manager to take a profiler trace.
+  """用于采集分析器追踪的上下文管理器。
 
-  The trace will capture CPU, GPU, and/or TPU activity, including Python
-  functions and JAX on-device operations.
+  该追踪会捕获 CPU、GPU 和/或 TPU 活动，
+  包括 Python 函数和 JAX 设备端操作。
 
-  The resulting trace can be viewed with TensorBoard. Note that TensorBoard
-  doesn't need to be running when collecting the trace.
+  生成的追踪可以用 TensorBoard 查看。注意收集追踪时不需要 TensorBoard
+  处于运行状态。
 
-  Only one trace may be collected at a time. A RuntimeError will be raised if a
-  trace is started while another trace is running.
+  同一时间只能收集一次追踪。若在另一个追踪运行期间启动追踪，将抛出
+  RuntimeError。
 
   Args:
-    log_dir: The directory to save the profiler trace to (usually the
-      TensorBoard log directory).
-    create_perfetto_link: A boolean which, if true, creates and prints link to
-      the Perfetto trace viewer UI (https://ui.perfetto.dev). The program will
-      block until the link is opened and Perfetto loads the trace.
-    create_perfetto_trace: A boolean which, if true, additionally dumps a
-      ``perfetto_trace.json.gz`` file that is compatible for upload with the
-      Perfetto trace viewer UI (https://ui.perfetto.dev). The file will also be
-      generated if ``create_perfetto_link`` is true. This could be useful if you
-      want to generate a Perfetto-compatible trace without blocking the process.
-    profiler_options: Profiler options to configure the profiler for collection.
+    log_dir: 保存分析器追踪的目录（通常是
+      TensorBoard 日志目录）。
+    create_perfetto_link: 布尔值，若为 true，则创建并打印指向
+      Perfetto 追踪查看器 UI（https://ui.perfetto.dev）的链接。程序会
+      阻塞，直到该链接被打开并且 Perfetto 加载完追踪。
+    create_perfetto_trace: 布尔值，若为 true，则额外导出一个可与
+      Perfetto 追踪查看器 UI（https://ui.perfetto.dev）上传兼容的
+      ``perfetto_trace.json.gz`` 文件。若 ``create_perfetto_link`` 为 true
+      也会生成该文件。如果你想生成与 Perfetto 兼容的追踪而又不想阻塞进程，
+      这会很有用。
+    profiler_options: 用于配置分析器采集行为的分析器选项。
   """
   start_trace(
       log_dir, create_perfetto_link, create_perfetto_trace, profiler_options
@@ -345,40 +352,40 @@ def trace(
 
 
 class TraceAnnotation(_profiler.TraceMe):
-  """Context manager that generates a trace event in the profiler.
+  """在分析器中生成一个追踪事件的上下文管理器。
 
-  The trace event spans the duration of the code enclosed by the context.
+  该追踪事件的时间跨度覆盖上下文所包含代码的执行时长。
 
-  For example:
+  例如：
 
   >>> x = jnp.ones((1000, 1000))
   >>> with jax.profiler.TraceAnnotation("my_label"):
   ...   result = jnp.dot(x, x.T).block_until_ready()
 
-  This will cause a "my_label" event to show up on the trace timeline if the
-  event occurs while the process is being traced.
+  如果该事件发生在进程被追踪期间，它会使一个 "my_label" 事件出现在
+  追踪时间线上。
   """
 
 
 class StepTraceAnnotation(TraceAnnotation):
-  """Context manager that generates a step trace event in the profiler.
+  """在分析器中生成一个步进追踪事件的上下文管理器。
 
-  The step trace event spans the duration of the code enclosed by the context.
-  The profiler will provide the performance analysis for each step trace event.
+  该步进追踪事件的时间跨度覆盖上下文所包含代码的执行时长。
+  分析器会为每个步进追踪事件提供性能分析。
 
-  For example, it can be used to mark training steps and enable the profiler to
-  provide the performance analysis per step:
+  例如，可以用它来标记训练步，
+  让分析器能够提供逐步的性能分析：
 
   >>> while global_step < NUM_STEPS:                                           # doctest: +SKIP
   ...   with jax.profiler.StepTraceAnnotation("train", step_num=global_step):  # doctest: +SKIP
   ...     train_step()                                                         # doctest: +SKIP
   ...     global_step += 1                                                     # doctest: +SKIP
 
-  This will cause a "train xx" event to show up on the trace timeline if the
-  event occurs while the process is being traced by TensorBoard. In addition,
-  if using accelerators, the device trace timeline will also show a "train xx"
-  event. Note that "step_num" can be set as a keyword argument to pass the
-  global step number to the profiler.
+  如果该事件发生在进程被 TensorBoard 追踪期间，
+  它会使一个 "train xx" 事件出现在追踪时间线上。此外，如果使用
+  加速器，设备追踪时间线上也会显示一个 "train xx" 事件。
+  注意 "step_num" 可以作为关键字参数传入，
+  以便把全局步号传递给分析器。
 
   """
 
@@ -388,9 +395,9 @@ class StepTraceAnnotation(TraceAnnotation):
 
 def annotate_function(func: Callable, name: str | None = None,
                       **decorator_kwargs):
-  """Decorator that generates a trace event for the execution of a function.
+  """为函数执行生成追踪事件的装饰器。
 
-  For example:
+  例如：
 
   >>> @jax.profiler.annotate_function
   ... def f(x):
@@ -398,10 +405,10 @@ def annotate_function(func: Callable, name: str | None = None,
   >>>
   >>> result = f(jnp.ones((1000, 1000)))
 
-  This will cause an "f" event to show up on the trace timeline if the
-  function execution occurs while the process is being traced by TensorBoard.
+  如果函数执行发生在进程被 TensorBoard 追踪期间，它会使一个 "f" 事件
+  出现在追踪时间线上。
 
-  Arguments can be passed to the decorator via :py:func:`functools.partial`.
+  可以通过 :py:func:`functools.partial` 给该装饰器传递参数。
 
   >>> from functools import partial
 
@@ -422,53 +429,53 @@ def annotate_function(func: Callable, name: str | None = None,
 
 
 def device_memory_profile(backend: str | None = None) -> bytes:
-  """Captures a JAX device memory profile as ``pprof``-format protocol buffer.
+  """以 ``pprof`` 格式的 protocol buffer 捕获 JAX 设备内存分析数据。
 
-  A device memory profile is a snapshot of the state of memory, that describes the JAX
-  :class:`~jax.Array` and executable objects present in memory and their
-  allocation sites.
+  设备内存分析是内存状态的一份快照，
+  它描述了内存中存在的 JAX :class:`~jax.Array` 与可执行对象，
+  以及它们各自的分配位置。
 
-  For more information how to use the device memory profiler, see
-  :doc:`/device_memory_profiling`.
+  关于如何使用设备内存分析器的更多信息，请参见
+  :doc:`/device_memory_profiling`。
 
-  The profiling system works by instrumenting JAX on-device allocations,
-  capturing a Python stack trace for each allocation. The instrumentation is
-  always enabled; :func:`device_memory_profile` provides an API to capture it.
+  该分析系统通过插桩 JAX 的设备端分配来工作，会为每次分配捕获一份
+  Python 栈回溯。插桩始终处于启用状态；:func:`device_memory_profile`
+  提供了用于捕获它的 API。
 
-  The output of :func:`device_memory_profile` is a binary protocol buffer that
-  can be interpreted and visualized by the `pprof tool
-  <https://github.com/google/pprof>`_.
+  :func:`device_memory_profile` 的输出是一个二进制 protocol buffer，
+  可以用 `pprof 工具
+  <https://github.com/google/pprof>`_ 解释和可视化。
 
   Args:
-    backend: optional; the name of the JAX backend for which the device memory
-      profile should be collected.
+    backend: 可选；应为其收集设备内存分析数据的
+      JAX 后端名称。
 
   Returns:
-    A byte string containing a binary `pprof`-format protocol buffer.
+    一个包含二进制 `pprof` 格式 protocol buffer 的字节串。
   """
   client = xla_bridge.get_backend(backend)
   return gzip.compress(client.heap_profile())
 
 
 def save_device_memory_profile(filename, backend: str | None = None) -> None:
-  """Collects a device memory profile and writes it to a file.
+  """收集设备内存分析数据并把它写入文件。
 
-  :func:`save_device_memory_profile` is a convenience wrapper around :func:`device_memory_profile`
-  that saves its output to a ``filename``. See the
-  :func:`device_memory_profile` documentation for more information.
+  :func:`save_device_memory_profile` 是 :func:`device_memory_profile` 的
+  便捷包装器，它把输出保存到 ``filename``。更多信息请参见
+  :func:`device_memory_profile` 的文档。
 
   Args:
-    filename: the filename to which the profile should be written.
-    backend: optional; the name of the JAX backend for which the device memory
-      profile should be collected.
+    filename: 分析数据应写入的文件名。
+    backend: 可选；应为其收集设备内存分析数据的
+      JAX 后端名称。
   """
   profile = device_memory_profile(backend)
   with open(filename, "wb") as f:
     f.write(profile)
 
 
-# Allows to run model with profiler given amount of times. After required amount
-# of retries achieved client can collect FDO data.
+# 允许以分析器运行模型给定次数。在达到所需的
+# 重试次数后，客户端就可以收集 FDO 数据。
 class PGLEProfiler:
 
   def __init__(self, retries: int, percentile: int):

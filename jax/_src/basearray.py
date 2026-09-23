@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Note that type annotations for this file are defined in basearray.pyi
+# 文件职责：`jax.Array` 的基类与类型标注。
+# 定义 Array 抽象基类（dtype/ndim/size/shape/sharding/committed/device 等属性，
+# addressable_data、copy_to_host_async 等接口），运行时由 C++ 的 xc.Array 替换实现；
+# 另定义 StaticScalar 与 ArrayLike 类型别名。具体数组实现见 `jax._src.array`。
+
+# 注意：本文件的类型标注定义在 basearray.pyi 中
 
 from __future__ import annotations
 
@@ -25,44 +30,42 @@ from jax._src.util import use_cpp_class
 import numpy as np
 
 
-# TODO(jakevdp): fix import cycles and define these.
+# TODO(jakevdp): 修复循环导入并定义这些类型。
 Device = Any
 Shard = Any
 Sharding = Any
 
-# Array is a type annotation for standard JAX arrays and tracers produced by
-# core functions in jax.lax and jax.numpy; it is not meant to include
-# future non-standard array types like KeyArray and BInt.
+# Array 是标准 JAX 数组、以及由 jax.lax 和 jax.numpy 中核心函数产生的
+# 追踪器的类型标注；它并不打算涵盖未来那些非标准数组类型，
+# 例如 KeyArray 和 BInt。
 
 
 class Array:
-  """Array base class for JAX
+  """JAX 的数组基类
 
-  ``jax.Array`` is the public interface for instance checks and type annotation
-  of JAX arrays and tracers. Its main applications are in instance checks and
-  type annotations; for example::
+  ``jax.Array`` 是用于对 JAX 数组和追踪器做实例检查与类型标注的公开接口。
+  它的主要用途是实例检查和类型标注；例如::
 
     x = jnp.arange(5)
-    isinstance(x, jax.Array)  # returns True both inside and outside traced functions.
+    isinstance(x, jax.Array)  # 在被追踪函数内部和外部都返回 True。
 
-    def f(x: Array) -> Array:  # type annotations are valid for traced and non-traced types.
+    def f(x: Array) -> Array:  # 类型标注对已追踪和未追踪类型都有效。
       return x
 
-  ``jax.Array`` should not be used directly for creation of arrays; instead you
-  should use array creation routines offered in :mod:`jax.numpy`, such as
-  :func:`jax.numpy.array`, :func:`jax.numpy.zeros`, :func:`jax.numpy.ones`,
-  :func:`jax.numpy.full`, :func:`jax.numpy.arange`, etc.
+  不应直接使用 ``jax.Array`` 来创建数组；而应使用 :mod:`jax.numpy` 提供的
+  数组创建例程，例如 :func:`jax.numpy.array`、:func:`jax.numpy.zeros`、
+  :func:`jax.numpy.ones`、:func:`jax.numpy.full`、
+  :func:`jax.numpy.arange` 等。
   """
-  # For the sake of static type analysis, these definitions are mirrored in the
-  # associated basearray.pyi file.
+  # 为了静态类型分析，这些定义在配套的 basearray.pyi 文件中有对应的镜像定义。
 
   __slots__ = ['__weakref__']
   __hash__ = None
 
-  # TODO(jakevdp): set __numpy_dtype__ = None after deprecation period.
+  # TODO(jakevdp): 弃用期结束后把 __numpy_dtype__ 设为 None。
   @property
   def __numpy_dtype__(self) -> np.dtype:
-    # __numpy_dtype__ protocol added in NumPy v2.4.0.
+    # __numpy_dtype__ 协议在 NumPy v2.4.0 中加入。
     deprecations.warn(
       'jax-array-numpy-dtype',
       (
@@ -76,76 +79,72 @@ class Array:
 
   @property
   def dtype(self) -> np.dtype:
-    """The data type (:class:`numpy.dtype`) of the array."""
+    """数组的数据类型（:class:`numpy.dtype`）。"""
     raise NotImplementedError
 
   @property
   def ndim(self) -> int:
-    """The number of dimensions in the array."""
+    """数组的维数。"""
     raise NotImplementedError
 
   @property
   def size(self) -> int:
-    """The total number of elements in the array."""
+    """数组中元素的总个数。"""
     raise NotImplementedError
 
   @property
   def shape(self) -> tuple[int, ...]:
-    """The shape of the array."""
+    """数组的形状。"""
     raise NotImplementedError
 
-  # Documentation for sharding-related methods and properties defined on ArrayImpl:
+  # 以下是在 ArrayImpl 上定义的分片相关方法与属性的文档：
   def addressable_data(self, index: int) -> Array:
-    """Return an array of the addressable data at a particular index."""
+    """返回特定索引处的可寻址数据所组成的数组。"""
     raise NotImplementedError
 
   @property
   def addressable_shards(self) -> Sequence[Shard]:
-    """List of addressable shards."""
+    """可寻址分片的列表。"""
     raise NotImplementedError
 
   @property
   def global_shards(self) -> Sequence[Shard]:
-    """List of global shards."""
+    """全局分片的列表。"""
     raise NotImplementedError
 
   @property
   def is_fully_addressable(self) -> bool:
-    """Is this Array fully addressable?
+    """这个 Array 是否完全可寻址？
 
-    A jax.Array is fully addressable if the current process can address all of
-    the devices named in the :class:`Sharding`. ``is_fully_addressable`` is
-    equivalent to "is_local" in multi-process JAX.
+    如果当前进程能够寻址到 :class:`Sharding` 中指定的所有设备，那么该
+    jax.Array 就是完全可寻址的。在多进程 JAX 中，
+    ``is_fully_addressable`` 等价于 “is_local”。
 
-    Note that fully replicated is not equal to fully addressable i.e.
-    a jax.Array which is fully replicated can span across multiple hosts and is
-    not fully addressable.
+    注意，完全复制并不等于完全可寻址；也就是说，一个完全复制的
+    jax.Array 可能横跨多台主机，并且不是完全可寻址的。
     """
     raise NotImplementedError
 
   @property
   def is_fully_replicated(self) -> bool:
-    """Is this Array fully replicated?"""
+    """这个 Array 是否完全复制？"""
     raise NotImplementedError
 
   @property
   def sharding(self) -> Sharding:
-    """The sharding for the array."""
+    """该数组的分片方式。"""
     raise NotImplementedError
 
   @property
   def committed(self) -> bool:
-    """Whether the array is committed or not.
+    """该数组是否已提交（committed）。
 
-    An array is committed when it is explicitly placed on device(s) via JAX
-    APIs. For example, ``jax.device_put(np.arange(8), jax.devices()[0])`` is
-    committed to device 0. While ``jax.device_put(np.arange(8))`` is uncommitted
-    and will be placed on the default device.
+    当数组通过 JAX API 被显式放到某（些）设备上时，它就是已提交的。
+    例如 ``jax.device_put(np.arange(8), jax.devices()[0])`` 被提交到设备 0，
+    而 ``jax.device_put(np.arange(8))`` 未提交，会被放到默认设备上。
 
-    Computations involving some committed inputs will happen on the committed
-    device(s) and the result will be committed on the same device(s).
-    Invoking an operation on arguments that are committed to different device(s)
-    will raise an error.
+    涉及某些已提交输入的计算会在这些已提交的设备上进行，结果也会提交到
+    同一（些）设备上。对已提交到不同设备上的参数调用运算则会报错。
 
     Examples:
       >>> a = jax.device_put(np.arange(8), jax.devices()[0])
@@ -159,26 +158,22 @@ class Array:
 
   @property
   def device(self) -> Device | Sharding:
-    """Array API-compatible device attribute.
+    """与 Array API 兼容的 device 属性。
 
-    For single-device arrays, this returns a Device. For sharded arrays, this
-    returns a Sharding.
+    对于单设备数组，它返回一个 Device；对于分片数组，它返回一个 Sharding。
     """
     raise NotImplementedError
 
   def copy_to_host_async(self):
-    """Copies an ``Array`` to the host asynchronously.
+    """把 ``Array`` 异步复制到主机。
 
-    For arrays that live an an accelerator, such as a GPU or a TPU, JAX may
-    cache the value of the array on the host. Normally this happens
-    behind the scenes when the value of an on-device array is requested by the
-    user, but waiting to initiate a device-to-host copy until the value is
-    requested requires that JAX block the caller while waiting for the copy to
-    complete.
+    对于位于加速器（例如 GPU 或 TPU）上的数组，JAX 可能会在主机上缓存
+    该数组的值。通常，当用户请求读取设备上数组的值时，这会在幕后自动
+    发生；但如果要一直等到用户请求时才发起设备到主机的复制，JAX 就必须
+    在等待复制完成期间阻塞调用方。
 
-    ``copy_to_host_async`` requests that JAX populate its on-host cache of an
-    array, but does not wait for the copy to complete. This may speed up a
-    future on-host access to the array's contents.
+    ``copy_to_host_async`` 请求 JAX 填充它在主机上维护的数组缓存，但不
+    等待复制完成。这可以加快将来在主机上访问该数组内容的速度。
     """
     raise NotImplementedError
 
@@ -187,21 +182,21 @@ Array = use_cpp_class(xc.Array)(Array)
 Array.__module__ = "jax"
 
 
-# StaticScalar is the Union of all scalar types that can be converted to
-# JAX arrays, and are possible to mark as static arguments.
+# StaticScalar 是所有可转换为 JAX 数组、并且可以被标记为静态参数的
+# 标量类型的联合。
 StaticScalar = (
-  np.bool_ | np.number  # NumPy scalar types
-  | bool | int | float | complex  # Python scalar types
+  np.bool_ | np.number  # NumPy 标量类型
+  | bool | int | float | complex  # Python 标量类型
 )
-"""Type annotation for JAX-compatible static scalars."""
+"""与 JAX 兼容的静态标量的类型标注。"""
 
-# ArrayLike is a Union of all objects that can be implicitly converted to a
-# standard JAX array (i.e. not including future non-standard array types like
-# KeyArray and BInt). It's different than np.typing.ArrayLike in that it doesn't
-# accept arbitrary sequences, nor does it accept string data.
+# ArrayLike 是所有可隐式转换为标准 JAX 数组的对象的联合
+# （即不包括未来那些非标准数组类型，例如 KeyArray 和 BInt）。
+# 它与 np.typing.ArrayLike 的不同之处在于：它既不接受任意序列，
+# 也不接受字符串数据。
 ArrayLike = (
-  Array  # JAX array type
-  | np.ndarray  # NumPy array type
-  | StaticScalar  # valid scalars
+  Array  # JAX 数组类型
+  | np.ndarray  # NumPy 数组类型
+  | StaticScalar  # 合法的标量
 )
-"""Type annotation for JAX array-like objects."""
+"""JAX 类数组对象的类型标注。"""

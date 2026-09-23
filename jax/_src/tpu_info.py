@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exposes TPU hardware information."""
+# 文件职责：描述 TPU 硬件规格并提供查询接口，是 JAX 中了解“当前或目标 TPU 芯片
+# 长什么样”的单一事实来源。
+# 它把 `device_kind` 映射为 `ChipVersion` 枚举，给出每个 TensorCore 的 lane/sublane
+# 布局、MXU 列宽与数量、VMEM/CMEM/SMEM/HBM 容量和 bf16/int8/fp8/int4 峰值算力，
+# 并区分 Megacore 与 split 两种多核使用模式；`Tiling`/`infer_tiling` 还据此推断
+# 内存布局的分块因子。`get_tpu_info()` 查当前设备，`get_tpu_info_for_chip()` 查指定芯片。
+
+"""对外暴露 TPU 硬件信息。"""
 
 import dataclasses
 import enum
@@ -32,35 +39,35 @@ class ChipVersionBase:
 
 
 class ChipVersion(ChipVersionBase, enum.Enum):
-  """TPU chip version.
+  """TPU 芯片版本。
 
-  The following table summarizes the differences between TPU versions:
+  下表汇总了各 TPU 版本之间的差异：
 
-  +---------+-------------------------------+-----------+------------------+
-  | Version | Physical TensorCores per chip | Lite chip | Megacore support |
-  +=========+===============================+===========+==================+
-  | v2      | 2                             | No        | No               |
-  +---------+-------------------------------+-----------+------------------+
-  | v3      | 2                             | No        | No               |
-  +---------+-------------------------------+-----------+------------------+
-  | v4i     | 1                             | Yes       | No               |
-  +---------+-------------------------------+-----------+------------------+
-  | v4      | 2                             | No        | Yes              |
-  +---------+-------------------------------+-----------+------------------+
-  | v5e     | 1                             | Yes       | No               |
-  +---------+-------------------------------+-----------+------------------+
-  | v5p     | 2                             | No        | Yes              |
-  +---------+-------------------------------+-----------+------------------+
-  | v6e     | 1                             | Yes       | No               |
-  +---------+-------------------------------+-----------+------------------+
-  | 7       | 2                             | No        | No               |
-  +---------+-------------------------------+-----------+------------------+
-  | 7x      | 2                             | No        | No               |
-  +---------+-------------------------------+-----------+------------------+
-  | 8i      | 2                             | No        | No               |
-  +---------+-------------------------------+-----------+------------------+
-  | 8t      | 1                             | No        | No               |
-  +---------+-------------------------------+-----------+------------------+
+  +------+--------------------------+-----------+---------------+
+  | 版本 | 每芯片物理 TensorCore 数 | Lite 芯片 | Megacore 支持 |
+  +======+==========================+===========+===============+
+  | v2   | 2                        | 否        | 否            |
+  +------+--------------------------+-----------+---------------+
+  | v3   | 2                        | 否        | 否            |
+  +------+--------------------------+-----------+---------------+
+  | v4i  | 1                        | 是        | 否            |
+  +------+--------------------------+-----------+---------------+
+  | v4   | 2                        | 否        | 是            |
+  +------+--------------------------+-----------+---------------+
+  | v5e  | 1                        | 是        | 否            |
+  +------+--------------------------+-----------+---------------+
+  | v5p  | 2                        | 否        | 是            |
+  +------+--------------------------+-----------+---------------+
+  | v6e  | 1                        | 是        | 否            |
+  +------+--------------------------+-----------+---------------+
+  | 7    | 2                        | 否        | 否            |
+  +------+--------------------------+-----------+---------------+
+  | 7x   | 2                        | 否        | 否            |
+  +------+--------------------------+-----------+---------------+
+  | 8i   | 2                        | 否        | 否            |
+  +------+--------------------------+-----------+---------------+
+  | 8t   | 1                        | 否        | 否            |
+  +------+--------------------------+-----------+---------------+
   """
 
   TPU_V2 = "v2"
@@ -146,7 +153,7 @@ def chip_version_from_device_kind(device_kind: str) -> ChipVersion | None:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class SparseCoreInfo:
-  """SparseCore-specific information."""
+  """SparseCore 特有的信息。"""
 
   num_cores: int
   num_subcores: int
@@ -157,10 +164,10 @@ class SparseCoreInfo:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class TpuInfo:
-  """TPU hardware information.
+  """TPU 硬件信息。
 
-  Note that all information is per-TensorCore so you would need to multiply
-  by `num_cores` to obtain the total for the chip.
+  注意：这里的所有信息都是按 TensorCore 计的，需要乘以 `num_cores`
+  才能得到整块芯片的总量。
   """
 
   chip_version: ChipVersionBase
@@ -169,10 +176,10 @@ class TpuInfo:
   num_lanes: int
   num_sublanes: int
   mxu_column_size: int
-  # The number of MXUs available for each core.
+  # 每个核心可用的 MXU 数量。
   num_mxus: int
-  # The number of (num_sublanes, mxu_column_size)-shaped 32-bit accumulator
-  # buffers available for each MXU.
+  # 每个 MXU 可用的、形状为 (num_sublanes, mxu_column_size) 的
+  # 32 位累加器缓冲区数量。
   num_accumulators: int
   vmem_capacity_bytes: int
   cmem_capacity_bytes: int
@@ -192,16 +199,16 @@ class TpuInfo:
 
   @property
   def is_split_chip(self) -> bool:
-    """Returns True if the chip is a multi-core chip being used in single-core mode.
+    """若芯片是多核芯片但以单核模式使用，则返回 True。
 
-    Some TPU generations (e.g. v4, v5p) have multiple TensorCores per chip.
-    These chips can be used in two modes:
-    1. "Megacore" mode, where the cores are combined into a single logical
-    device (if supported).
-    2. "Split" mode, where each core is treated as an independent logical
-    device.
+    某些 TPU 代次（例如 v4、v5p）每块芯片上有多个 TensorCore。
+    这些芯片可以工作在两种模式下：
+    1. `Megacore` 模式，即把多个核心合并成单个逻辑
+    设备（若支持）。
+    2. `split` 模式，即把每个核心视为独立的逻辑
+    设备。
 
-    This property returns True if the chip is in "split" mode (case 2).
+    若芯片处于 `split` 模式（情况 2），该属性返回 True。
     """
     return self.num_cores == 1 and (
         cast(ChipVersion, self.chip_version).num_physical_tensor_cores_per_chip
@@ -210,10 +217,10 @@ class TpuInfo:
 
   @property
   def is_megacore(self) -> bool:
-    """Returns True if the chip is configured in Megacore mode.
+    """若芯片被配置为 Megacore 模式，则返回 True。
 
-    Megacore mode means the two physical TensorCores are combined into a single
-    logical device.
+    Megacore 模式意味着两个物理 TensorCore 被合并成单个
+    逻辑设备。
     """
     return self.num_cores > 1
 
@@ -222,7 +229,7 @@ class TpuInfo:
       lhs_dtype: dtypes.DTypeLike,
       rhs_dtype: dtypes.DTypeLike,
   ) -> bool:
-    """Returns whether the chip natively supports matmul on the given input dtypes (no casting needed)."""
+    """返回该芯片是否原生支持给定输入数据类型上的 matmul（无需类型转换）。"""
     lhs_dtype = dtypes.dtype(lhs_dtype)
     rhs_dtype = dtypes.dtype(rhs_dtype)
 
@@ -265,7 +272,7 @@ class TpuInfo:
             and rhs_dtype in (F8E5M2, F8E4M3FN, U4, S4)
         )
       case ChipVersion.TPU_8T:
-        # TODO: b/543848756 - add the remaining dtypes.
+        # TODO: b/543848756 - 补充其余的数据类型。
         return (lhs_dtype in (F32, BF16) and rhs_dtype in (F32, BF16, S4)) or (
             lhs_dtype in (F32, BF16, F8E5M2, F8E4M3FN)
             and rhs_dtype in (F8E5M2, F8E4M3FN, S4)
@@ -274,21 +281,20 @@ class TpuInfo:
         return False
 
   def get_sublane_tiling(self, dtype: dtypes.DType) -> int:
-    """Returns the sublane tiling for the given itemsize.
+    """返回给定 itemsize 的 sublane 分块（tiling）。
 
-    Note that this is a heurustic and depends on the settings of the XLA flags.
+    注意这是一个启发式规则，取决于 XLA flag 的设置。
     """
     bitwidth = dtypes.itemsize_bits(dtype)
     if self.generation < 7:
-      # Caveat: before TPU7x, by default XLA does not use large 2nd minor tiling
-      # but it can be enabled by setting the flag
-      # xla_tpu_enable_large_2nd_minor_layout_for_x16.
+      # 注意：在 TPU7x 之前，XLA 默认不启用大 2nd minor 分块，但可以通过设置
+      # flag `xla_tpu_enable_large_2nd_minor_layout_for_x16` 来启用。
       if bitwidth == 16 or bitwidth == 32:
         return self.num_sublanes
       else:
-        # Large 2nd minor tiling is enabled for other types.
+        # 其他类型则启用大 2nd minor 分块。
         return self.num_sublanes * (32 // bitwidth)
-    # XLA allows large 2nd minor tiling by default starting with TPU7x.
+    # 从 TPU7x 开始，XLA 默认允许大 2nd minor 分块。
     if self.generation == 7 or self.generation == 8:
       return self.num_sublanes * (32 // bitwidth)
     raise NotImplementedError("TPU generation is not supported")
@@ -302,17 +308,17 @@ registry: dict[str, Callable[[], TpuInfo]] = {}
 
 
 def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
-  """Returns the TPU hardware info for the given chip version and core count.
+  """返回给定芯片版本与核心数下的 TPU 硬件信息。
 
-  Note that all information is *per-TensorCore* so you would need to multiply by
-  `num_cores` to obtain the total for the chip.
+  注意：这里的所有信息都是*按 TensorCore 计*的，需要乘以 `num_cores`
+  才能得到整块芯片的总量。
 
   Args:
-    chip_version: The TPU chip version.
-    num_cores: The number of TensorCores per chip for this configuration. This
-      is influenced by the TPU version and whether Megacore is enabled.
+    chip_version: TPU 芯片版本。
+    num_cores: 该配置下每块芯片的 TensorCore 数量。它受
+      TPU 版本以及是否启用 Megacore 的影响。
   """
-  # Common parameters for all TensorCores
+  # 所有 TensorCore 共用的参数
   NUM_LANES = 128
   NUM_SUBLANES = 8
   MXU_COLUMN_SIZE_GEN_LT_6 = 128
@@ -328,16 +334,16 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           num_sublanes=NUM_SUBLANES,
           mxu_column_size=MXU_COLUMN_SIZE_GEN_LT_6,
           num_mxus=1,
-          num_accumulators=0,  # Not Available
-          vmem_capacity_bytes=16 * 1024 * 1024,  # 16 MiB per core
+          num_accumulators=0,  # 不可用
+          vmem_capacity_bytes=16 * 1024 * 1024,  # 每个核心 16 MiB
           cmem_capacity_bytes=0,
-          smem_capacity_bytes=16 * 1024,  # 16 KiB per core
+          smem_capacity_bytes=16 * 1024,  # 每个核心 16 KiB
           hbm_capacity_bytes=int(16_000_000_000 // tensor_cores_per_chip),
           mem_bw_bytes_per_second=int(7.16e11 // tensor_cores_per_chip),
           bf16_ops_per_second=int(4.6e13 // tensor_cores_per_chip),
-          int8_ops_per_second=0,  # Not Available
-          fp8_ops_per_second=0,  # Not Available
-          int4_ops_per_second=0,  # Not Available
+          int8_ops_per_second=0,  # 不可用
+          fp8_ops_per_second=0,  # 不可用
+          int4_ops_per_second=0,  # 不可用
       )
     case ChipVersion.TPU_V3:
       return TpuInfo(
@@ -348,16 +354,16 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           num_sublanes=NUM_SUBLANES,
           mxu_column_size=MXU_COLUMN_SIZE_GEN_LT_6,
           num_mxus=2,
-          num_accumulators=0,  # Not Available
-          vmem_capacity_bytes=16 * 1024 * 1024,  # 16 MiB per core
+          num_accumulators=0,  # 不可用
+          vmem_capacity_bytes=16 * 1024 * 1024,  # 每个核心 16 MiB
           cmem_capacity_bytes=0,
-          smem_capacity_bytes=16 * 1024,  # 16 KiB per core
+          smem_capacity_bytes=16 * 1024,  # 每个核心 16 KiB
           hbm_capacity_bytes=34_400_000_000 // tensor_cores_per_chip,
           mem_bw_bytes_per_second=int(8.25e11 // tensor_cores_per_chip),
           bf16_ops_per_second=int(1.40e14 // tensor_cores_per_chip),
-          int8_ops_per_second=0,  # Not Available
-          fp8_ops_per_second=0,  # Not Available
-          int4_ops_per_second=0,  # Not Available
+          int8_ops_per_second=0,  # 不可用
+          fp8_ops_per_second=0,  # 不可用
+          int4_ops_per_second=0,  # 不可用
       )
     case ChipVersion.TPU_V4I:
       return TpuInfo(
@@ -368,16 +374,16 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           num_sublanes=NUM_SUBLANES,
           mxu_column_size=MXU_COLUMN_SIZE_GEN_LT_6,
           num_mxus=4,
-          num_accumulators=0,  # Not Available
-          vmem_capacity_bytes=16 * 1024 * 1024,  # 16 MiB per core
+          num_accumulators=0,  # 不可用
+          vmem_capacity_bytes=16 * 1024 * 1024,  # 每个核心 16 MiB
           cmem_capacity_bytes=134_000_000,
-          smem_capacity_bytes=1024 * 1024,  # 1 MiB per core
+          smem_capacity_bytes=1024 * 1024,  # 每个核心 1 MiB
           hbm_capacity_bytes=8_590_000_000,
           mem_bw_bytes_per_second=int(6.14e11),
           bf16_ops_per_second=int(1.37e14),
-          int8_ops_per_second=0,  # Not Available
-          fp8_ops_per_second=0,  # Not Available
-          int4_ops_per_second=0,  # Not Available
+          int8_ops_per_second=0,  # 不可用
+          fp8_ops_per_second=0,  # 不可用
+          int4_ops_per_second=0,  # 不可用
       )
     case ChipVersion.TPU_V4:
       return TpuInfo(
@@ -388,16 +394,16 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           num_sublanes=NUM_SUBLANES,
           mxu_column_size=MXU_COLUMN_SIZE_GEN_LT_6,
           num_mxus=4,
-          num_accumulators=0,  # Not Available
-          vmem_capacity_bytes=16 * 1024 * 1024,  # 16 MiB per core
+          num_accumulators=0,  # 不可用
+          vmem_capacity_bytes=16 * 1024 * 1024,  # 每个核心 16 MiB
           cmem_capacity_bytes=134_000_000 // tensor_cores_per_chip,
-          smem_capacity_bytes=1024 * 1024,  # 1 MiB per core
+          smem_capacity_bytes=1024 * 1024,  # 每个核心 1 MiB
           hbm_capacity_bytes=34_400_000_000 // tensor_cores_per_chip,
           mem_bw_bytes_per_second=int(1.23e12 // tensor_cores_per_chip),
           bf16_ops_per_second=int(2.75e14 // tensor_cores_per_chip),
-          int8_ops_per_second=0,  # Not Available
-          fp8_ops_per_second=0,  # Not Available
-          int4_ops_per_second=0,  # Not Available
+          int8_ops_per_second=0,  # 不可用
+          fp8_ops_per_second=0,  # 不可用
+          int4_ops_per_second=0,  # 不可用
       )
     case ChipVersion.TPU_V5E:
       return TpuInfo(
@@ -408,15 +414,15 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           num_sublanes=NUM_SUBLANES,
           mxu_column_size=MXU_COLUMN_SIZE_GEN_LT_6,
           num_mxus=4,
-          num_accumulators=0,  # Not Available
-          vmem_capacity_bytes=128 * 1024 * 1024,  # 128 MiB per core
+          num_accumulators=0,  # 不可用
+          vmem_capacity_bytes=128 * 1024 * 1024,  # 每个核心 128 MiB
           cmem_capacity_bytes=0,
-          smem_capacity_bytes=1024 * 1024,  # 1 MiB per core
+          smem_capacity_bytes=1024 * 1024,  # 每个核心 1 MiB
           hbm_capacity_bytes=17_200_000_000,
           mem_bw_bytes_per_second=int(8.20e11),
           bf16_ops_per_second=int(1.97e14),
           int8_ops_per_second=int(3.94e14),
-          fp8_ops_per_second=0,  # Not Available
+          fp8_ops_per_second=0,  # 不可用
           int4_ops_per_second=int(7.88e14),
       )
     case ChipVersion.TPU_V5P:
@@ -428,21 +434,21 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           num_sublanes=NUM_SUBLANES,
           mxu_column_size=MXU_COLUMN_SIZE_GEN_LT_6,
           num_mxus=4,
-          num_accumulators=0,  # Not Available
-          vmem_capacity_bytes=64 * 1024 * 1024,  # 64 MiB per core
+          num_accumulators=0,  # 不可用
+          vmem_capacity_bytes=64 * 1024 * 1024,  # 每个核心 64 MiB
           cmem_capacity_bytes=0,
-          smem_capacity_bytes=1024 * 1024,  # 1 MiB per core
+          smem_capacity_bytes=1024 * 1024,  # 每个核心 1 MiB
           hbm_capacity_bytes=103_000_000_000 // tensor_cores_per_chip,
           mem_bw_bytes_per_second=int(2.46e12 // tensor_cores_per_chip),
           bf16_ops_per_second=int(4.59e14 // tensor_cores_per_chip),
           int8_ops_per_second=int(9.18e14 // tensor_cores_per_chip),
-          fp8_ops_per_second=0,  # Not Available
+          fp8_ops_per_second=0,  # 不可用
           int4_ops_per_second=int(1.84e15 // tensor_cores_per_chip),
           sparse_core=SparseCoreInfo(
               num_cores=4,
               num_subcores=16,
               num_lanes=8,
-              vmem_capacity_bytes=512 * 1024,  # 512 KiB per vector subcore
+              vmem_capacity_bytes=512 * 1024,  # 每个向量 subcore 512 KiB
               dma_granule_size_bytes=32,
           ),
       )
@@ -455,10 +461,10 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           num_sublanes=NUM_SUBLANES,
           mxu_column_size=MXU_COLUMN_SIZE_GEN_GE_6,
           num_mxus=2,
-          num_accumulators=0,  # Not Available
-          vmem_capacity_bytes=128 * 1024 * 1024,  # 128 MiB per core
+          num_accumulators=0,  # 不可用
+          vmem_capacity_bytes=128 * 1024 * 1024,  # 每个核心 128 MiB
           cmem_capacity_bytes=0,
-          smem_capacity_bytes=1024 * 1024,  # 1 MiB per core
+          smem_capacity_bytes=1024 * 1024,  # 每个核心 1 MiB
           hbm_capacity_bytes=34_400_000_000,
           mem_bw_bytes_per_second=int(1.64e12),
           bf16_ops_per_second=int(9.20e14),
@@ -469,7 +475,7 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
               num_cores=2,
               num_subcores=16,
               num_lanes=8,
-              vmem_capacity_bytes=256 * 1024,  # 256 KiB per vector subcore
+              vmem_capacity_bytes=256 * 1024,  # 每个向量 subcore 256 KiB
               dma_granule_size_bytes=32,
           ),
       )
@@ -483,20 +489,20 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           mxu_column_size=256,
           num_mxus=2,
           num_accumulators=128,
-          vmem_capacity_bytes=64 * 1024 * 1024,  # 64 MiB per core
+          vmem_capacity_bytes=64 * 1024 * 1024,  # 每个核心 64 MiB
           cmem_capacity_bytes=0,
-          smem_capacity_bytes=1024 * 1024,  # 1 MiB per core
+          smem_capacity_bytes=1024 * 1024,  # 每个核心 1 MiB
           hbm_capacity_bytes=206_000_000_000 // tensor_cores_per_chip,
           mem_bw_bytes_per_second=int(7.40e12 // tensor_cores_per_chip),
           bf16_ops_per_second=int(2.31e15 // tensor_cores_per_chip),
-          int8_ops_per_second=0,  # Not Available
+          int8_ops_per_second=0,  # 不可用
           fp8_ops_per_second=int(4.60e15 // tensor_cores_per_chip),
-          int4_ops_per_second=0,  # Not Available
+          int4_ops_per_second=0,  # 不可用
           sparse_core=SparseCoreInfo(
               num_cores=2,
               num_subcores=16,
               num_lanes=16,
-              vmem_capacity_bytes=512 * 1024,  # 512 KiB per vector subcore
+              vmem_capacity_bytes=512 * 1024,  # 每个向量 subcore 512 KiB
               dma_granule_size_bytes=32,
           ),
       )
@@ -510,20 +516,20 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           mxu_column_size=256,
           num_mxus=2,
           num_accumulators=256,
-          vmem_capacity_bytes=192 * 1024 * 1024,  # 192 MiB per core
+          vmem_capacity_bytes=192 * 1024 * 1024,  # 每个核心 192 MiB
           cmem_capacity_bytes=0,
-          smem_capacity_bytes=1024 * 1024,  # 1 MiB per core
+          smem_capacity_bytes=1024 * 1024,  # 每个核心 1 MiB
           hbm_capacity_bytes=309_000_000_000 // tensor_cores_per_chip,
           mem_bw_bytes_per_second=int(8.60e12 // tensor_cores_per_chip),
           bf16_ops_per_second=int(1.101e15 // tensor_cores_per_chip),
-          int8_ops_per_second=0,  # Not Available
+          int8_ops_per_second=0,  # 不可用
           fp8_ops_per_second=int(8.808e15 // tensor_cores_per_chip),
-          int4_ops_per_second=0,  # Not Available
+          int4_ops_per_second=0,  # 不可用
           sparse_core=SparseCoreInfo(
               num_cores=1,
               num_subcores=4,
               num_lanes=16,
-              vmem_capacity_bytes=512 * 1024,  # 512 KiB per vector subcore
+              vmem_capacity_bytes=512 * 1024,  # 每个向量 subcore 512 KiB
               dma_granule_size_bytes=64,
           ),
       )
@@ -536,10 +542,10 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
           num_sublanes=16,
           mxu_column_size=256,
           num_mxus=2,
-          num_accumulators=256,  #  Need to confirm
-          vmem_capacity_bytes=128 * 1024 * 1024,  # 128 MiB per core
+          num_accumulators=256,  #  待确认
+          vmem_capacity_bytes=128 * 1024 * 1024,  # 每个核心 128 MiB
           cmem_capacity_bytes=0,
-          smem_capacity_bytes=1024 * 1024,  # 1 MiB per core
+          smem_capacity_bytes=1024 * 1024,  # 每个核心 1 MiB
           hbm_capacity_bytes=231_000_000_000 // tensor_cores_per_chip,
           mem_bw_bytes_per_second=int(6.4e12 // tensor_cores_per_chip),
           bf16_ops_per_second=int(0.9961e15 // tensor_cores_per_chip),
@@ -550,7 +556,7 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
               num_cores=2,
               num_subcores=16,
               num_lanes=16,
-              vmem_capacity_bytes=256 * 1024,  # 256 KiB per vector subcore
+              vmem_capacity_bytes=256 * 1024,  # 每个向量 subcore 256 KiB
               dma_granule_size_bytes=64,
           ),
       )
@@ -560,10 +566,10 @@ def _get_tpu_info_impl(chip_version: ChipVersion, num_cores: int) -> TpuInfo:
 
 @jax_util.cache(trace_context_in_key=True)
 def get_tpu_info() -> TpuInfo:
-  """Returns the TPU hardware info for the current device.
+  """返回当前设备的 TPU 硬件信息。
 
-  Note that all information is *per-TensorCore* so you would need to multiply by
-  `num_cores` to obtain the total for the chip.
+  注意：这里的所有信息都是*按 TensorCore 计*的，需要乘以 `num_cores`
+  才能得到整块芯片的总量。
   """
   device_kind = get_device_kind()
   chip_version = chip_version_from_device_kind(device_kind)
@@ -583,19 +589,19 @@ def get_tpu_info() -> TpuInfo:
 def get_tpu_info_for_chip(
     chip_version: ChipVersion, num_tensor_cores_per_logical_device: int
 ) -> TpuInfo:
-  """Returns the TPU hardware info for the given TPU chip version.
+  """返回给定 TPU 芯片版本的 TPU 硬件信息。
 
-  Note that all information is *per-TensorCore* so you would need to multiply by
-  `num_tensor_cores_per_logical_device` to obtain the total for the chip.
+  注意：这里的所有信息都是*按 TensorCore 计*的，需要乘以
+  `num_tensor_cores_per_logical_device` 才能得到整块芯片的总量。
 
   Args:
-    chip_version: The TPU chip version.
-    num_tensor_cores_per_logical_device: The number of TensorCores per logical
-      device in the requested configuration. Should be 1 for single-core chips
-      (TPU_V4I, TPU_V5E, TPU_V6E). For dual-core chips that support Megacore
-      (TPU_V4, TPU_V5P), this can be 2 (Megacore mode) or 1 (split mode). For
-      dual-core chips that do not support Megacore (TPU_V2, TPU_V3, TPU_7X),
-      this must be 1.
+    chip_version: TPU 芯片版本。
+    num_tensor_cores_per_logical_device: 请求的配置下每个逻辑设备上的
+      TensorCore 数量。对单核芯片（TPU_V4I、TPU_V5E、TPU_V6E），
+      该值应为 1。对支持 Megacore 的双核芯片（TPU_V4、TPU_V5P），
+      该值可以是 2（Megacore 模式）或 1（split 模式）。对不支持
+      Megacore 的双核芯片（TPU_V2、TPU_V3、TPU_7X），该值必须
+      为 1。
   """
   if (
       chip_version.is_lite
@@ -618,15 +624,15 @@ def get_tpu_info_for_chip(
   return _get_tpu_info_impl(chip_version, num_tensor_cores_per_logical_device)
 
 
-# TODO(sharadmv): Generalize Tiling to capture the various options
-# (compact 2nd minor, large 2nd minor, regular tiling)
+# TODO(sharadmv): 泛化 Tiling 以覆盖各种选项
+# （compact 2nd minor、large 2nd minor、常规分块）
 class Tiling(enum.Enum):
   COMPACT = enum.auto()
   SPARSE_CORE = enum.auto()
 
   @property
   def shape(self) -> tuple[int, ...]:
-    # TODO(slebedev): Use ``get_tpu_info()`` instead of hardcoding the values.
+    # TODO(slebedev): 使用 ``get_tpu_info()`` 而不是硬编码这些值。
     match self:
       case Tiling.COMPACT:
         return (8, 128)
@@ -635,7 +641,7 @@ class Tiling(enum.Enum):
 
 
 def _get_tiling_factor(src: int, max_tiling: int, packing: int) -> int:
-  # This roughly mirrors ``getTilingFactor`` in infer-memref-layout.
+  # 这大致对应 infer-memref-layout 中的 ``getTilingFactor``。
   tpu_generation = get_tpu_info().generation
   tiling = (1 + int(tpu_generation < 4)) * packing
   while tiling < min(src, max_tiling):
@@ -646,15 +652,15 @@ def _get_tiling_factor(src: int, max_tiling: int, packing: int) -> int:
 def infer_tiling(
     ty: jax_core.AbstractValue, tiling: Tiling | None = None
 ) -> tuple[int | None, ...]:
-  """Compute a tiling for the given shape and type.
+  """为给定的形状与类型计算分块（tiling）。
 
-  For an n-dimensional shape, returns the tiling for the last
-  ``len(tiling.shape)`` dimensions and 1 for the leading dims. For example:
-  - 2D tiling: (256, 256) -> (8, 128) and (2, 3, 128, 128) -> (1, 1, 8, 128).
-  - 1D tiling: (16,) -> (8,) and (2, 3, 8) -> (1, 1, 8).
+  对于 n 维形状，返回最后 ``len(tiling.shape)`` 个维度的分块，
+  前导维度返回 1。例如：
+  - 2D 分块：(256, 256) -> (8, 128)，(2, 3, 128, 128) -> (1, 1, 8, 128)。
+  - 1D 分块：(16,) -> (8,)，(2, 3, 8) -> (1, 1, 8)。
 
-  Types are not required to have a dtype, so for such types we return None for
-  all dimensions because their tiling is unknown.
+  类型不要求带有 dtype，因此对这类类型，由于分块未知，
+  我们对所有维度都返回 None。
   """
   assert hasattr(ty, "shape")
   shape = ty.shape

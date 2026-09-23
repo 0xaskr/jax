@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# 文件职责：提供 `FlatTree`——用 Python 面向对象方式编码 pytree 结构的内部函子。
+# JAX 的暂存与追踪机制（`partial_eval`、`ad`、`stages`、`interpreters/mlir`、
+# `interpreters/remat`、Pallas 等）靠它把「扁平叶子序列 + 树结构」表示成代数数据类型，
+# 每个分支对应一个子类：元组、pytree、单例、静态项、过滤项、字典。
+# 核心操作包括 map/update/unzip2/unpack/filter/unfilter/unflatten，
+# 以及 pack/flatten/statics_mask 等按静态与动态拆分参数并打包的辅助函数。
+
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -27,20 +35,20 @@ map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
 
 class FlatTree:
-  """FlatTree is a Python OOP version of this functor. Each case is implemented
-  as a subclass of FlatTree and the fixed set of pattern-matching operations
-  is handled via subclasses implementing methods.
+  """`FlatTree` 是这个函子的 Python 面向对象版本。
+  每个分支都实现为 `FlatTree` 的一个子类，
+  固定的那组模式匹配操作则由子类实现的方法来承担。
 
     data FlatTree a = Tuple [FlatTree a]
                     | Pytree [a] PyTreeDef
                     | Singleton a
                     | Static Aux
                     | Filtered (FlatTree (Either a Aux))
-                    -- TODO: remove this case
+                    -- TODO: 移除这个分支
                     | Dict [Key] [FlatTree a]
   """
 
-  # === Each subclass (ADT case) should implement these ===
+  # === 每个子类（ADT 分支）都应实现以下方法 ===
   def __init__(self, *a, **k): assert False, f"subclass {self.__class__} should implement"
   def __len__(self):           assert False, f"subclass {self.__class__} should implement"
   def __eq__(self, other):     assert False, f"subclass {self.__class__} should implement"
@@ -50,7 +58,7 @@ class FlatTree:
   @property
   def tree(self) -> PyTreeDef: assert False, f"subclass {self.__class__} should implement"
 
-  # === Derived methods ===
+  # === 派生方法 ===
   def map2(self: FlatTree, t2: Sequence[Any], f: Callable) -> FlatTree:
     n = len(self)
     assert len(t2) == n
@@ -86,8 +94,8 @@ class FlatTree:
     if isinstance(self, FTTuple):
       return self.elts
     elif isinstance(self, FTPyTree):
-      # TODO: we should be able to get rid of this case by ensuring that
-      # we always have FTTuple on the output of tuple-returning HOPs.
+      # TODO: 我们应当能够去掉这个分支，办法是保证返回元组的高阶原语
+      # 其输出上总是带有 FTTuple。
       treedefs = treedef_children(self.tree)
       valss = split_list_checked(self.xs, [t.num_leaves for t in treedefs])
       return tuple(FTPyTree(vals, treedef) for vals, treedef in zip(valss, treedefs))
@@ -128,13 +136,13 @@ class FlatTree:
 
   @cached_property
   def paths(self) -> FlatTree:
-    # TODO(dougalm): find a way to do this without roundtripping
+    # TODO(dougalm): 找一个不用来回转换就能做到这件事的办法
     try:
       paths, _ = unzip2(tracing_registry.flatten_with_path(self.unflatten())[0])
       assert len(paths) == len(self.vals)
       return self.update(paths)
     except:
-      return self.update([()] * len(self.vals))  # not our fault
+      return self.update([()] * len(self.vals))  # 不是我们的问题
 
   @cached_property
   def vals(self):
@@ -149,12 +157,12 @@ class FlatTree:
     return self.vals[i]
 
   def filter(self, f):
-    # a FlatTree version of list.filter. Unlike the latter, it keeps
-    # the filtered-out data in the pytree structure, so that it can
-    # be reinstantiated with `unfilter`.
+    # `list.filter` 的 FlatTree 版本。与后者不同，
+    # 它把被过滤掉的数据保留在 pytree 结构中，
+    # 以便之后能用 `unfilter` 重新实例化。
     return self.filter_with_mask(map(f, self))
 
-  # True means keep
+  # True 表示保留
   def filter_with_mask(self, mask):
     return ft_filtered(self.map2(mask,
         lambda x, kept: Either.right(x) if kept else Either.left(x)))
@@ -170,10 +178,10 @@ class FlatTree:
   def enumerate(self):
     idxs = it.count()
     return self.map(lambda x: (next(idxs), x))
-  # TODO: add other helpers like map3, zip, unzip3 etc. as needed
+  # TODO: 按需补充 map3、zip、unzip3 之类的其他辅助方法
 
 class FTTuple(FlatTree):
-  # TODO: revise this away. We shouldn't need to get treedef from FlatTrees
+  # TODO: 改掉这个做法。我们不应该从 FlatTree 里取 treedef
   @property
   def tree(self):
     return treedef_tuple_tracing_registry(t.tree for t in self.elts)
@@ -189,22 +197,22 @@ class FTTuple(FlatTree):
   def __repr__(self): return repr(self.elts)
   def map(self, f): return FTTuple(*(elt.map(f) for elt in self.elts))
 
-# TODO(dougalm): delete this case
+# TODO(dougalm): 删掉这个分支
 class FTDict(FlatTree):
-  # TODO: revise this away
+  # TODO: 改掉这个做法
   @property
   def tree(self):
-    # We have to roundtrip because there's no dict analog of "treedef_tuple"
+    # 我们必须来回转换，因为不存在与 `treedef_tuple` 对应的字典版本
     _, t = tracing_registry.flatten(self.update([0] * len(self)).unflatten())
     return t
 
-  # keys should be sorted
+  # keys 应当是排好序的
   def __init__(self, keys, vals):
     keys = keys if type(keys) is tuple else tuple(keys)
     assert all(isinstance(v, FlatTree) for v in vals)
     vals = vals if type(vals) is tuple else tuple(vals)
     self.keys = keys
-    self._vals = vals  # underscore to avoid collision with FlatTree.vals
+    self._vals = vals  # 加下划线以避免与 FlatTree.vals 冲突
   def __len__(self): return sum(len(val) for val in self._vals)
   def __eq__(self, other):
     return (isinstance(other, FTDict) and
@@ -250,13 +258,13 @@ class FTStatic(FlatTree):
   def __eq__(self, other):
     return (
         isinstance(other, FTStatic) and
-        type(self.val) is type(other.val) and  # see https://github.com/jax-ml/jax/pull/9311
+        type(self.val) is type(other.val) and  # 参见 https://github.com/jax-ml/jax/pull/9311
         self.val == other.val)
   def __hash__(self): return hash(self.val)
   def __repr__(self): return f"Static({self.val})"
   def map(self, f): return self
   @property
-  def tree(self): return tracing_registry.flatten(0)[1]  # leaf treedef
+  def tree(self): return tracing_registry.flatten(0)[1]  # 叶子的 treedef
 
 class FTFiltered(FlatTree):
   # Filtered (FlatTree (Either Aux a))
@@ -277,8 +285,8 @@ class FTFiltered(FlatTree):
     return FTFiltered(self.val.map(apply_f_to_rights))
 
 def pack(tree):
-  # We could generalize this to arbitrary pytrees of FlatTree but tuples/dicts
-  # are sufficient for now.
+  # 我们本可以把它推广到 `FlatTree` 的任意 pytree，但目前
+  # 元组与字典已经够用了。
   if isinstance(tree, FlatTree):
     return tree
   elif isinstance(tree, tuple):
@@ -290,7 +298,7 @@ def pack(tree):
     assert False, type(tree)
 
 def pack_args(*args, **kwargs):
-  # TODO: check elements of args and kwargs are all flat trees
+  # TODO: 检查 args 与 kwargs 的元素是否都是扁平树
   return pack((args, kwargs))
 
 def flatten(tree: PyTree, is_leaf=None, registry=tracing_registry) -> FlatTree:
@@ -301,7 +309,7 @@ def flatten_args(*arg_trees: PyTree, registry=tracing_registry) -> FlatTree:
   arg_fts = tuple(flatten(t, registry=registry) for t in arg_trees)
   return pack((arg_fts, {}))
 
-# statics to the Left, dynamics to the Right
+# 静态项放左边，动态项放右边
 def statics_mask(args: PyArgs, static_argnums, static_argnames):
   num_args = len(args.args)
   static_argnums = [i % num_args if i < 0 else i for i in static_argnums]
@@ -318,7 +326,7 @@ def flatten_static_argnums_argnames(
           FTStatic(x) if is_static else flatten(x, registry=registry))
   return pack((fts.args, fts.kwargs))
 
-# TODO: this sucks. revise it away by using FlatTree in pjit instead of treedef.
+# TODO: 这个设计很糟糕。改成在 pjit 里用 FlatTree 代替 treedef 就能把它删掉。
 def flatten_static_argnums_argnames_and_return_various_trees(
     args, kwargs, static_argnums, static_argnames):
   registry = tracing_registry
@@ -335,7 +343,7 @@ def flatten_static_argnums_argnames_and_return_various_trees(
   return ans_ft, tree_nones, tree_filtered
 
 def flatten_list(xs):
-  # [a] -> FlatTree[a] . Treats list elements as leaves.
+  # [a] -> FlatTree[a]。把列表元素当作叶子。
   return pack(tuple(FTSingleton(x) for x in xs))
 
 def nones(n):

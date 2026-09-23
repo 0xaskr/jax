@@ -11,10 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# 文件职责：为 JAX 提供 Wadler-Lindig 风格的文档美化打印（pretty printing）组合子。
+# 这些原语（`text`、`concat`、`brk`、`group`、`nest`、`color`、`source_map` 等）
+# 是打印 jaxpr、HLO 等 IR 的底层设施：调用方先构造 `Doc` 文档树，再用 `format`
+# 以指定宽度渲染为字符串，必要时附加 ANSI 颜色和“输出区域到来源”的映射。
+# 真正的排版算法由 C++ 扩展 `_pretty_printer` 实现，这里只是它的 Python 包装层，
+# 并通过 `use_cpp_class` / `use_cpp_method` 让 `Doc` 与 C++ 类型互操作。
 #
-# Wadler-Lindig pretty printer.
+# Wadler-Lindig 美化打印器。
 #
-# References:
+# 参考文献：
 # Wadler, P., 1998. A prettier printer. Journal of Functional Programming,
 # pp.223-244.
 #
@@ -45,18 +52,18 @@ _PPRINT_USE_COLOR = config.bool_state(
 
 def _can_use_color() -> bool:
   try:
-    # Check if we're in IPython or Colab
+    # 检查是否处于 IPython 或 Colab 环境
     ipython = get_ipython()  # pyrefly: ignore[unknown-name]
     shell = ipython.__class__.__name__
     if shell == "ZMQInteractiveShell":
       # Jupyter Notebook
       return True
     elif "colab" in str(ipython.__class__):
-      # Google Colab (external or internal)
+      # Google Colab（外部或内部）
       return True
   except NameError:
     pass
-  # Otherwise check if we're in a terminal
+  # 否则检查是否处于终端环境
   return hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
 
 CAN_USE_COLOR = _can_use_color()
@@ -104,13 +111,13 @@ class Doc:
       annotation_prefix: str = " # ",
       source_map: list[list[tuple[int, int, Any]]] | None = None,
   ) -> str:
-    """Formats a pretty-printer document as a string.
+    """把美化打印器的文档格式化为字符串。
 
     Args:
 
-    source_map: for each line in the output, contains a list of
-      (start column, end column, source) tuples. Each tuple associates a
-      region of output text with a source.
+    source_map: 对输出中的每一行，包含一个
+      (起始列, 结束列, 来源) 元组列表。每个元组把一段
+      输出文本与一个来源关联起来。
     """
     if use_color is None:
       use_color = CAN_USE_COLOR and _PPRINT_USE_COLOR.value
@@ -128,7 +135,7 @@ class Doc:
 
 
 def nil() -> Doc:
-  """An empty document."""
+  """空文档。"""
   return _pretty_printer.nil()  # pyrefly: ignore[bad-return]
 
 
@@ -138,44 +145,44 @@ def text(
     anchor: str | None = None,
     href: str | None = None,
 ) -> Doc:
-  """Literal text.
+  """字面文本。
 
   Args:
-    text: The text content to be printed.
-    annotation: Optional annotation for the text.
-    anchor: Optional HTML anchor ID for this text. When formatted as HTML,
-      wraps the text in an <a id="..."> tag.
-    href: Optional HTML href for this text. When formatted as HTML,
-      wraps the text in an <a href="..."> tag.
+    text: 要打印的文本内容。
+    annotation: 该文本的可选注解。
+    anchor: 该文本可选的 HTML 锚点 ID。以 HTML 格式输出时，
+      会把文本包裹在 <a id="..."> 标签中。
+    href: 该文本可选的 HTML href。以 HTML 格式输出时，
+      会把文本包裹在 <a href="..."> 标签中。
   """
   return _pretty_printer.text(text, annotation, anchor, href)  # pyrefly: ignore[bad-return]
 
 
 def concat(children: Sequence[Doc]) -> Doc:
-  """Concatenation of documents."""
+  """文档的拼接。"""
   return _pretty_printer.concat(children)  # pyrefly: ignore[bad-argument-type, bad-return]
 
 
 def brk(text: str = " ") -> Doc:
-  """A break.
+  """一个换行点。
 
-  Prints either as a newline or as `text`, depending on the enclosing group.
+  根据所在分组的状态，打印为换行符或 `text`。
   """
   return _pretty_printer.brk(text)  # pyrefly: ignore[bad-return]
 
 
 def group(doc: Doc) -> Doc:
-  """Layout alternative groups.
+  """布局备选分组。
 
-  Prints the group with its breaks as their text (typically spaces) if the
-  entire group would fit on the line when printed that way. Otherwise, breaks
-  inside the group as printed as newlines.
+  如果整个分组按把换行点当作其文本（通常是空格）打印时能容纳在一行内，
+  则把这些换行点打印为各自的文本；否则，分组内部的换行点
+  打印为换行符。
   """
   return _pretty_printer.group(doc)  # pyrefly: ignore[bad-argument-type, bad-return]
 
 
 def nest(n: int, doc: Doc) -> Doc:
-  """Increases the indentation level by `n`."""
+  """把缩进层级增加 `n`。"""
   return _pretty_printer.nest(n, doc)  # pyrefly: ignore[bad-argument-type, bad-return]
 
 
@@ -185,22 +192,22 @@ def color(
     background: Color | None = None,
     intensity: Intensity | None = None,
 ) -> Doc:
-  """ANSI colors.
+  """ANSI 颜色。
 
-  Overrides the foreground/background/intensity of the text for the child doc.
-  Requires use_colors=True to be set when printing; otherwise does nothing.
+  覆盖子文档文本的前景色/背景色/强度。
+  打印时需要设置 use_colors=True，否则不起作用。
   """
   return _pretty_printer.color(child, foreground, background, intensity)  # pyrefly: ignore[bad-argument-type, bad-return]
 
 
 def source_map(doc: Doc, source: Any) -> Doc:
-  """Source mapping.
+  """来源映射。
 
-  A source map associates a region of the pretty-printer's text output with a
-  source location that produced it. For the purposes of the pretty printer a
-  ``source`` may be any object: we require only that we can compare sources for
-  equality. A text region to source object mapping can be populated as a side
-  output of the ``format`` method.
+  来源映射把美化打印器输出的某段文本与产生它的来源位置关联起来。
+  对美化打印器而言，``source`` 可以是任意对象：
+  我们只要求来源之间可以相互比较是否相等。
+  文本区域到来源对象的映射可以作为
+  ``format`` 方法的附带输出被填充。
   """
   return _pretty_printer.source_map(doc, source)  # pyrefly: ignore[bad-argument-type, bad-return]
 
@@ -211,7 +218,7 @@ keyword = partial(color, intensity=Intensity.BRIGHT, foreground=Color.BLUE)
 
 
 def join(sep: Doc, docs: Sequence[Doc]) -> Doc:
-  """Concatenates `docs`, separated by `sep`."""
+  """用 `sep` 分隔地拼接 `docs`。"""
   docs = list(docs)
   if len(docs) == 0:
     return nil()

@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 文件职责：用命名轴（mesh 轴名 + `PartitionSpec`）表达数组分片方式。
+# 中心是 `NamedSharding`，它把设备网格 `Mesh` 与 `PartitionSpec` 组合起来，
+# 并给出设备集合、地址可达设备、全复制/复制轴等属性，是 `jax.jit` 的
+# `in_shardings` / `out_shardings` 与 `jax.device_put` 等接口常用的分片类型。
+# 模块还负责下游表示转换：`NamedSharding` 转换为 XLA 的 `HloSharding`
+# （含手动/非规约轴与逻辑设备顺序）以及 shardy 的 `SdyArray`。
+# 校验函数检查 `PartitionSpec` 中的轴在 mesh 中唯一存在且类型合法。
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -45,19 +53,17 @@ UNSPECIFIED = UnspecifiedValue()
 MeshAxisName = Any
 
 """
-ArrayMapping specifies how an ndarray should map to mesh axes.
+ArrayMapping 规定了 ndarray 应该如何映射到 mesh 轴上。
 
-Note that the ordering is crucial for the cases when this mapping is non-injective
-(i.e. when multiple mesh axes map to the same positional axis). Then, the
-order of entries of the mapping determines a major-to-minor order on mesh axes,
-according to which chunks of the value along the repeated dimension will be assigned.
+注意：当该映射不是单射时（即多个 mesh 轴映射到同一个位置轴），
+条目的顺序至关重要。此时映射条目的顺序决定了 mesh 轴上从主到次
+的顺序，重复维度上的数据块会按这个顺序被分配。
 
-For example, consider a mapping {'x': 1, 'y': 1} and a mesh with shape {'x': 2, 'y': 3}.
-The second dimension of the value would get chunked into 6 pieces, and assigned to the
-mesh in a way that treats 'y' as the fastest changing (minor) dimension. In this case,
-that would mean that a flat list of chunks would get assigned to a flattened list of
-mesh devices without any modifications. If the mapping was {'y': 1, 'x': 1}, then the
-mesh devices ndarray would have to be transposed before flattening and assignment.
+例如，考虑映射 {'x': 1, 'y': 1} 以及形状为 {'x': 2, 'y': 3} 的 mesh。
+值的第二个维度会被切成 6 块，并按把 'y' 当作变化最快（次要）维度的
+方式分配到 mesh 上。在这种情况下，这意味着一维的数据块列表可以不加
+改动地分配给展平后的 mesh 设备列表。如果映射是 {'y': 1, 'x': 1}，
+则必须先对 mesh 设备组成的 ndarray 做转置，再进行展平和分配。
 """
 ArrayMapping = collections.OrderedDict[MeshAxisName, int]
 ArrayMappingOrAutoOrUnspecified = ArrayMapping | UnspecifiedValue
@@ -70,30 +76,27 @@ def _unpickle_named_sharding(mesh, spec, memory_kind, logical_device_ids):
 
 @use_cpp_class(xc.NamedSharding)
 class NamedSharding(jsharding.Sharding):
-  r"""A :class:`NamedSharding` expresses sharding using named axes.
+  r"""`NamedSharding` 用命名轴来表达分片。
 
-  A :class:`NamedSharding` is a pair of a :class:`Mesh` of devices and
-  :class:`PartitionSpec` which describes how to shard an array across that
-  mesh.
+  `NamedSharding` 由一对对象组成：设备组成的 `Mesh`，以及描述如何在该
+  mesh 上对一个数组做分片的 `PartitionSpec`。
 
-  A :class:`Mesh` is a multidimensional NumPy array of JAX devices,
-  where each axis of the mesh has a name, e.g. ``'x'`` or ``'y'``.
+  `Mesh` 是 JAX 设备组成的多维 NumPy 数组，其中 mesh 的每个轴都有一个
+  名字，例如 ``'x'`` 或 ``'y'``。
 
-  A :class:`PartitionSpec` is a tuple, whose elements can be a ``None``,
-  a mesh axis, or a tuple of mesh axes. Each element describes how an input
-  dimension is partitioned across zero or more mesh dimensions. For example,
-  ``PartitionSpec('x', 'y')`` says that the first dimension of data
-  is sharded across ``x`` axis of the mesh, and the second dimension is sharded
-  across ``y`` axis of the mesh.
+  `PartitionSpec` 是一个元组，其元素可以是 ``None``、一个 mesh 轴，
+  或者一个由 mesh 轴组成的元组。每个元素描述输入的某个维度如何被划分到
+  零个或多个 mesh 维度上。例如，``PartitionSpec('x', 'y')`` 表示数据的
+  第一个维度沿 mesh 的 ``x`` 轴分片，第二个维度沿 mesh 的 ``y`` 轴分片。
 
-  The `Distributed arrays and automatic parallelization`_
-  and `Explicit Sharding`_ tutorials have more details and diagrams that
-  explain how :class:`Mesh` and :class:`PartitionSpec` are used.
+  `Distributed arrays and automatic parallelization`_
+  与 `Explicit Sharding`_ 教程给出了更多细节和图示，
+  解释 `Mesh` 与 `PartitionSpec` 的用法。
 
   Args:
-    mesh: A :class:`jax.sharding.Mesh` object.
-    spec: A :class:`jax.sharding.PartitionSpec` object.
-    memory_kind: A string indicating the memory kind of the sharding.
+    mesh: 一个 :class:`jax.sharding.Mesh` 对象。
+    spec: 一个 :class:`jax.sharding.PartitionSpec` 对象。
+    memory_kind: 表示该分片的内存类型的字符串。
 
   Examples:
 
@@ -188,7 +191,7 @@ class NamedSharding(jsharding.Sharding):
     if isinstance(self.mesh, mesh_lib.AbstractMesh):
       raise ValueError('is_fully_addressable is not implemented for '
                        '`jax.sharding.AbstractMesh`.')
-    # return False if addressable_device_list is empty.
+    # 如果 addressable_device_list 为空则返回 False。
     return self._internal_device_list.is_fully_addressable
 
   @property
@@ -202,8 +205,8 @@ class NamedSharding(jsharding.Sharding):
     if isinstance(self.mesh, mesh_lib.AbstractMesh):
       raise ValueError('addressable_devices is not implemented for '
                        '`jax.sharding.AbstractMesh`.')
-    # Override addressable devices because there is a high chance that the mesh
-    # across multiple NamedSharding objects will be the same.
+    # 重写 addressable devices，因为多个 NamedSharding 对象
+    # 很可能共用同一个 mesh。
     return self.mesh._local_devices_set
 
   @functools.cached_property
@@ -251,11 +254,11 @@ class NamedSharding(jsharding.Sharding):
 
   def _to_sdy_sharding(self, num_dimensions: int,
                        modify_wrt_axis_types: bool = False) -> SdyArray:
-    """Lowers to shardy's representation of NamedSharding.
+    """降级为 shardy 对 NamedSharding 的表示。
 
-    When modify_wrt_axis_types=True, `Explicit` mesh axes are marked as
-    `replicated_axes` in `SdyArray` if they are unused in PartitionSpec.
-    This means that shardy cannot use these axes to shard any open dimensions.
+    当 modify_wrt_axis_types=True 时，`Explicit` 类型的 mesh 轴如果在
+    PartitionSpec 中未被使用，就会在 `SdyArray` 中被标记为
+    `replicated_axes`。这意味着 shardy 不能再用这些轴去分片任何开放的维度。
     """
     return named_sharding_to_sdy_sharding(self, num_dimensions,
                                           modify_wrt_axis_types)
@@ -317,7 +320,7 @@ def _get_axes(axes, mesh_shape):
   if not axes:
     return ()
   assert mesh_shape is not None
-  # Sort wrt mesh axis names so order is deterministic and doesn't hang in McJAX
+  # 按 mesh 轴名排序，使顺序确定，避免在 McJAX 中挂起
   return tuple(n for n, _ in mesh_shape if n in axes)
 
 
@@ -444,21 +447,21 @@ def named_sharding_to_xla_hlo_sharding(
       new_mesh_shape.append(size_by_type[ty])
       mesh_permutation.extend(axes)
 
-  # Explanation of the parameters of `HloSharding.iota_tile`.
-  # This is the HloShardingV2 format:
-  #   * dims: How many ways each dimension is sharded.
-  #       Replicated/Manual dims are added added at the end
-  #   * reshape_dims: This is the just the shape of the mesh.
-  #   * transpose_perm: This is the order in which mesh axes in PartitionSpec
-  #       appear relative to mesh.axis_names order.
-  #   * subgroup_types: List of type of OpSharding. Type can be REPLICATED and MANUAL.
-  # Let's see an example:
-  #   Consider input_shape=(8, 4, 2, 2), mesh={'a': 2, 'b': 2, 'c': 2, 'd': 2}
-  #   and partition_spec=P(None, ('d', 'b'), 'c').
-  #   Arguments to iota_tile will be:
-  #     dims = [1, 4, 2, 1, 2]  # 'a' is replicated hence `2` is at the end.
+  # `HloSharding.iota_tile` 各参数的含义说明。
+  # 这是 HloShardingV2 格式：
+  #   * dims：每个维度被分片成多少份。
+  #       复制/手动维度会被追加到末尾
+  #   * reshape_dims：就是 mesh 的形状。
+  #   * transpose_perm：PartitionSpec 中的 mesh 轴相对于 mesh.axis_names
+  #       顺序的出现次序。
+  #   * subgroup_types：OpSharding 类型的列表。类型可以是 REPLICATED 和 MANUAL。
+  # 来看一个例子：
+  #   考虑 input_shape=(8, 4, 2, 2)，mesh={'a': 2, 'b': 2, 'c': 2, 'd': 2}
+  #   以及 partition_spec=P(None, ('d', 'b'), 'c')。
+  #   传给 iota_tile 的参数将是：
+  #     dims = [1, 4, 2, 1, 2]  # 'a' 是复制的，因此 `2` 位于末尾。
   #     reshape_dims = [2, 2, 2, 2]
-  #     transpose_perm = [3, 1, 2, 0]  # 'a' is replicated hence 0 is at the end
+  #     transpose_perm = [3, 1, 2, 0]  # 'a' 是复制的，因此 0 位于末尾
   #     subgroup_types = [xc.OpSharding.Type.REPLICATED]
   dims = new_mesh_shape
   reshape_dims = abs_mesh.axis_sizes
@@ -490,7 +493,7 @@ def named_sharding_to_sdy_sharding(self, num_dimensions: int,
     if dim_spec is PartitionSpec.UNCONSTRAINED:
       dim_shardings[i] = SdyDim(axes=(), is_open=True)
     elif dim_spec is None:
-      # Already empty and closed sharding.
+      # 已经是空的封闭分片。
       pass
     else:
       dim_spec = dim_spec if isinstance(dim_spec, tuple) else (dim_spec,)
