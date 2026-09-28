@@ -113,12 +113,19 @@ class Jaxpr:
       "_is_high",
       "_consts",
   ]
+  # 所有输入变量；前 len(_consts) 个已附常量值，其余由调用者传入。
   _all_invars: list[Var]
+  # 按返回顺序排列的输出，可以是计算结果 Var 或已知值 Literal。
   _outvars: list[Atom]
+  # 程序体中的方程，按求值顺序记录 primitive 调用。
   _eqns: list[JaxprEqn]
+  # 整个 Jaxpr 的效果集合，由方程的 effects 汇总而来。
   _effects: Effects
+  # 被追踪函数、输入名和结果路径等信息，用于诊断与报错。
   _debug_info: DebugInfo
+  # 是否涉及 HiJAX 原语或抽象值；决定何时需要转成 LoJAX。
   _is_high: bool
+  # 与 _all_invars 前缀中的变量一一对应的已附常量值。
   _consts: list[Any]
 
   @property
